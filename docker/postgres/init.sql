@@ -1,0 +1,12 @@
+-- ---------------------------------------------------------------------------
+-- ApexScan — PostgreSQL initialization script.
+--
+-- Runs once on first container start (mounted into docker-entrypoint-initdb.d
+-- when wired up). Schema/table creation is owned by Alembic migrations, not
+-- this file — keep it limited to database-level bootstrapping such as
+-- extensions. No tables are created in Phase 1.
+-- ---------------------------------------------------------------------------
+
+-- Example extension enablement (uncomment when needed):
+-- CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";

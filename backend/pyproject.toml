@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# ApexScan backend — Python project & tooling configuration.
+# ---------------------------------------------------------------------------
+[project]
+name = "apexscan-backend"
+version = "0.1.0"
+description = "ApexScan trading scanner platform — backend API"
+requires-python = ">=3.13"
+readme = "README.md"
+
+# Runtime dependencies. Versions are pinned to current stable majors and
+# should be refreshed with `pip list --outdated` before each release.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "redis>=5.2",
+    "python-json-logger>=3.2",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["alembic*", "tests*"]
+
+[project.optional-dependencies]
+# Developer tooling: tests, linting, typing.
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "httpx>=0.28",
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "pip-audit>=2.9,<3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# Enable common rule families; keep the build warning-free.
+select = ["E", "F", "I", "N", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

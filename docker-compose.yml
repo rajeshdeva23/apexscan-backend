@@ -1,0 +1,128 @@
+# ---------------------------------------------------------------------------
+# ApexScan — Docker Compose stack
+#
+# Orchestrates the full local/staging environment:
+#   - postgres : primary relational store
+#   - redis    : cache / pub-sub / real-time fan-out backbone
+#   - backend  : FastAPI application (async)
+#   - frontend : React + Vite dev server
+#   - nginx    : reverse proxy (prepared, commented until production wiring)
+#
+# Usage:
+#   docker compose up --build
+# ---------------------------------------------------------------------------
+
+services:
+  # -------------------------------------------------------------------------
+  # PostgreSQL — durable relational storage for instruments, strategies, etc.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: apexscan-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apexscan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_local_env}
+      POSTGRES_DB: ${POSTGRES_DB:-apexscan}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apexscan}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - apexscan-net
+
+  # -------------------------------------------------------------------------
+  # Redis — caching layer and real-time message backbone.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: apexscan-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - apexscan-net
+
+  # -------------------------------------------------------------------------
+  # Backend — FastAPI application server.
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: apexscan-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    networks:
+      - apexscan-net
+
+  # -------------------------------------------------------------------------
+  # Frontend — React + Vite dev server.
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: apexscan-frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - apexscan-net
+
+  # -------------------------------------------------------------------------
+  # Nginx — reverse proxy / TLS termination for production.
+  # Prepared but disabled by default. Enable when deploying behind a proxy.
+  # -------------------------------------------------------------------------
+  # nginx:
+  #   image: nginx:1.27-alpine
+  #   container_name: apexscan-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - backend
+  #     - frontend
+  #   networks:
+  #     - apexscan-net
+
+networks:
+  apexscan-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

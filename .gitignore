@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# ApexScan — Git ignore rules
+# ---------------------------------------------------------------------------
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+*.local
+
+# Editors / OS
+.idea/
+.vscode/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+
+# Docker / data volumes
+docker/postgres/data/
+*.pid
+
+# Logs
+logs/
+*.log
+
+# Alembic scratch
+backend/alembic/versions/__pycache__/
