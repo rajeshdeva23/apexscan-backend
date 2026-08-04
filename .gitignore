@@ -23,12 +23,11 @@ build/
 .env
 .env.*
 !.env.example
+credentials/
+*.pem
+*.key
 
-# Node / frontend
-node_modules/
-frontend/dist/
-frontend/.vite/
-*.tsbuildinfo
+# Local build/editor files
 *.local
 
 # Editors / OS

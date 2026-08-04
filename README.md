@@ -1,11 +1,11 @@
-# ApexScan
+# ApexScan Backend
 
-Professional trading scanner platform — **Phase 1: infrastructure skeleton**.
+Backend and infrastructure repository for ApexScan — **Phase 1: foundation**.
 
 ApexScan is designed from day one to scale to **100+ strategies** across
 **multiple brokers** (Dhan, Binance, Zerodha, …). This repository currently
 contains only the production-grade project skeleton: folder structure,
-configuration, database/cache wiring, a FastAPI starter, and a React shell.
+configuration, database/cache wiring, and a FastAPI starter.
 
 > No trading strategy, indicator, or market logic is implemented yet.
 > This phase is purely infrastructure and architecture.
@@ -18,7 +18,6 @@ configuration, database/cache wiring, a FastAPI starter, and a React shell.
 | -------------- | ----------------------------------------------------------------- |
 | Backend        | Python 3.13+, FastAPI, SQLAlchemy 2.0, Alembic, Pydantic v2, asyncio, uvicorn |
 | Data stores    | PostgreSQL, Redis                                                  |
-| Frontend       | React 19, TypeScript, Vite, Tailwind CSS, Zustand, TanStack Query, React Router, AG Grid, TradingView Lightweight Charts |
 | Infrastructure | Docker, Docker Compose, Nginx (prepared)                          |
 
 ---
@@ -26,13 +25,12 @@ configuration, database/cache wiring, a FastAPI starter, and a React shell.
 ## Repository layout
 
 ```
-ApexScan/
+ApexScan Backend/
 ├── backend/        FastAPI application (clean architecture)
-├── frontend/       React + Vite single-page app
 ├── docs/           Architecture & design documentation
 ├── docker/         Dockerfiles and service configs (nginx, postgres)
 ├── scripts/        Developer / operational helper scripts
-├── tests/          Cross-cutting / end-to-end test suites
+├── tests/          Cross-cutting backend test suites
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
@@ -40,6 +38,11 @@ ApexScan/
 
 See [`docs/00_PROJECT_OVERVIEW.md`](docs/00_PROJECT_OVERVIEW.md) for the full
 documentation index.
+
+The React application, its Node.js tooling, and frontend quality gates live in
+the separate [apexscan-frontend](https://github.com/rajeshdeva23/apexscan-frontend)
+repository. It communicates with this backend through configured HTTP API and
+WebSocket URLs.
 
 ---
 
@@ -52,7 +55,6 @@ docker compose up --build
 
 - Backend API  → http://localhost:8000
 - API docs      → http://localhost:8000/docs
-- Frontend      → http://localhost:5173
 
 ## Quick start (local backend)
 
@@ -61,14 +63,6 @@ cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 uvicorn app.main:app --reload
-```
-
-## Quick start (local frontend)
-
-```bash
-cd frontend
-npm install
-npm run dev
 ```
 
 ## Quality gates
@@ -85,14 +79,6 @@ python -m ruff check .
 python -m mypy app
 python -m pytest
 python -m pip_audit
-
-# Frontend (Node.js 22.22+)
-cd ../frontend
-npm ci
-npm run lint
-npm run typecheck
-npm run build
-npm audit --audit-level=high
 
 # From the repository root: validate the local stack definition, then run it.
 docker compose config --quiet
@@ -111,7 +97,7 @@ validating shutdown.
 ```bash
 # From the repository root
 docker compose pull postgres redis
-docker compose build backend frontend
+docker compose build backend
 docker compose up -d postgres redis
 # Wait until both dependency health checks pass (up to 60 seconds).
 for attempt in {1..30}; do
@@ -122,7 +108,7 @@ for attempt in {1..30}; do
 done
 [[ "$postgres_status" == healthy && "$redis_status" == healthy ]]
 docker compose run --rm backend alembic upgrade head
-docker compose up -d backend frontend
+docker compose up -d backend
 # Wait for the backend liveness probe (expected response: {"status":"ok"}).
 for attempt in {1..30}; do
   response="$(curl --fail --silent --show-error http://localhost:8000/api/v1/health || true)"
@@ -131,7 +117,7 @@ for attempt in {1..30}; do
 done
 [[ "$response" == '{"status":"ok"}' ]]
 docker compose ps
-docker compose logs --no-color postgres redis backend frontend
+docker compose logs --no-color postgres redis backend
 docker compose down
 test -z "$(docker compose ps --status running --services)"
 ```

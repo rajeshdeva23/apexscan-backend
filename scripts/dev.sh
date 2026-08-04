@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # ApexScan — developer convenience script.
-# Brings up the full stack via Docker Compose with a fresh build.
+# Brings up the backend/infrastructure stack via Docker Compose with a fresh
+# build. The React application runs separately from apexscan-frontend.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
