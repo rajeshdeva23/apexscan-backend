@@ -10,17 +10,11 @@ Phase 1 provides the pattern skeleton only — no queries are implemented.
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import Base
 
-# Model type bound to the ORM declarative base.
-ModelT = TypeVar("ModelT", bound=Base)
-
-
-class BaseRepository(Generic[ModelT]):
+class BaseRepository[ModelT: Base]:
     """Base class for data-access repositories.
 
     Args:

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Manage application startup and shutdown.
 
     Startup logs readiness; shutdown disposes the database engine and Redis

@@ -29,7 +29,7 @@ def create_redis_pool() -> redis.ConnectionPool:
 redis_pool: redis.ConnectionPool = create_redis_pool()
 
 
-async def get_redis() -> AsyncGenerator[redis.Redis, None]:
+async def get_redis() -> AsyncGenerator[redis.Redis]:
     """Yield a Redis client bound to the shared connection pool.
 
     FastAPI dependency. The client returns its connection to the pool on exit.

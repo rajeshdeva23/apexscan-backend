@@ -11,15 +11,14 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from alembic import context
-from app.core.config import get_settings
-from app.database import Base
-
 # Importing the models package registers any ORM classes on Base.metadata.
 import app.models  # noqa: F401  (side-effect import for autogenerate)
+from app.core.config import get_settings
+from app.database import Base
 
 config = context.config
 
