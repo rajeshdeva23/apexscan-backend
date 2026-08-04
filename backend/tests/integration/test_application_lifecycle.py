@@ -14,6 +14,8 @@ from app.core.config import get_settings
 from app.database import DatabaseLifecycle
 from app.main import create_app
 
+pytestmark = pytest.mark.integration
+
 
 def _lifecycle_module() -> ModuleType:
     """Load the P2.3 lifecycle boundary at test execution time."""
