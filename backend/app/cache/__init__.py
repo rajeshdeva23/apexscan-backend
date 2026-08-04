@@ -4,6 +4,24 @@ Redis connection infrastructure for caching and real-time messaging.
 Exposes the connection pool and the :func:`get_redis` dependency.
 """
 
-from app.cache.redis_client import get_redis, redis_pool
+from app.cache.redis_client import (
+    RedisCleanupError,
+    RedisConnectivityError,
+    RedisInitializationError,
+    RedisLifecycle,
+    RedisLifecycleError,
+    RedisNotInitializedError,
+    get_redis,
+    redis_lifecycle,
+)
 
-__all__ = ["get_redis", "redis_pool"]
+__all__ = [
+    "RedisCleanupError",
+    "RedisConnectivityError",
+    "RedisInitializationError",
+    "RedisLifecycle",
+    "RedisLifecycleError",
+    "RedisNotInitializedError",
+    "get_redis",
+    "redis_lifecycle",
+]

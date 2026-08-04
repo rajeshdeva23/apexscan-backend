@@ -199,8 +199,9 @@ explicitly listed as included is out of scope for V1.
 
 > **📝 Note — Strategy names describe outcomes, not code.**
 > The three V1 strategies are listed here for scope clarity. Their algorithms
-> are specified in `07_STRATEGY_ENGINE.md` and implemented in Phase 2
-> development. This overview intentionally contains no strategy logic.
+> are specified in `07_STRATEGY_ENGINE.md` and implemented during the Strategy
+> Engine phase, as defined by `12_ROADMAP.md`. This overview intentionally
+> contains no strategy logic.
 
 ### 4.2 Explicitly NOT included in Version 1
 

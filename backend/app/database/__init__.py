@@ -6,6 +6,25 @@ on nothing above it.
 """
 
 from app.database.base import Base
-from app.database.session import async_session_factory, engine, get_session
+from app.database.session import (
+    DatabaseCleanupError,
+    DatabaseConnectivityError,
+    DatabaseInitializationError,
+    DatabaseLifecycle,
+    DatabaseLifecycleError,
+    DatabaseNotInitializedError,
+    database_lifecycle,
+    get_session,
+)
 
-__all__ = ["Base", "engine", "async_session_factory", "get_session"]
+__all__ = [
+    "Base",
+    "DatabaseCleanupError",
+    "DatabaseConnectivityError",
+    "DatabaseInitializationError",
+    "DatabaseLifecycle",
+    "DatabaseLifecycleError",
+    "DatabaseNotInitializedError",
+    "database_lifecycle",
+    "get_session",
+]
