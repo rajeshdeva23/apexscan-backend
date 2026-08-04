@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import Base
 
+
 class BaseRepository[ModelT: Base]:
     """Base class for data-access repositories.
 
