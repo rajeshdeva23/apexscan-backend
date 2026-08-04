@@ -50,6 +50,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install integration-test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./backend[dev]"
+
       - name: Prepare CI environment
         run: cp .env.example .env
 
@@ -75,24 +85,21 @@ jobs:
           docker compose logs --no-color postgres redis
           exit 1
 
+      - name: Run real dependency lifecycle tests
+        env:
+          APEXSCAN_RUN_INTEGRATION: "1"
+          INTEGRATION_DATABASE_URL: postgresql+asyncpg://apexscan:change_me_in_local_env@127.0.0.1:5432/apexscan
+          INTEGRATION_REDIS_URL: redis://127.0.0.1:6379/0
+        run: python -m pytest backend/tests/integration -m integration -v
+
       - name: Run database migrations
         run: docker compose run --rm backend alembic upgrade head
 
       - name: Start backend
         run: docker compose up -d backend
 
-      - name: Verify backend health
-        run: |
-          for attempt in {1..30}; do
-            response="$(curl --fail --silent --show-error http://localhost:8000/api/v1/health 2>/dev/null || true)"
-            if [[ "$response" == '{"status":"ok"}' ]]; then
-              exit 0
-            fi
-            sleep 2
-          done
-          docker compose ps
-          docker compose logs --no-color backend
-          exit 1
+      - name: Run Phase 2 Compose runtime acceptance
+        run: bash scripts/validate_phase2_runtime.sh
 
       - name: Show startup logs
         if: always()

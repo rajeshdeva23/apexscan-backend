@@ -90,16 +90,16 @@ starting the stack.
 
 ### Docker runtime validation
 
-Run the following on a Docker-capable machine to complete the Phase 1 runtime
-gate. Do not use `down -v`; database and Redis volumes must be preserved while
-validating shutdown.
+Run the following on a Docker-capable machine to validate Phase 2 runtime
+health behavior. Do not use `down -v`; database and Redis volumes must be
+preserved while validating shutdown.
 
 ```bash
 # From the repository root
 docker compose pull postgres redis
 docker compose build backend
 docker compose up -d postgres redis
-# Wait until both dependency health checks pass (up to 60 seconds).
+# Wait for both dependency health checks before running migrations.
 for attempt in {1..30}; do
   postgres_status="$(docker inspect --format '{{.State.Health.Status}}' apexscan-postgres)"
   redis_status="$(docker inspect --format '{{.State.Health.Status}}' apexscan-redis)"
@@ -109,21 +109,15 @@ done
 [[ "$postgres_status" == healthy && "$redis_status" == healthy ]]
 docker compose run --rm backend alembic upgrade head
 docker compose up -d backend
-# Wait for the backend liveness probe (expected response: {"status":"ok"}).
-for attempt in {1..30}; do
-  response="$(curl --fail --silent --show-error http://localhost:8000/api/v1/health || true)"
-  [[ "$response" == '{"status":"ok"}' ]] && break
-  sleep 2
-done
-[[ "$response" == '{"status":"ok"}' ]]
-docker compose ps
-docker compose logs --no-color postgres redis backend
+# Validates startup/readiness, PostgreSQL and Redis outage/recovery,
+# liveness continuity, and backend process continuity.
+bash scripts/validate_phase2_runtime.sh
 docker compose down
 test -z "$(docker compose ps --status running --services)"
 ```
 
-Capture the readiness result, migration output, health response, service logs,
-and clean-shutdown result as acceptance evidence.
+Capture the script output, migration output, service logs, and clean-shutdown
+result as acceptance evidence.
 
 ---
 

@@ -12,41 +12,59 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import cast
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
-from app.cache import redis_pool
+from app.cache import redis_lifecycle
 from app.core.config import get_settings
+from app.core.lifecycle import (
+    ApplicationLifecycle,
+    ApplicationShutdownError,
+    ApplicationStartupError,
+)
 from app.core.logging import configure_logging
-from app.database import engine
+from app.database import database_lifecycle
 from app.middleware.request_logging import RequestLoggingMiddleware
 
 logger = logging.getLogger(__name__)
+application_lifecycle = ApplicationLifecycle(database_lifecycle, redis_lifecycle)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Manage application startup and shutdown.
 
-    Startup logs readiness; shutdown disposes the database engine and Redis
-    pool so connections are released cleanly. Resource creation itself lives
-    in the database/cache modules — this only owns lifecycle.
+    Startup gates traffic on PostgreSQL then Redis verification. Shutdown first
+    removes readiness, then releases Redis and PostgreSQL in reverse order.
     """
     settings = get_settings()
+    lifecycle = cast(ApplicationLifecycle, app.state.lifecycle)
     logger.info("Starting %s (%s)", settings.app_name, settings.app_env)
-    yield
-    logger.info("Shutting down %s", settings.app_name)
-    await engine.dispose()
-    await redis_pool.aclose()
+    try:
+        await lifecycle.start(settings)
+    except ApplicationStartupError:
+        logger.error("Application startup blocked by a mandatory dependency")
+        raise
+
+    try:
+        yield
+    finally:
+        logger.info("Shutting down %s", settings.app_name)
+        try:
+            await lifecycle.shutdown()
+        except ApplicationShutdownError:
+            logger.error("Application shutdown dependency cleanup failed")
+            raise
 
 
-def create_app() -> FastAPI:
+def create_app(lifecycle: ApplicationLifecycle | None = None) -> FastAPI:
     """Build and configure the FastAPI application.
 
     Returns:
-        A fully wired :class:`FastAPI` instance ready to serve requests.
+        A fully wired :class:`FastAPI` instance with an injected lifecycle owner.
     """
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -57,6 +75,7 @@ def create_app() -> FastAPI:
         debug=settings.app_debug,
         lifespan=lifespan,
     )
+    app.state.lifecycle = lifecycle or application_lifecycle
 
     # Cross-origin access for the browser frontend.
     app.add_middleware(
