@@ -16,7 +16,7 @@ from app.main import create_app
 
 
 @pytest.fixture
-async def client() -> AsyncGenerator[AsyncClient, None]:
+async def client() -> AsyncGenerator[AsyncClient]:
     """Yield an async HTTP client wired to the ASGI application."""
     app = create_app()
     transport = ASGITransport(app=app)

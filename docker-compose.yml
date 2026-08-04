@@ -5,8 +5,11 @@
 #   - postgres : primary relational store
 #   - redis    : cache / pub-sub / real-time fan-out backbone
 #   - backend  : FastAPI application (async)
-#   - frontend : React + Vite dev server
-#   - nginx    : reverse proxy (prepared, commented until production wiring)
+#
+# The React application lives in the independently cloneable
+# ``apexscan-frontend`` repository and runs separately during local
+# development. Host-level Nginx routing remains documented in ``docker/nginx``
+# but is not part of this backend-owned local Compose stack (ADR-002).
 #
 # Usage:
 #   docker compose up --build
@@ -78,46 +81,6 @@ services:
       - ./backend:/app
     networks:
       - apexscan-net
-
-  # -------------------------------------------------------------------------
-  # Frontend — React + Vite dev server.
-  # -------------------------------------------------------------------------
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: apexscan-frontend
-    restart: unless-stopped
-    env_file:
-      - .env
-    ports:
-      - "5173:5173"
-    depends_on:
-      - backend
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    networks:
-      - apexscan-net
-
-  # -------------------------------------------------------------------------
-  # Nginx — reverse proxy / TLS termination for production.
-  # Prepared but disabled by default. Enable when deploying behind a proxy.
-  # -------------------------------------------------------------------------
-  # nginx:
-  #   image: nginx:1.27-alpine
-  #   container_name: apexscan-nginx
-  #   restart: unless-stopped
-  #   ports:
-  #     - "80:80"
-  #     - "443:443"
-  #   volumes:
-  #     - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-  #   depends_on:
-  #     - backend
-  #     - frontend
-  #   networks:
-  #     - apexscan-net
 
 networks:
   apexscan-net:

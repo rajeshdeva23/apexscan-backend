@@ -47,7 +47,7 @@ async_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
 )
 
 
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
+async def get_session() -> AsyncGenerator[AsyncSession]:
     """Yield a database session scoped to a single request.
 
     FastAPI dependency. The session is committed by the caller (service layer)

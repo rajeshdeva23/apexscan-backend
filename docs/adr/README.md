@@ -17,3 +17,4 @@ context that forced it, the alternatives weighed, and its consequences.
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
 | [ADR-001](ADR-001-postgresql-as-source-of-truth.md) | Use PostgreSQL as the Source of Truth | Accepted | 2026-07-31 |
+| [ADR-002](ADR-002-two-repository-ownership.md) | Separate ApexScan into Backend and Frontend Repositories | Accepted | 2026-08-03 |
