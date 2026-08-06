@@ -435,5 +435,26 @@ Scores are 0–100, reflecting the **documentation and design** as audited (not 
 
 ---
 
+## 16. Governance Addendum — ADR Record Resolution
+
+> **Addendum date:** 2026-08-04. This addendum records governance actions taken
+> after the original review. It preserves the review's original findings as a
+> historical audit record and does not redesign the approved architecture.
+
+- ADR-001 existed when the original review was written.
+- ADR-002 was accepted after the original review, recording the V1 repository
+  ownership decision.
+- ADR-003 is now accepted as `ADR-003-broker-adapter-pattern.md`, before Phase
+  3, recording the already-approved Broker Adapter Pattern.
+- The dangling ADR-003 references in `05_DATA_PROVIDER.md` now resolve. The
+  Broker Adapter Pattern gap identified by F-CR-1 and F-ADR-2 is resolved.
+- The original architecture sign-off remains valid. No domain architecture
+  redesign, database ownership change, or repository ownership change occurred.
+
+The remaining unrecorded ADRs from the historical intended batch are outside
+this addendum's scope and do not reopen the resolved Phase 3 governance gate.
+
+---
+
 *End of `99_ARCHITECTURE_REVIEW.md` — Official Architecture Review & Sign-Off for ApexScan.*
 *This audit is read-only over `00`–`13`; it evaluates the architecture and does not alter it.*

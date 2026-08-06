@@ -85,6 +85,35 @@ docker compose config --quiet
 docker compose up --build
 ```
 
+### Optional protected Dhan REST and live-feed smoke test
+
+Ordinary tests and CI use sanitized Dhan fixtures and never require Dhan
+credentials. A developer may validate the documented REST integration and,
+during NSE regular market hours, a bounded standard-feed live sample with
+securely supplied TOTP credentials and both explicit opt-ins:
+
+```bash
+export DHAN_AUTH_MODE=totp
+export DHAN_CLIENT_ID='secure-value-from-your-secret-store'
+export DHAN_PIN='secure-value-from-your-secret-store'
+export DHAN_TOTP_SECRET='secure-value-from-your-secret-store'
+export DHAN_LIVE_SMOKE_ENABLED=true
+export APEXSCAN_DHAN_LIVE_SMOKE=1
+cd backend
+python -m pytest tests/integration/test_dhan_live_smoke.py -m live_dhan -s
+```
+
+The server generates a short-lived runtime token through Dhan's documented
+TOTP endpoint; it never stores or prints the token, PIN, or TOTP material. Keep
+the host clock synchronized because TOTP rotates every 30 seconds. For explicit
+developer troubleshooting only, `DHAN_AUTH_MODE=access_token` may be selected
+with `DHAN_ACCESS_TOKEN` instead. This smoke test uses current documented
+endpoint-specific DhanHQ v2 request shapes, first verifies the 208-to-208
+F&O-eligible-underlying-to-NSE-cash-equity mapping, and observes at most one
+canonical Tick from five deterministic cash equities through Dhan's standard
+live WebSocket feed. Outside NSE regular market hours, the live-data portion is
+reported as not run rather than treating a quiet feed as success.
+
 Docker Compose requires a local `.env`; create one from `.env.example` before
 starting the stack.
 

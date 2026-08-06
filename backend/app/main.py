@@ -30,6 +30,10 @@ from app.database import database_lifecycle
 from app.middleware.request_logging import RequestLoggingMiddleware
 
 logger = logging.getLogger(__name__)
+# No concrete provider adapter is configurable at startup in Phase 3 (local and
+# CI environments hold no broker credentials), so the composition root registers
+# no provider dependency. The ProviderCoordinator lifecycle is wired here once a
+# concrete adapter can be constructed from settings.
 application_lifecycle = ApplicationLifecycle(database_lifecycle, redis_lifecycle)
 
 

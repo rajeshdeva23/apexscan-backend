@@ -18,3 +18,5 @@ context that forced it, the alternatives weighed, and its consequences.
 |-----|-------|--------|------|
 | [ADR-001](ADR-001-postgresql-as-source-of-truth.md) | Use PostgreSQL as the Source of Truth | Accepted | 2026-07-31 |
 | [ADR-002](ADR-002-two-repository-ownership.md) | Separate ApexScan into Backend and Frontend Repositories | Accepted | 2026-08-03 |
+| [ADR-003](ADR-003-broker-adapter-pattern.md) | Adopt the Broker Adapter Pattern | Accepted | 2026-08-04 |
+| [ADR-004](ADR-004-nse-cash-equity-live-scanner-domain.md) | Use NSE Cash Equity as the V1 Live Scanner Domain | Accepted | 2026-08-06 |
