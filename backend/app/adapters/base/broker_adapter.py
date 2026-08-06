@@ -1,42 +1,62 @@
-"""Broker adapter contract.
-
-Defines the abstract interface every broker integration (Dhan, Binance,
-Zerodha, …) must implement. The market engine and services depend only on
-this abstraction, never on a concrete broker — this is the seam that lets
-ApexScan scale to many brokers without touching core logic (Dependency
-Inversion).
-
-Phase 1 declares the contract only. No broker behaviour is implemented.
-"""
+"""Broker-neutral adapter capabilities for the Data Provider boundary."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from typing import Protocol, runtime_checkable
+
+from app.schemas.market_data import (
+    HistoricalRequest,
+    HistoricalResult,
+    Instrument,
+    MarketData,
+    ProviderCapability,
+    ProviderHealth,
+    SubscriptionRequest,
+)
 
 
 class BrokerAdapter(ABC):
-    """Abstract base class for all broker integrations.
+    """Lifecycle and health contract shared by all provider adapters."""
 
-    Concrete adapters translate ApexScan's internal calls into a specific
-    broker's API (auth, market data, instruments) and normalise responses
-    back into internal schemas. Method bodies are intentionally undefined
-    here — subclasses provide them.
-    """
-
-    #: Human-readable broker identifier, e.g. ``"dhan"``. Set by subclasses.
-    name: str
+    capabilities: frozenset[ProviderCapability]
 
     @abstractmethod
     async def connect(self) -> None:
-        """Establish and authenticate a session with the broker."""
+        """Initialize the adapter's provider-side state."""
         raise NotImplementedError
 
     @abstractmethod
     async def disconnect(self) -> None:
-        """Tear down the broker session and release resources."""
+        """Release the adapter's provider-side state."""
         raise NotImplementedError
 
     @abstractmethod
-    async def is_healthy(self) -> bool:
-        """Return whether the broker connection is usable right now."""
+    async def get_health(self) -> ProviderHealth:
+        """Return a canonical provider-health observation."""
         raise NotImplementedError
+
+
+@runtime_checkable
+class LiveMarketDataAdapter(Protocol):
+    """Capability for streaming canonical live market data."""
+
+    def stream_market_data(self, request: SubscriptionRequest) -> AsyncIterator[MarketData]:
+        """Yield normalized events matching the requested canonical subscription."""
+
+
+@runtime_checkable
+class HistoricalDataAdapter(Protocol):
+    """Capability for loading canonical historical candle data."""
+
+    async def load_historical_data(self, request: HistoricalRequest) -> HistoricalResult:
+        """Return normalized historical data for one canonical request."""
+
+
+@runtime_checkable
+class InstrumentDataAdapter(Protocol):
+    """Capability for loading canonical instrument identities."""
+
+    async def load_instruments(self) -> tuple[Instrument, ...]:
+        """Return canonical instrument identities known to the provider."""

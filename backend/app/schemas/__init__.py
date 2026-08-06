@@ -1,7 +1,43 @@
-"""Pydantic schemas package (placeholder).
+"""Pydantic schemas for API and internal canonical data contracts."""
 
-Request/response and internal transfer models (Pydantic v2). Schemas define
-the API contract and validation boundary, kept separate from ORM models so
-persistence and transport concerns never leak into each other. No schemas
-are defined in Phase 1.
-"""
+from app.schemas.market_data import (
+    Candle,
+    DepthLevel,
+    DepthSnapshot,
+    HistoricalRequest,
+    HistoricalResult,
+    Instrument,
+    InstrumentClass,
+    MarketData,
+    MarketDataKind,
+    MarketSegment,
+    OptionType,
+    ProviderCapability,
+    ProviderHealth,
+    ProviderStatus,
+    Quote,
+    SubscriptionRequest,
+    Tick,
+    UnderlyingInstrument,
+)
+
+__all__ = [
+    "Candle",
+    "DepthLevel",
+    "DepthSnapshot",
+    "HistoricalRequest",
+    "HistoricalResult",
+    "Instrument",
+    "InstrumentClass",
+    "MarketData",
+    "MarketDataKind",
+    "MarketSegment",
+    "OptionType",
+    "ProviderCapability",
+    "ProviderHealth",
+    "ProviderStatus",
+    "Quote",
+    "SubscriptionRequest",
+    "Tick",
+    "UnderlyingInstrument",
+]

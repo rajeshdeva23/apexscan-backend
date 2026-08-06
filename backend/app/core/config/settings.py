@@ -9,16 +9,18 @@ injection (see :func:`app.core.config.get_settings`).
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "staging", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _LOCAL_CORS_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_DHAN_AUTH_MODES = frozenset({"totp", "access_token"})
 
 
 class ConfigurationError(RuntimeError):
@@ -64,6 +66,21 @@ class Settings(BaseSettings):
     # --- Redis -------------------------------------------------------------
     redis_url: str = Field(..., repr=False)
 
+    # --- Provider lifecycle ------------------------------------------------
+    provider_lifecycle_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
+    # --- Dhan REST adapter -------------------------------------------------
+    # The adapter is not application-wired in P3.3, so Dhan credentials remain
+    # optional except for explicitly enabled protected live-smoke validation.
+    dhan_auth_mode: str = Field(default="totp")
+    dhan_client_id: SecretStr | None = Field(default=None, repr=False)
+    dhan_pin: SecretStr | None = Field(default=None, repr=False)
+    dhan_totp_secret: SecretStr | None = Field(default=None, repr=False)
+    dhan_access_token: SecretStr | None = Field(default=None, repr=False)
+    dhan_rest_base_url: str = Field(default="https://api.dhan.co/v2")
+    dhan_rest_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    dhan_live_smoke_enabled: bool = Field(default=False)
+
     @field_validator("app_env")
     @classmethod
     def normalize_app_env(cls, value: str) -> str:
@@ -82,6 +99,16 @@ class Settings(BaseSettings):
         if normalized not in _ALLOWED_LOG_LEVELS:
             allowed = ", ".join(sorted(_ALLOWED_LOG_LEVELS))
             raise ValueError(f"LOG_LEVEL must be one of: {allowed}")
+        return normalized
+
+    @field_validator("dhan_auth_mode")
+    @classmethod
+    def normalize_dhan_auth_mode(cls, value: str) -> str:
+        """Require a single explicit Dhan authentication path when one is used."""
+        normalized = value.strip().lower()
+        if normalized not in _DHAN_AUTH_MODES:
+            allowed = ", ".join(sorted(_DHAN_AUTH_MODES))
+            raise ValueError(f"DHAN_AUTH_MODE must be one of: {allowed}")
         return normalized
 
     @field_validator("backend_port")
@@ -133,9 +160,44 @@ class Settings(BaseSettings):
             raise ValueError("REDIS_URL must use the redis or rediss scheme and include a host")
         return value
 
+    @field_validator("dhan_rest_base_url")
+    @classmethod
+    def validate_dhan_rest_base_url(cls, value: str) -> str:
+        """Restrict Dhan REST traffic to an explicit HTTPS API base URL."""
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+            raise ValueError("DHAN_REST_BASE_URL must be an HTTPS URL without query or fragment")
+        return normalized
+
     @model_validator(mode="after")
     def validate_production_safety(self) -> Self:
         """Reject settings that are safe only for local development in production."""
+        if self.dhan_live_smoke_enabled:
+            if self.dhan_auth_mode == "access_token":
+                if not _has_secret_value(self.dhan_access_token):
+                    raise ValueError(
+                        "DHAN_ACCESS_TOKEN must be configured when "
+                        "DHAN_AUTH_MODE=access_token and DHAN_LIVE_SMOKE_ENABLED=true"
+                    )
+            else:
+                required_totp_settings = (
+                    ("DHAN_CLIENT_ID", self.dhan_client_id),
+                    ("DHAN_PIN", self.dhan_pin),
+                    ("DHAN_TOTP_SECRET", self.dhan_totp_secret),
+                )
+                for setting_name, secret in required_totp_settings:
+                    if not _has_secret_value(secret):
+                        raise ValueError(
+                            f"{setting_name} must be configured when DHAN_AUTH_MODE=totp "
+                            "and DHAN_LIVE_SMOKE_ENABLED=true"
+                        )
+                if (
+                    self.dhan_pin is not None
+                    and re.fullmatch(r"[0-9]{6}", self.dhan_pin.get_secret_value().strip()) is None
+                ):
+                    raise ValueError("DHAN_PIN must be a six-digit numeric code")
+
         if not self.is_production:
             return self
 
@@ -185,3 +247,8 @@ def _format_validation_error(error: ValidationError) -> str:
         diagnostics.append(f"{field_name}: {detail['msg']}")
 
     return "Configuration validation failed. Correct the following: " + "; ".join(diagnostics)
+
+
+def _has_secret_value(value: SecretStr | None) -> bool:
+    """Return whether a secret setting contains non-whitespace runtime material."""
+    return value is not None and bool(value.get_secret_value().strip())

@@ -156,3 +156,37 @@ async def test_startup_snapshot_reports_initialization_in_progress() -> None:
     assert lifecycle.liveness_snapshot().status == "live"
     assert lifecycle.startup_snapshot().status == "starting"
     assert (await lifecycle.readiness_snapshot()).status == "not_ready"
+
+
+def test_composition_root_registers_no_unconfigured_provider() -> None:
+    """Regression (C1): the shipped lifecycle must not carry a provider that blocks startup."""
+    main_module = import_module("app.main")
+
+    assert main_module.application_lifecycle._provider is None
+
+
+async def test_lifecycle_wired_like_composition_root_reaches_ready() -> None:
+    """The composition-root wiring (database + redis only) starts and reports ready."""
+    lifecycle_module = _lifecycle_module()
+    lifecycle = lifecycle_module.ApplicationLifecycle(_FakeDatabase([]), _FakeRedis([]))
+
+    await lifecycle.start(_settings())
+    snapshot = await lifecycle.readiness_snapshot()
+    await lifecycle.shutdown()
+
+    assert snapshot.status == "ready"
+    assert "provider" not in (snapshot.dependencies or {})
+
+
+async def test_bare_provider_coordinator_wiring_would_block_startup() -> None:
+    """A ProviderCoordinator with no adapter is not a startable mandatory dependency."""
+    coordinator_module = import_module("app.adapters.base")
+    lifecycle_module = _lifecycle_module()
+    lifecycle = lifecycle_module.ApplicationLifecycle(
+        _FakeDatabase([]),
+        _FakeRedis([]),
+        coordinator_module.ProviderCoordinator(),
+    )
+
+    with pytest.raises(lifecycle_module.ApplicationStartupError):
+        await lifecycle.start(_settings())

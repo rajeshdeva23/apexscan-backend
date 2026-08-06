@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from app.core.config import Settings
+from app.schemas.market_data import ProviderHealth, ProviderStatus
 
 
 class DatabaseDependency(Protocol):
@@ -33,6 +34,19 @@ class RedisDependency(Protocol):
 
     async def close(self) -> None:
         """Release Redis resources."""
+
+
+class ProviderDependency(Protocol):
+    """The broker-neutral provider lifecycle capability required by the app."""
+
+    async def start(self, timeout_seconds: float) -> None:
+        """Connect the provider and verify its startup health."""
+
+    async def verify_health(self) -> ProviderHealth:
+        """Return the latest canonical provider health observation."""
+
+    async def shutdown(self) -> None:
+        """Disconnect the provider safely during application shutdown."""
 
 
 class ApplicationStartupError(RuntimeError):
@@ -82,12 +96,19 @@ class HealthSnapshot:
 class ApplicationLifecycle:
     """Coordinate mandatory dependency startup, health, and ordered cleanup."""
 
-    def __init__(self, database: DatabaseDependency, redis: RedisDependency) -> None:
+    def __init__(
+        self,
+        database: DatabaseDependency,
+        redis: RedisDependency,
+        provider: ProviderDependency | None = None,
+    ) -> None:
         self._database = database
         self._redis = redis
+        self._provider = provider
         self._state = LifecycleState.STARTING
         self._database_state = DependencyState.UNKNOWN
         self._redis_state = DependencyState.UNKNOWN
+        self._provider_state = DependencyState.UNKNOWN
 
     async def start(self, settings: Settings) -> None:
         """Start mandatory dependencies in order and gate application readiness.
@@ -106,6 +127,7 @@ class ApplicationLifecycle:
         self._state = LifecycleState.STARTING
         self._database_state = DependencyState.UNKNOWN
         self._redis_state = DependencyState.UNKNOWN
+        self._provider_state = DependencyState.UNKNOWN
 
         try:
             await self._database.initialize(settings.database_url, echo=settings.app_debug)
@@ -115,11 +137,17 @@ class ApplicationLifecycle:
             await self._redis.initialize(settings.redis_url)
             await self._redis.verify_connectivity()
             self._redis_state = DependencyState.HEALTHY
+
+            if self._provider is not None:
+                await self._provider.start(settings.provider_lifecycle_timeout_seconds)
+                self._provider_state = DependencyState.HEALTHY
         except Exception as error:
             if self._database_state is not DependencyState.HEALTHY:
                 self._database_state = DependencyState.UNHEALTHY
             if self._redis_state is not DependencyState.HEALTHY:
                 self._redis_state = DependencyState.UNHEALTHY
+            if self._provider is not None and self._provider_state is not DependencyState.HEALTHY:
+                self._provider_state = DependencyState.UNHEALTHY
 
             cleanup_error = await self._release_dependencies()
             self._state = LifecycleState.FAILED
@@ -140,6 +168,8 @@ class ApplicationLifecycle:
 
         await self._probe_database()
         await self._probe_redis()
+        if self._provider is not None:
+            await self._probe_provider()
         return self._readiness_response()
 
     def liveness_snapshot(self) -> HealthSnapshot:
@@ -185,9 +215,27 @@ class ApplicationLifecycle:
         else:
             self._redis_state = DependencyState.HEALTHY
 
+    async def _probe_provider(self) -> None:
+        """Refresh provider readiness from its canonical health contract safely."""
+        assert self._provider is not None
+        try:
+            health = await self._provider.verify_health()
+        except Exception:
+            self._provider_state = DependencyState.UNHEALTHY
+        else:
+            self._provider_state = (
+                DependencyState.HEALTHY
+                if health.status is ProviderStatus.HEALTHY
+                else DependencyState.UNHEALTHY
+            )
+
     async def _release_dependencies(self) -> Exception | None:
         cleanup_error: Exception | None = None
-        for close_dependency in (self._redis.close, self._database.dispose):
+        close_dependencies = [self._redis.close, self._database.dispose]
+        if self._provider is not None:
+            close_dependencies.insert(0, self._provider.shutdown)
+
+        for close_dependency in close_dependencies:
             try:
                 await close_dependency()
             except Exception as error:
@@ -196,16 +244,20 @@ class ApplicationLifecycle:
         return cleanup_error
 
     def _readiness_response(self) -> HealthSnapshot:
+        dependencies = {
+            "database": self._database_state.value,
+            "redis": self._redis_state.value,
+        }
         is_ready = (
             self._state is LifecycleState.STARTED
             and self._database_state is DependencyState.HEALTHY
             and self._redis_state is DependencyState.HEALTHY
         )
+        if self._provider is not None:
+            dependencies["provider"] = self._provider_state.value
+            is_ready = is_ready and self._provider_state is DependencyState.HEALTHY
         return HealthSnapshot(
             status="ready" if is_ready else "not_ready",
             startup=self._state.value,
-            dependencies={
-                "database": self._database_state.value,
-                "redis": self._redis_state.value,
-            },
+            dependencies=dependencies,
         )

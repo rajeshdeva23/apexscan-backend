@@ -20,6 +20,15 @@ _CONFIGURATION_KEYS = (
     "CORS_ORIGINS",
     "DATABASE_URL",
     "REDIS_URL",
+    "PROVIDER_LIFECYCLE_TIMEOUT_SECONDS",
+    "DHAN_AUTH_MODE",
+    "DHAN_CLIENT_ID",
+    "DHAN_PIN",
+    "DHAN_TOTP_SECRET",
+    "DHAN_ACCESS_TOKEN",
+    "DHAN_REST_BASE_URL",
+    "DHAN_REST_TIMEOUT_SECONDS",
+    "DHAN_LIVE_SMOKE_ENABLED",
 )
 
 _VALID_REQUIRED_VALUES = {
@@ -141,6 +150,206 @@ def test_optional_defaults_remain_available_for_development(
     assert settings.app_env == "development"
     assert settings.app_debug is True
     assert settings.backend_port == 8000
+    assert settings.provider_lifecycle_timeout_seconds == 5.0
+
+
+def test_dhan_settings_are_optional_and_safe_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary local and CI configuration needs no Dhan credential."""
+    _set_environment(monkeypatch, _VALID_REQUIRED_VALUES)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dhan_auth_mode == "totp"
+    assert settings.dhan_client_id is None
+    assert settings.dhan_pin is None
+    assert settings.dhan_totp_secret is None
+    assert settings.dhan_access_token is None
+    assert settings.dhan_rest_base_url == "https://api.dhan.co/v2"
+    assert settings.dhan_rest_timeout_seconds == 10.0
+    assert settings.dhan_live_smoke_enabled is False
+
+
+def test_inactive_dhan_example_placeholders_do_not_block_ordinary_local_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copying the optional example values must not make non-Dhan development unusable."""
+    _set_environment(
+        monkeypatch,
+        {
+            **_VALID_REQUIRED_VALUES,
+            "DHAN_AUTH_MODE": "totp",
+            "DHAN_CLIENT_ID": "replace_with_secure_dhan_client_id",
+            "DHAN_PIN": "replace_with_secure_six_digit_dhan_pin",
+            "DHAN_TOTP_SECRET": "replace_with_secure_dhan_totp_secret",
+        },
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dhan_live_smoke_enabled is False
+    assert settings.dhan_auth_mode == "totp"
+
+
+@pytest.mark.parametrize(
+    ("missing_key", "configured_credentials"),
+    [
+        (
+            "DHAN_CLIENT_ID",
+            {
+                "DHAN_PIN": "123456",
+                "DHAN_TOTP_SECRET": "JBSWY3DPEHPK3PXP",
+            },
+        ),
+        (
+            "DHAN_PIN",
+            {
+                "DHAN_CLIENT_ID": "fixture-client-id",
+                "DHAN_TOTP_SECRET": "JBSWY3DPEHPK3PXP",
+            },
+        ),
+        (
+            "DHAN_TOTP_SECRET",
+            {
+                "DHAN_CLIENT_ID": "fixture-client-id",
+                "DHAN_PIN": "123456",
+            },
+        ),
+    ],
+)
+def test_dhan_live_smoke_totp_mode_requires_each_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_key: str,
+    configured_credentials: dict[str, str],
+) -> None:
+    """A missing TOTP credential must fail preflight before any live request can occur."""
+    _set_environment(
+        monkeypatch,
+        {
+            **_VALID_REQUIRED_VALUES,
+            "DHAN_LIVE_SMOKE_ENABLED": "true",
+            **configured_credentials,
+        },
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        get_settings()
+
+    assert missing_key in str(captured.value)
+
+
+def test_dhan_live_smoke_manual_mode_requires_a_configured_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicitly selected manual mode cannot continue with a blank token."""
+    _set_environment(
+        monkeypatch,
+        {
+            **_VALID_REQUIRED_VALUES,
+            "DHAN_LIVE_SMOKE_ENABLED": "true",
+            "DHAN_AUTH_MODE": "access_token",
+            "DHAN_ACCESS_TOKEN": "   ",
+        },
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        get_settings()
+
+    assert "DHAN_ACCESS_TOKEN" in str(captured.value)
+
+
+def test_dhan_live_smoke_manual_mode_does_not_require_totp_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual mode must be an explicit, unambiguous developer-only alternative."""
+    _set_environment(
+        monkeypatch,
+        {
+            **_VALID_REQUIRED_VALUES,
+            "DHAN_LIVE_SMOKE_ENABLED": "true",
+            "DHAN_AUTH_MODE": "access_token",
+            "DHAN_ACCESS_TOKEN": "fixture-manual-access-token",
+        },
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dhan_auth_mode == "access_token"
+    assert settings.dhan_client_id is None
+    assert settings.dhan_totp_secret is None
+
+
+def test_dhan_access_token_is_redacted_from_settings_representation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured Dhan access token never appears in printable settings diagnostics."""
+    secret = "test-dhan-access-token-must-not-leak"
+    _set_environment(
+        monkeypatch,
+        {**_VALID_REQUIRED_VALUES, "DHAN_ACCESS_TOKEN": secret},
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert secret not in repr(settings)
+    assert secret not in str(settings.dhan_access_token)
+    assert secret not in str(settings.model_dump())
+
+
+def test_dhan_totp_credentials_are_redacted_from_settings_and_validation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing Dhan diagnostics to include any TOTP credential must fail this boundary."""
+    client_id = "fixture-client-id-must-not-leak"
+    pin = "654321"
+    secret = "JBSWY3DPEHPK3PXP"
+    _set_environment(
+        monkeypatch,
+        {
+            **_VALID_REQUIRED_VALUES,
+            "DHAN_LIVE_SMOKE_ENABLED": "true",
+            "DHAN_CLIENT_ID": client_id,
+            "DHAN_PIN": pin,
+            "DHAN_TOTP_SECRET": secret,
+            "DHAN_REST_BASE_URL": "http://invalid.example",
+        },
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        get_settings()
+
+    diagnostic = str(captured.value)
+    assert "DHAN_REST_BASE_URL" in diagnostic
+    assert client_id not in diagnostic
+    assert pin not in diagnostic
+    assert secret not in diagnostic
+
+
+def test_rejects_insecure_dhan_rest_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dhan credentials are never configured for a non-TLS REST endpoint."""
+    _set_environment(
+        monkeypatch,
+        {**_VALID_REQUIRED_VALUES, "DHAN_REST_BASE_URL": "http://api.dhan.co/v2"},
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        get_settings()
+
+    assert "DHAN_REST_BASE_URL" in str(captured.value)
+
+
+def test_rejects_nonpositive_provider_lifecycle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider lifecycle operations must have a positive bounded timeout."""
+    _set_environment(
+        monkeypatch,
+        {**_VALID_REQUIRED_VALUES, "PROVIDER_LIFECYCLE_TIMEOUT_SECONDS": "0"},
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        get_settings()
+
+    assert "PROVIDER_LIFECYCLE_TIMEOUT_SECONDS" in str(captured.value)
 
 
 def test_rejects_debug_mode_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
