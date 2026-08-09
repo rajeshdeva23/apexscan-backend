@@ -110,7 +110,9 @@ class ApplicationLifecycle:
         self._redis_state = DependencyState.UNKNOWN
         self._provider_state = DependencyState.UNKNOWN
 
-    async def start(self, settings: Settings) -> None:
+    # Pre-existing Phase-2 complexity (9 > 8); tracked debt. Refactor is out of
+    # P4.0 scope; new code is gated by C901 (docs/11 Rule 16).
+    async def start(self, settings: Settings) -> None:  # noqa: C901
         """Start mandatory dependencies in order and gate application readiness.
 
         Raises:

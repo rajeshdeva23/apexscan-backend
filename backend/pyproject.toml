@@ -49,7 +49,26 @@ target-version = "py313"
 
 [tool.ruff.lint]
 # Enable common rule families; keep the build warning-free.
-select = ["E", "F", "I", "N", "UP", "B", "ASYNC"]
+# C90 (mccabe) enforces the cyclomatic-complexity ceiling from docs/11 Rule 16;
+# D (pydocstyle, google) enforces the docstring standard from docs/11 Rule 26.
+select = ["E", "F", "I", "N", "UP", "B", "ASYNC", "C90", "D"]
+# docs/11 Rule 26 requires docstrings on non-trivial *public APIs* using Google
+# style, which documents construction via the class docstring — so __init__
+# (D107) and magic methods (D105) are not separately required.
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.mccabe]
+# docs/11 §3.2 / Rule 16: cyclomatic complexity <= 8.
+max-complexity = 8
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Docstrings (D) and the complexity ceiling (C90) are production public-API
+# standards (docs/11 Rules 16, 26). Tests are neither a public-API surface nor
+# the target of the Market Engine complexity gate, so they are exempt.
+"tests/**" = ["D", "C90"]
 
 [tool.mypy]
 python_version = "3.13"

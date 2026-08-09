@@ -87,6 +87,7 @@ def test_fixture_normalizer_converts_provider_shaped_input_without_leaking_field
         "event_timestamp": "2026-08-04T09:15:00Z",
         "last_price": "101.25",
         "traded_quantity": 10,
+        "session_cumulative_volume": None,
     }
 
 
@@ -177,12 +178,23 @@ def test_shared_contracts_and_canonical_types_do_not_import_dhan() -> None:
         assert "dhan" not in inspect.getsource(module).lower()
 
 
-def test_no_market_engine_or_strategy_implementation_is_introduced() -> None:
-    """P3.1 creates only the provider boundary, not later engine or strategy logic."""
-    for package_name in ("app.market_engine", "app.strategies"):
-        package = import_module(package_name)
-        package_path = Path(package.__file__).parent
-        implementation_modules = [
-            path for path in package_path.glob("*.py") if path.name != "__init__.py"
-        ]
-        assert implementation_modules == []
+def test_no_strategy_engine_or_market_logic_is_introduced() -> None:
+    """Strategy Engine stays unimplemented; the Market Engine holds only its P4.1 foundation.
+
+    Through P4.4 the Market Engine holds the deterministic foundation, tick/quote
+    routing and validation, the market-session layer, and live candle
+    aggregation; it still builds no historical context, computes no features, and
+    the Strategy Engine (Phase 5) and its context-builder orchestrator do not
+    exist yet.
+    """
+    strategies = import_module("app.strategies")
+    strategies_path = Path(strategies.__file__).parent
+    assert [path for path in strategies_path.glob("*.py") if path.name != "__init__.py"] == []
+
+    engine = import_module("app.market_engine")
+    engine_modules = {path.name for path in Path(engine.__file__).parent.glob("*.py")}
+    forbidden_market_logic = {
+        "engine.py",
+        "historical_context.py",
+    }
+    assert engine_modules.isdisjoint(forbidden_market_logic)
