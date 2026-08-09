@@ -295,6 +295,7 @@ def _decode_quote_packet(
                 event_timestamp=event_timestamp,
                 last_price=Decimal(str(last_price)),
                 traded_quantity=last_trade_quantity,
+                session_cumulative_volume=volume,
             ),
         )
     except (OverflowError, OSError, ValueError) as error:
@@ -363,6 +364,7 @@ def _decode_full_packet(
             event_timestamp=event_timestamp,
             last_price=Decimal(str(last_price)),
             traded_quantity=last_trade_quantity,
+            session_cumulative_volume=volume,
         )
         quote = Quote(
             instrument=reference.instrument,

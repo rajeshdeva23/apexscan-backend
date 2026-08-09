@@ -10,9 +10,11 @@ injection (see :func:`app.core.config.get_settings`).
 from __future__ import annotations
 
 import re
+from datetime import UTC, date, datetime
 from functools import lru_cache
 from typing import Self
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -80,6 +82,20 @@ class Settings(BaseSettings):
     dhan_rest_base_url: str = Field(default="https://api.dhan.co/v2")
     dhan_rest_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     dhan_live_smoke_enabled: bool = Field(default=False)
+
+    # --- Market session (NSE cash-equity; ADR-004) -------------------------
+    # Exchange timezone for interpreting canonical UTC timestamps into the
+    # trading date and session phase; canonical timestamps stay UTC.
+    exchange_timezone: str = Field(default="Asia/Kolkata")
+    # Exchange-local HH:MM session boundaries (configuration, not embedded
+    # assumptions — docs/06 §8); defaults reflect the NSE regular schedule.
+    nse_pre_open_start: str = Field(default="09:00")
+    nse_opening_auction_start: str = Field(default="09:08")
+    nse_regular_open: str = Field(default="09:15")
+    nse_regular_close: str = Field(default="15:30")
+    nse_closing_end: str = Field(default="15:40")
+    # Comma-separated ISO trading-holiday dates (deterministic; no remote fetch).
+    nse_holidays: str = Field(default="")
 
     @field_validator("app_env")
     @classmethod
@@ -170,8 +186,52 @@ class Settings(BaseSettings):
             raise ValueError("DHAN_REST_BASE_URL must be an HTTPS URL without query or fragment")
         return normalized
 
+    @field_validator("exchange_timezone")
+    @classmethod
+    def validate_exchange_timezone(cls, value: str) -> str:
+        """Require a resolvable IANA timezone for exchange-session interpretation."""
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError("EXCHANGE_TIMEZONE must be a valid IANA timezone name") from error
+        return normalized
+
+    @field_validator(
+        "nse_pre_open_start",
+        "nse_opening_auction_start",
+        "nse_regular_open",
+        "nse_regular_close",
+        "nse_closing_end",
+    )
+    @classmethod
+    def validate_session_time(cls, value: str) -> str:
+        """Require each session boundary to be an exchange-local ``HH:MM`` time."""
+        normalized = value.strip()
+        try:
+            datetime.strptime(normalized, "%H:%M").replace(tzinfo=UTC)
+        except ValueError as error:
+            raise ValueError("session boundary times must be formatted as HH:MM") from error
+        return normalized
+
+    @field_validator("nse_holidays")
+    @classmethod
+    def validate_holidays(cls, value: str) -> str:
+        """Require every configured holiday to be an ISO (YYYY-MM-DD) date."""
+        for entry in value.split(","):
+            candidate = entry.strip()
+            if not candidate:
+                continue
+            try:
+                date.fromisoformat(candidate)
+            except ValueError as error:
+                raise ValueError("NSE_HOLIDAYS entries must be ISO dates (YYYY-MM-DD)") from error
+        return value
+
+    # Pre-existing Phase-2/3 complexity (11 > 8); tracked debt. Refactor is out
+    # of P4.0 scope; new code is gated by C901 (docs/11 Rule 16).
     @model_validator(mode="after")
-    def validate_production_safety(self) -> Self:
+    def validate_production_safety(self) -> Self:  # noqa: C901
         """Reject settings that are safe only for local development in production."""
         if self.dhan_live_smoke_enabled:
             if self.dhan_auth_mode == "access_token":

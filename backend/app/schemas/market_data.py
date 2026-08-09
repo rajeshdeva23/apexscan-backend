@@ -152,6 +152,20 @@ class ProviderCapability(StrEnum):
     INSTRUMENTS = "instruments"
 
 
+class FeedContinuity(StrEnum):
+    """Broker-neutral live-feed continuity states reported by the Data Provider.
+
+    A market-data quality fact (ADR-006), distinct from provider health/readiness
+    (ProviderStatus). Consumed by the Market Engine to decide candle completeness;
+    it never carries provider transport types, codes, or security identifiers.
+    """
+
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    RECONNECTED = "reconnected"
+    CONTINUITY_LOST = "continuity_lost"
+
+
 def _require_aware_timestamp(value: datetime) -> datetime:
     """Reject ambiguous clocks and normalize accepted timestamps to UTC."""
     if value.tzinfo is None or value.utcoffset() is None:
@@ -169,10 +183,18 @@ class _EventData(_CanonicalModel):
 
 
 class Tick(_EventData):
-    """One event-time last-traded price and optional traded quantity in units."""
+    """One event-time last-traded price and optional traded quantity in units.
+
+    ``traded_quantity`` is the last-traded quantity (LTQ) of the most recent
+    trade — not an interval or cumulative volume. ``session_cumulative_volume``
+    is the exchange-reported session-to-date cumulative traded quantity and is
+    the only correct basis for live candle volume (ADR-005); it is broker-neutral
+    and optional (absent when the provider does not report it).
+    """
 
     last_price: Decimal = Field(gt=0)
     traded_quantity: int | None = Field(default=None, ge=0)
+    session_cumulative_volume: int | None = Field(default=None, ge=0)
 
 
 class Quote(_EventData):
@@ -283,6 +305,20 @@ class ProviderHealth(_CanonicalModel):
     """A point-in-time broker health observation, not application readiness."""
 
     status: ProviderStatus
+    observed_at: datetime
+
+    _validate_observed_at = field_validator("observed_at")(_require_aware_timestamp)
+
+
+class FeedContinuityEvent(_CanonicalModel):
+    """A broker-neutral, feed-wide live-continuity fact (ADR-006).
+
+    Produced by the Data Provider and consumed by the Market Engine to invalidate
+    candle completeness across a continuity loss. Feed-wide (not per-instrument):
+    the engine applies it to every instrument it is aggregating.
+    """
+
+    status: FeedContinuity
     observed_at: datetime
 
     _validate_observed_at = field_validator("observed_at")(_require_aware_timestamp)

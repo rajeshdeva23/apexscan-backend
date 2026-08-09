@@ -26,6 +26,7 @@ from app.adapters.base import (
 from app.adapters.dhan import DhanRestAdapter
 from app.schemas.market_data import (
     DepthSnapshot,
+    FeedContinuity,
     Instrument,
     MarketDataKind,
     Quote,
@@ -194,6 +195,8 @@ def test_quote_packet_normalizes_only_to_a_canonical_tick() -> None:
     assert events[0].instrument.symbol == "360ONE"
     assert str(events[0].last_price) == "101.25"
     assert events[0].traded_quantity == 12
+    # ADR-005: the day-cumulative volume is surfaced broker-neutrally (LTQ 12 != volume).
+    assert events[0].session_cumulative_volume == 1200
     assert events[0].event_timestamp.isoformat() == "2025-09-04T06:35:00+00:00"
 
 
@@ -220,6 +223,7 @@ def test_full_packet_normalizes_quote_and_five_level_depth_when_requested() -> N
     assert plan.feed_mode is dhan.DhanLiveFeedMode.FULL
     assert [type(event) for event in events] == [Tick, Quote, DepthSnapshot]
     tick, quote, depth = events
+    assert tick.session_cumulative_volume == 3000
     assert tick.last_price == 200.5
     assert quote.bid_price == 200.0
     assert str(quote.ask_price) == "200.0500030517578"
@@ -656,6 +660,52 @@ async def test_mapping_gate_blocks_websocket_connect_when_a_cash_reference_is_mi
         await adapter.disconnect()
 
     assert live_transport.connection_urls == []
+
+
+async def test_live_feed_emits_broker_neutral_continuity_facts() -> None:
+    """The adapter surfaces connect/loss/reconnect as broker-neutral continuity facts (ADR-006)."""
+    first_socket = _FakeLiveSocket((ConnectionError("fixture feed lost"),))
+    second_socket = _FakeLiveSocket((_packet("live_quote_packet.hex"),))
+    live_transport = _FakeLiveTransport(first_socket, second_socket)
+    statuses: list[FeedContinuity] = []
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    dhan = _dhan()
+    adapter = DhanRestAdapter(
+        access_token=SecretStr(_ACCESS_TOKEN),
+        live_client_id=SecretStr(_CLIENT_ID),
+        transport=httpx.MockTransport(_master_handler),
+        websocket_transport=live_transport,
+        live_reconnect_policy=dhan.DhanLiveReconnectPolicy(
+            maximum_attempts=1,
+            initial_delay_seconds=0.0,
+            maximum_delay_seconds=0.0,
+            jitter_ratio=0.0,
+        ),
+        live_sleep=no_wait,
+        live_continuity_sink=lambda event: statuses.append(event.status),
+    )
+    await adapter.connect()
+    await adapter.load_instruments()
+    try:
+        request = SubscriptionRequest(
+            instruments=(
+                adapter.load_nse_cash_equity_live_universe().cash_references[0].instrument,
+            ),
+            data_types=frozenset({MarketDataKind.TICK}),
+        )
+        stream = adapter.stream_market_data(request)
+        event = await anext(stream)
+        await stream.aclose()
+    finally:
+        await adapter.disconnect()
+
+    assert isinstance(event, Tick)
+    assert FeedContinuity.CONNECTED in statuses
+    assert FeedContinuity.CONTINUITY_LOST in statuses
+    assert FeedContinuity.RECONNECTED in statuses
 
 
 def _packet_with_header(

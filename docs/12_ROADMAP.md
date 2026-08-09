@@ -314,6 +314,26 @@ and the always-on quality gates.
 > ⚠️ **The Market Engine is the trust anchor.** If its facts are wrong or non-reproducible, every layer
 > above inherits the error. Its Definition of Done is therefore the strictest in the roadmap.
 
+### 7.7 Phase 4.5 — Historical Context & Reconciliation
+
+**Status: COMPLETE.** Authorized by ADR-005 and ADR-006; a Market Engine sub-capability that adds
+historical facts and authoritative repair without introducing decisions. Scope, as implemented:
+- A broker-neutral `HistoricalRequirement` (timeframe, lookback) registration seam with deterministic
+  union/deduplication (max lookback per timeframe) — the future consumer/strategy hook, no strategy coupling.
+- An immutable, per-instrument `HistoricalContext` (previous-session facts + per-timeframe series) carried
+  additively inside `MarketContext`; installation mints no version and surfaces on the next accepted datum.
+- An engine-local `HistoricalSource` abstraction with an exact-coverage in-memory cache, in-flight request
+  deduplication, and bounded concurrency; completed-session warmup only (current-day withheld).
+- Exact arbitrary-timeframe reconstruction (e.g. 7m from authoritative 1m) sharing one session-relative
+  bucket algorithm with the live engine; withholds unless mathematically exact.
+- Incomplete-candle reconciliation and feed-gap recovery by exact `(instrument, timeframe, start, end)`
+  identity; daily→session canonicalization aligns provider daily bars to the live session identity.
+- Deterministic replay of history + reconciliation; a composition bridge (`app/services`) adapts the
+  Phase-3 `HistoricalDataAdapter` to `HistoricalSource` outside the Market Engine.
+- **Current-day fail-safe:** `CURRENT_DAY_RECONCILIATION_GUARANTEE` remains **NOT PROVEN**; same-day
+  reconciliation is withheld by default. The capability is **dormant** until a future orchestrator
+  (Phase 5) registers requirements — zero requirements make zero source calls and never block readiness.
+
 ---
 
 ## 8. Phase 5 — Strategy Engine
@@ -699,6 +719,16 @@ checked and its acceptance criteria are met.
 - [ ] Determinism is a passing DoD gate.
 - [ ] Ordering guarantees hold under load.
 - [ ] Facts vs decisions boundary is verified by review against `06`.
+
+### Historical Context & Reconciliation (Phase 4.5)
+- [ ] Broker-neutral `HistoricalRequirement` registration with deterministic union/dedup.
+- [ ] Immutable `HistoricalContext`; installation/reconciliation mint no standalone version.
+- [ ] Exact-coverage in-memory cache; in-flight dedup; bounded concurrency (no persistence).
+- [ ] Exact arbitrary-timeframe reconstruction shares the live bucket algorithm; withholds unless exact.
+- [ ] Exact-identity reconciliation and feed-gap recovery; active partial never rewritten.
+- [ ] Daily→session canonicalization aligns provider daily bars to live session identity.
+- [ ] Current-day reconciliation withheld by default (guarantee NOT PROVEN); capability dormant.
+- [ ] The Market Engine imports no concrete provider; the composition bridge lives outside it.
 
 ### Strategy Engine (Phase 5)
 - [ ] The strategy execution pipeline works.

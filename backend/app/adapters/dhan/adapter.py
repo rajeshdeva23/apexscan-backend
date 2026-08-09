@@ -66,6 +66,8 @@ from app.adapters.dhan.normalizer import (
 from app.core.config import Settings
 from app.schemas.market_data import (
     Candle,
+    FeedContinuity,
+    FeedContinuityEvent,
     HistoricalRequest,
     HistoricalResult,
     Instrument,
@@ -179,6 +181,7 @@ class DhanRestAdapter(
         live_reconnect_policy: DhanLiveReconnectPolicy | None = None,
         live_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         live_random: Callable[[], float] = random.random,
+        live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
     ) -> None:
         if (access_token is None) == (token_provider is None):
             raise ProviderAuthenticationError()
@@ -214,6 +217,14 @@ class DhanRestAdapter(
         self._live_reconnect_policy = live_reconnect_policy or DhanLiveReconnectPolicy()
         self._live_sleep = live_sleep
         self._live_random = live_random
+        self._live_continuity_sink = live_continuity_sink
+
+    def _emit_continuity(self, status: FeedContinuity) -> None:
+        """Emit a broker-neutral live-continuity fact to the injected sink, if any."""
+        if self._live_continuity_sink is not None:
+            self._live_continuity_sink(
+                FeedContinuityEvent(status=status, observed_at=datetime.now(UTC))
+            )
 
     @classmethod
     def from_settings(
@@ -480,6 +491,7 @@ class DhanRestAdapter(
         except Exception as error:
             self._live_status = ProviderStatus.DOWN
             raise ProviderNetworkError() from error
+        self._emit_continuity(FeedContinuity.CONNECTED)
 
     async def _reconcile_live_subscriptions(self, plan: DhanLiveSubscriptionPlan) -> None:
         socket = self._require_live_socket()
@@ -513,6 +525,7 @@ class DhanRestAdapter(
                     if plan is None:
                         return
                     await self._reconcile_live_subscriptions(plan)
+                    self._emit_continuity(FeedContinuity.RECONNECTED)
                     return
                 except asyncio.CancelledError:
                     raise
@@ -559,6 +572,7 @@ class DhanRestAdapter(
         self._active_live_batches = ()
         self._live_status = ProviderStatus.DEGRADED
         if socket is not None:
+            self._emit_continuity(FeedContinuity.CONTINUITY_LOST)
             try:
                 await socket.close()
             except Exception:
