@@ -17,7 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.market_engine.buckets import bucket_bounds
-from app.market_engine.session import SessionSchedule, TradingCalendar
+from app.market_engine.session import EffectiveSchedule, TradingCalendar
 from app.market_engine.timeframe import Timeframe
 from app.schemas.market_data import Candle
 
@@ -27,21 +27,26 @@ _SESSION = Timeframe.session()
 def canonicalize_session_candle(
     candle: Candle,
     *,
-    schedule: SessionSchedule,
+    effective: EffectiveSchedule,
     calendar: TradingCalendar,
     exchange_timezone: str,
 ) -> Candle | None:
-    """Re-stamp a daily bar to its trading date's regular-session bounds.
+    """Re-stamp a daily bar to its trading date's whole-session envelope bounds.
+
+    The whole-session identity spans the date's envelope — the default bounds for an
+    ordinary date, or the first-interval start to last-interval end for a special
+    multi-interval date (ADR-011 addendum MI10). OHLCV from the daily bar is preserved
+    unchanged across the intervening closure; only the timestamps are canonicalized.
 
     Args:
         candle: The provider daily candle (OHLCV authoritative; timestamps arbitrary).
-        schedule: The exchange session schedule (open/close bounds).
+        effective: The default-plus-override effective schedule (envelope lookup).
         calendar: The trading calendar (holiday/weekend fail-closed).
         exchange_timezone: The IANA exchange timezone.
 
     Returns:
-        A canonical session candle spanning ``[regular_open, regular_close)`` for the
-        bar's trading date, or ``None`` if that date is not a configured trading day.
+        A canonical session candle spanning the trading date's envelope, or ``None``
+        if that date is not a configured trading day.
     """
     timezone = ZoneInfo(exchange_timezone)
     trading_date = candle.start_timestamp.astimezone(timezone).date()
@@ -51,7 +56,7 @@ def canonicalize_session_candle(
         event_timestamp=candle.start_timestamp,
         trading_date=trading_date,
         timeframe=_SESSION,
-        schedule=schedule,
+        interval=effective.envelope_for(trading_date),
         timezone=timezone,
     )
     return Candle(
@@ -69,7 +74,7 @@ def canonicalize_session_candle(
 def canonical_session_series(
     candles: Iterable[Candle],
     *,
-    schedule: SessionSchedule,
+    effective: EffectiveSchedule,
     calendar: TradingCalendar,
     exchange_timezone: str,
 ) -> tuple[Candle, ...]:
@@ -82,7 +87,7 @@ def canonical_session_series(
     seen: set[tuple[datetime, datetime]] = set()
     for candle in candles:
         session = canonicalize_session_candle(
-            candle, schedule=schedule, calendar=calendar, exchange_timezone=exchange_timezone
+            candle, effective=effective, calendar=calendar, exchange_timezone=exchange_timezone
         )
         if session is None:
             continue

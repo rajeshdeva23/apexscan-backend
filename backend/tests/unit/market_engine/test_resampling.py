@@ -14,7 +14,7 @@ from app.market_engine.historical.resampling import (
     reconstruct_series,
     select_base,
 )
-from app.market_engine.session import SessionSchedule, TradingCalendar
+from app.market_engine.session import EffectiveSchedule, SessionSchedule, TradingCalendar
 from app.market_engine.timeframe import Timeframe
 from app.schemas.market_data import Candle, Instrument
 
@@ -72,7 +72,7 @@ def _reconstruct(source: HistoricalSeries, target: Timeframe) -> HistoricalSerie
     return reconstruct_series(
         source=source,
         target=target,
-        schedule=_SCHEDULE,
+        effective=EffectiveSchedule(default=_SCHEDULE),
         calendar=_CALENDAR,
         exchange_timezone=_TZ,
     )
@@ -193,7 +193,7 @@ def test_holiday_dated_source_withholds() -> None:
     result = reconstruct_series(
         source=source,
         target=_SEVEN,
-        schedule=_SCHEDULE,
+        effective=EffectiveSchedule(default=_SCHEDULE),
         calendar=calendar,
         exchange_timezone=_TZ,
     )

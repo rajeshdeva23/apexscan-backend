@@ -5,6 +5,7 @@ from app.adapters.base.broker_adapter import (
     HistoricalDataAdapter,
     InstrumentDataAdapter,
     LiveMarketDataAdapter,
+    SessionStatisticsSource,
 )
 from app.adapters.base.errors import (
     InvalidProviderDataError,
@@ -51,6 +52,7 @@ __all__ = [
     "ProviderRateLimitError",
     "ProviderTimeoutError",
     "ProviderUnavailableError",
+    "SessionStatisticsSource",
     "TickNormalizer",
     "UnsupportedProviderRequestError",
     "UnknownProviderReferenceError",

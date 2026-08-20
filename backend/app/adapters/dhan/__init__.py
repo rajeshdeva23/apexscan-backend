@@ -37,6 +37,7 @@ from app.adapters.dhan.normalizer import (
     derive_equity_fno_universe,
     normalize_historical_payload,
     normalize_instrument_master,
+    normalize_session_statistics_payload,
     resolve_nse_cash_equity_live_universe,
 )
 
@@ -66,6 +67,7 @@ __all__ = [
     "derive_equity_fno_universe",
     "normalize_historical_payload",
     "normalize_instrument_master",
+    "normalize_session_statistics_payload",
     "plan_live_subscription_batches",
     "resolve_nse_cash_equity_live_universe",
 ]

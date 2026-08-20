@@ -83,6 +83,25 @@ class Settings(BaseSettings):
     dhan_rest_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     dhan_live_smoke_enabled: bool = Field(default=False)
 
+    # --- Market provider runtime (ADR-010 D14) -----------------------------
+    # Explicit switch: the live-market runtime (provider + universe + ingestion)
+    # is composed only when this is true. Never inferred from credential presence,
+    # environment name, or debug. Default off so ordinary local/CI runs stay dormant.
+    market_provider_enabled: bool = Field(default=False)
+    # Consecutive-failure threshold moving a strategy to ERROR (docs/07 §20 leaves the
+    # number to configuration). Exercised only once concrete strategies run.
+    strategy_error_threshold: int = Field(default=3, ge=1)
+    # Comma-separated strategy ids to enable in production (ADR-013 REG3). Default empty:
+    # zero production strategies started. Only catalog-known ids resolve; the composition
+    # fails closed on an unknown id. This is the sole strategy-enablement seam — no
+    # strategy-specific fields live in Settings (strategy config lives in the catalog).
+    strategies_enabled: str = Field(default="")
+    # Infrastructure wake interval for the session-statistics refresh driver — how often it
+    # evaluates the phase/demand/cadence gate (ADR-009 addendum). This is NOT the refresh
+    # cadence (the coordinator owns that via the strictest freshness max_age); keep it at or
+    # below the strictest configured max_age so no due transition is missed.
+    session_statistics_refresh_poll_seconds: float = Field(default=1.0, gt=0, le=60)
+
     # --- Market session (NSE cash-equity; ADR-004) -------------------------
     # Exchange timezone for interpreting canonical UTC timestamps into the
     # trading date and session phase; canonical timestamps stay UTC.
@@ -96,6 +115,17 @@ class Settings(BaseSettings):
     nse_closing_end: str = Field(default="15:40")
     # Comma-separated ISO trading-holiday dates (deterministic; no remote fetch).
     nse_holidays: str = Field(default="")
+
+    # --- Secondary calendar monitor (ADR-011; observation-only) ------------
+    # Off by default and never inferred: when enabled, a runtime-owned task fetches a
+    # public, unauthenticated secondary calendar page once per exchange-local day and
+    # compares it against the authoritative dataset. It never mutates any calendar
+    # authority; a discrepancy is a review signal only.
+    calendar_monitor_enabled: bool = Field(default=False)
+    # Exchange-local HH:MM at/after which the daily check fires (before the 09:15 open).
+    calendar_monitor_run_time: str = Field(default="08:00")
+    # Bounded per-request timeout for the secondary page fetch.
+    calendar_monitor_request_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
     @field_validator("app_env")
     @classmethod
@@ -203,6 +233,7 @@ class Settings(BaseSettings):
         "nse_regular_open",
         "nse_regular_close",
         "nse_closing_end",
+        "calendar_monitor_run_time",
     )
     @classmethod
     def validate_session_time(cls, value: str) -> str:
@@ -227,6 +258,46 @@ class Settings(BaseSettings):
             except ValueError as error:
                 raise ValueError("NSE_HOLIDAYS entries must be ISO dates (YYYY-MM-DD)") from error
         return value
+
+    @field_validator("strategies_enabled")
+    @classmethod
+    def validate_strategies_enabled(cls, value: str) -> str:
+        """Require each enabled entry to be a lowercase snake_case strategy id (fail safe)."""
+        for entry in value.split(","):
+            candidate = entry.strip()
+            if candidate and re.fullmatch(r"[a-z][a-z0-9_]*", candidate) is None:
+                raise ValueError(
+                    "STRATEGIES_ENABLED entries must be lowercase snake_case strategy ids"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def validate_provider_enabled_credentials(self) -> Self:
+        """Require the auth-mode credentials when the market provider runtime is enabled.
+
+        Fail fast at configuration time (ADR-010 D14): an enabled provider must never
+        start with missing credentials, and enablement is never inferred.
+        """
+        if not self.market_provider_enabled:
+            return self
+        if self.dhan_auth_mode == "access_token":
+            if not _has_secret_value(self.dhan_access_token):
+                raise ValueError(
+                    "DHAN_ACCESS_TOKEN must be configured when MARKET_PROVIDER_ENABLED=true "
+                    "and DHAN_AUTH_MODE=access_token"
+                )
+            return self
+        for setting_name, secret in (
+            ("DHAN_CLIENT_ID", self.dhan_client_id),
+            ("DHAN_PIN", self.dhan_pin),
+            ("DHAN_TOTP_SECRET", self.dhan_totp_secret),
+        ):
+            if not _has_secret_value(secret):
+                raise ValueError(
+                    f"{setting_name} must be configured when MARKET_PROVIDER_ENABLED=true "
+                    "and DHAN_AUTH_MODE=totp"
+                )
+        return self
 
     # Pre-existing Phase-2/3 complexity (11 > 8); tracked debt. Refactor is out
     # of P4.0 scope; new code is gated by C901 (docs/11 Rule 16).
@@ -278,6 +349,11 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Return CORS origins as a clean list of non-empty strings."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def strategies_enabled_list(self) -> list[str]:
+        """Return the enabled strategy ids as a clean list of non-empty strings."""
+        return [entry.strip() for entry in self.strategies_enabled.split(",") if entry.strip()]
 
     @property
     def is_production(self) -> bool:

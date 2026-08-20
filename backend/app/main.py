@@ -19,22 +19,40 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
 from app.cache import redis_lifecycle
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.lifecycle import (
     ApplicationLifecycle,
     ApplicationShutdownError,
     ApplicationStartupError,
+    ProviderDependency,
 )
 from app.core.logging import configure_logging
 from app.database import database_lifecycle
 from app.middleware.request_logging import RequestLoggingMiddleware
+from app.services.dhan_runtime_composition import LiveMarketRuntimeDependency
 
 logger = logging.getLogger(__name__)
-# No concrete provider adapter is configurable at startup in Phase 3 (local and
-# CI environments hold no broker credentials), so the composition root registers
-# no provider dependency. The ProviderCoordinator lifecycle is wired here once a
-# concrete adapter can be constructed from settings.
-application_lifecycle = ApplicationLifecycle(database_lifecycle, redis_lifecycle)
+
+
+def _provider_dependency(settings: Settings) -> ProviderDependency | None:
+    """Build the live-market runtime dependency when the provider is explicitly enabled.
+
+    Construction is side-effect free — provider I/O happens inside the lifespan via
+    ``ApplicationLifecycle.start`` → the dependency's ``start`` (ADR-010 D8/D14). When the
+    provider is disabled, the app runs dormant (``None``) with no broker credentials.
+    """
+    if not settings.market_provider_enabled:
+        return None
+    return LiveMarketRuntimeDependency(
+        settings=settings, error_threshold=settings.strategy_error_threshold
+    )
+
+
+def _build_application_lifecycle(settings: Settings) -> ApplicationLifecycle:
+    """Assemble the application lifecycle over the shared DB/Redis + optional runtime."""
+    return ApplicationLifecycle(
+        database_lifecycle, redis_lifecycle, provider=_provider_dependency(settings)
+    )
 
 
 @asynccontextmanager
@@ -79,7 +97,7 @@ def create_app(lifecycle: ApplicationLifecycle | None = None) -> FastAPI:
         debug=settings.app_debug,
         lifespan=lifespan,
     )
-    app.state.lifecycle = lifecycle or application_lifecycle
+    app.state.lifecycle = lifecycle or _build_application_lifecycle(settings)
 
     # Cross-origin access for the browser frontend.
     app.add_middleware(

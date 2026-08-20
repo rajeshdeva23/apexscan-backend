@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from io import StringIO
@@ -25,6 +25,8 @@ from app.schemas.market_data import (
     InstrumentClass,
     MarketSegment,
     OptionType,
+    ProviderSessionOhlc,
+    SessionStatisticsObservation,
     UnderlyingInstrument,
 )
 
@@ -232,6 +234,72 @@ def normalize_historical_payload(
         return HistoricalResult(request=request, candles=tuple(candles))
     except (InvalidOperation, OverflowError, TypeError, ValidationError, ValueError) as error:
         raise NormalizationError() from error
+
+
+def normalize_session_statistics_payload(
+    payload: Mapping[str, object],
+    pairs: Sequence[tuple[Instrument, DhanInstrumentReference]],
+    *,
+    trading_date: date,
+    observed_at: datetime,
+) -> tuple[SessionStatisticsObservation, ...]:
+    """Map a Market Quote OHLC response into canonical session-statistics observations.
+
+    One observation per requested instrument whose response OHLC satisfies the canonical
+    :class:`ProviderSessionOhlc` contract; an instrument missing from the response, or whose
+    OHLC is sentinel/zero or structurally invalid, is withheld (never fabricated). Output
+    order follows ``pairs`` (deterministic canonical order), independent of provider
+    response ordering. ``trading_date``/``observed_at`` are stamped from the caller.
+
+    Args:
+        payload: The decoded provider response (must carry ``status == "success"``).
+        pairs: The requested ``(instrument, reference)`` pairs, in canonical order.
+        trading_date: The exchange trading date the caller resolved.
+        observed_at: The single batch instant the snapshot became known (tz-aware UTC).
+
+    Returns:
+        The canonical observations, in ``pairs`` order.
+    """
+    if payload.get("status") != "success":
+        raise NormalizationError()
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise NormalizationError()
+
+    observations: list[SessionStatisticsObservation] = []
+    for instrument, reference in pairs:
+        segment = reference.exchange_segment
+        segment_data = data.get(segment) if segment is not None else None
+        item = (
+            segment_data.get(reference.security_id) if isinstance(segment_data, Mapping) else None
+        )
+        session_ohlc = _session_ohlc_from(item.get("ohlc")) if isinstance(item, Mapping) else None
+        if session_ohlc is None:
+            continue  # missing / sentinel / malformed provider OHLC — withheld, never fabricated
+        observations.append(
+            SessionStatisticsObservation(
+                instrument=instrument,
+                trading_date=trading_date,
+                observed_at=observed_at,
+                session_ohlc=session_ohlc,
+            )
+        )
+    return tuple(observations)
+
+
+def _session_ohlc_from(ohlc: object) -> ProviderSessionOhlc | None:
+    """Build a canonical session OHLC from a provider ``ohlc`` object, or None if unusable."""
+    if not isinstance(ohlc, Mapping):
+        return None
+    try:
+        return ProviderSessionOhlc(
+            open_price=_decimal(ohlc["open"]),
+            high_price=_decimal(ohlc["high"]),
+            low_price=_decimal(ohlc["low"]),
+            close_price=_decimal(ohlc["close"]),
+        )
+    except (KeyError, NormalizationError, ValidationError):
+        return None
 
 
 def _normalize_instrument_row(row: Mapping[str, str | None]) -> DhanInstrumentReference:

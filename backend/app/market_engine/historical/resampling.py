@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from app.market_engine.buckets import bucket_bounds, session_buckets
 from app.market_engine.historical.context import HistoricalSeries
-from app.market_engine.session import SessionSchedule, TradingCalendar
+from app.market_engine.session import EffectiveSchedule, TradingCalendar, TradingInterval
 from app.market_engine.timeframe import Timeframe
 from app.schemas.market_data import Candle
 
@@ -54,17 +54,26 @@ def reconstruct_series(
     *,
     source: HistoricalSeries,
     target: Timeframe,
-    schedule: SessionSchedule,
+    effective: EffectiveSchedule,
     calendar: TradingCalendar,
     exchange_timezone: str,
 ) -> HistoricalSeries | None:
     """Reconstruct an authoritative target series from a smaller authoritative source.
 
+    Each trading date is bucketed with its *effective* live intervals — the default
+    schedule for an ordinary date, the per-date override intervals for a special OPEN
+    date. A multi-interval special date reconstructs each disjoint block independently
+    and concatenates them chronologically; the closed gap yields no expected buckets
+    and no synthetic candles (ADR-011 multi-interval addendum MI8/MI9/MI11). A special
+    OPEN date that lacks session-hours metadata is withheld (never bucketed with
+    regular hours), so a missing override can never produce a falsely-complete intraday
+    session (ADR-011 addendum M16).
+
     Args:
         source: The authoritative smaller-timeframe series (one instrument).
         target: The intraday target timeframe (must be exactly divisible by source).
-        schedule: The exchange session boundaries (bucket anchor and truncation).
-        calendar: The trading calendar (holiday protection).
+        effective: The default-plus-override session bounds resolver.
+        calendar: The trading calendar (holiday and open-session classification).
         exchange_timezone: The IANA exchange timezone.
 
     Returns:
@@ -85,16 +94,19 @@ def reconstruct_series(
     for trading_date in sorted(by_date):
         if not calendar.is_trading_day(trading_date):
             continue  # holiday-dated source bars are a conflict — withhold (§14)
-        reconstructed.extend(
-            _reconstruct_session(
-                trading_date=trading_date,
-                day_candles=by_date[trading_date],
-                target=target,
-                source_duration=source_duration,
-                schedule=schedule,
-                timezone=timezone,
+        if trading_date in calendar.open_sessions and not effective.has_override(trading_date):
+            continue  # special OPEN date without timing — fail closed (M16)
+        for interval in effective.intervals_for(trading_date):
+            reconstructed.extend(
+                _reconstruct_interval(
+                    trading_date=trading_date,
+                    day_candles=by_date[trading_date],
+                    target=target,
+                    source_duration=source_duration,
+                    interval=interval,
+                    timezone=timezone,
+                )
             )
-        )
     if not reconstructed:
         return None
     return HistoricalSeries(timeframe=target, candles=tuple(reconstructed))
@@ -109,33 +121,39 @@ def _group_by_trading_date(
     return grouped
 
 
-def _reconstruct_session(
+def _reconstruct_interval(
     *,
     trading_date: date,
     day_candles: list[Candle],
     target: Timeframe,
     source_duration: timedelta,
-    schedule: SessionSchedule,
+    interval: TradingInterval,
     timezone: ZoneInfo,
 ) -> list[Candle]:
-    _, _, session_close = bucket_bounds(
-        event_timestamp=datetime.combine(trading_date, schedule.regular_close, tzinfo=timezone),
+    """Reconstruct target buckets for one live interval; the closed gap is never spanned.
+
+    Source candles outside this interval fall on bucket indices the interval never
+    enumerates, so they contribute no candle here (they belong to another interval, or
+    to the gap, which yields none).
+    """
+    _, _, interval_close = bucket_bounds(
+        event_timestamp=datetime.combine(trading_date, interval.end, tzinfo=timezone),
         trading_date=trading_date,
         timeframe=Timeframe.minutes(1),
-        schedule=schedule,
+        interval=interval,
         timezone=timezone,
     )
-    by_index = _group_by_bucket_index(day_candles, trading_date, target, schedule, timezone)
+    by_index = _group_by_bucket_index(day_candles, trading_date, target, interval, timezone)
     emitted: list[Candle] = []
     for index, start, end in session_buckets(
-        trading_date=trading_date, timeframe=target, schedule=schedule, timezone=timezone
+        trading_date=trading_date, timeframe=target, interval=interval, timezone=timezone
     ):
         candle = _prove_and_aggregate(
             constituents=by_index.get(index, []),
             start=start,
             end=end,
             source_duration=source_duration,
-            session_close=session_close,
+            session_close=interval_close,
         )
         if candle is not None:
             emitted.append(candle)
@@ -146,7 +164,7 @@ def _group_by_bucket_index(
     day_candles: list[Candle],
     trading_date: date,
     target: Timeframe,
-    schedule: SessionSchedule,
+    interval: TradingInterval,
     timezone: ZoneInfo,
 ) -> dict[int, list[Candle]]:
     grouped: dict[int, list[Candle]] = defaultdict(list)
@@ -155,7 +173,7 @@ def _group_by_bucket_index(
             event_timestamp=candle.start_timestamp,
             trading_date=trading_date,
             timeframe=target,
-            schedule=schedule,
+            interval=interval,
             timezone=timezone,
         )
         grouped[index].append(candle)

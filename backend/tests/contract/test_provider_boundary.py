@@ -88,6 +88,7 @@ def test_fixture_normalizer_converts_provider_shaped_input_without_leaking_field
         "last_price": "101.25",
         "traded_quantity": 10,
         "session_cumulative_volume": None,
+        "session_ohlc": None,
     }
 
 
@@ -178,23 +179,49 @@ def test_shared_contracts_and_canonical_types_do_not_import_dhan() -> None:
         assert "dhan" not in inspect.getsource(module).lower()
 
 
-def test_no_strategy_engine_or_market_logic_is_introduced() -> None:
-    """Strategy Engine stays unimplemented; the Market Engine holds only its P4.1 foundation.
+def test_result_persistence_absent_and_strategy_layer_stays_isolated() -> None:
+    """Manager concerns and durable result persistence stay out of the strategy layer.
 
-    Through P4.4 the Market Engine holds the deterministic foundation, tick/quote
-    routing and validation, the market-session layer, and live candle
-    aggregation; it still builds no historical context, computes no features, and
-    the Strategy Engine (Phase 5) and its context-builder orchestrator do not
-    exist yet.
+    The first governed concrete strategy (Narrow CPR — ADR-007 D15 + the Accepted Narrow
+    CPR strategy specification) now exists under ``app.strategies.implementations``. What
+    must still NOT exist: manager concerns (ranking/dedup/promotion) in the strategy
+    *contract* layer, and durable StrategyResult persistence/delivery (docs/02 §6.4
+    Postgres/Redis delivery is a later slice). Ranking/dedup/promotion are manager
+    concerns; concrete strategies live only in the isolated implementations subpackage.
     """
     strategies = import_module("app.strategies")
-    strategies_path = Path(strategies.__file__).parent
-    assert [path for path in strategies_path.glob("*.py") if path.name != "__init__.py"] == []
+    strategy_layer = Path(strategies.__file__).parent
+    contract_modules = {path.name for path in strategy_layer.glob("*.py")}
+    assert contract_modules.isdisjoint({"manager.py", "ranking.py", "dedup.py", "promotion.py"})
+    # Concrete strategies live only in the isolated implementations subpackage (a package).
+    implementations = strategy_layer / "implementations"
+    if implementations.exists():
+        assert (implementations / "__init__.py").exists()
 
-    engine = import_module("app.market_engine")
-    engine_modules = {path.name for path in Path(engine.__file__).parent.glob("*.py")}
-    forbidden_market_logic = {
-        "engine.py",
-        "historical_context.py",
-    }
-    assert engine_modules.isdisjoint(forbidden_market_logic)
+    # P5.5 orchestration lives under the manager; durable result persistence/delivery does not.
+    manager = import_module("app.strategy_manager")
+    manager_modules = {path.name for path in Path(manager.__file__).parent.glob("*.py")}
+    assert {"promotion.py", "dedup.py", "ranking.py", "events.py"} <= manager_modules
+    assert manager_modules.isdisjoint({"repository.py", "persistence.py", "store.py"})
+
+
+def test_provider_session_ohlc_field_names_stay_below_the_dhan_adapter() -> None:
+    """Dhan-private day-OHLC names must not leak into canonical or Market-Engine code (P4.6A).
+
+    The canonical aggregate is ``ProviderSessionOhlc`` (open/high/low/close_price); the
+    provider's ``day_open``/``day_high``/``day_low``/``day_close`` naming is legal only
+    inside the Dhan adapter. Consumers above the adapter never depend on it (ADR-008).
+    """
+    forbidden = ("day_open", "day_high", "day_low", "day_close")
+    consumers = (
+        _module("app.schemas.market_data", "canonical contracts must exist"),
+        _module("app.market_engine.context", "MarketContext must exist"),
+        _module("app.market_engine.tick_engine", "TickEngine must exist"),
+    )
+    for consumer in consumers:
+        source = inspect.getsource(consumer)
+        assert not any(name in source for name in forbidden)
+
+    # The Dhan adapter itself is where the mapping legitimately lives.
+    adapter_source = inspect.getsource(_module("app.adapters.dhan.live", "Dhan live must exist"))
+    assert "ProviderSessionOhlc" in adapter_source
