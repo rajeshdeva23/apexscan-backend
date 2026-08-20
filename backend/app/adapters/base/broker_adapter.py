@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 from app.schemas.market_data import (
@@ -13,6 +14,7 @@ from app.schemas.market_data import (
     MarketData,
     ProviderCapability,
     ProviderHealth,
+    SessionStatisticsObservation,
     SubscriptionRequest,
 )
 
@@ -60,3 +62,25 @@ class InstrumentDataAdapter(Protocol):
 
     async def load_instruments(self) -> tuple[Instrument, ...]:
         """Return canonical instrument identities known to the provider."""
+
+
+@runtime_checkable
+class SessionStatisticsSource(Protocol):
+    """Capability for loading canonical current-session statistics (ADR-009 D2).
+
+    Broker-neutral and batch-capable: given canonical instruments plus the caller's
+    exchange ``trading_date`` and ``observed_at`` (the composition-supplied instant the
+    snapshot became known — no wall-clock read here), it returns immutable canonical
+    :class:`SessionStatisticsObservation` values. It performs no MarketContext mutation
+    and knows nothing of strategies. Presence of an observation implies no authority
+    (ADR-009 D6); verification is a separate concern.
+    """
+
+    async def load_session_statistics(
+        self,
+        instruments: Sequence[Instrument],
+        *,
+        trading_date: date,
+        observed_at: datetime,
+    ) -> tuple[SessionStatisticsObservation, ...]:
+        """Return canonical current-session observations for the given instruments."""

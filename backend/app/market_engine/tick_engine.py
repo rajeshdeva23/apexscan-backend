@@ -17,15 +17,34 @@ from dataclasses import dataclass
 from app.events.bus import EventBus
 from app.market_engine.candle_engine import CandleEngine
 from app.market_engine.clock import Clock, SystemClock
-from app.market_engine.context import MarketContext, SessionContext, TimeframeCandles
+from app.market_engine.context import (
+    MarketContext,
+    SessionContext,
+    SessionStatistics,
+    TimeframeCandles,
+)
 from app.market_engine.events import MarketContextCreated, MarketContextUpdated
 from app.market_engine.sequence import MonotonicSequence, SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier
+from app.market_engine.session_statistics import (
+    SessionStatisticsAuthority,
+    resolve_session_statistics,
+)
 from app.market_engine.state import InstrumentState, InstrumentStateRegistry
 from app.market_engine.validation import ValidationOutcome, classify
-from app.schemas.market_data import FeedContinuityEvent, Quote, Tick
+from app.schemas.market_data import (
+    FeedContinuityEvent,
+    Quote,
+    SessionStatisticsObservation,
+    Tick,
+)
 
 logger = logging.getLogger(__name__)
+
+# Default (immutable) authority: both canonical sources (staged observation and
+# tick-carried aggregate) are unverified until their own provider semantics are verified
+# (P4.6D/E6), so a default-constructed engine never emits AUTHORITATIVE session statistics.
+_DISABLED_SESSION_STATISTICS_AUTHORITY = SessionStatisticsAuthority()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +85,9 @@ class TickEngine:
         sequence: SequenceGenerator | None = None,
         session: MarketSessionClassifier | None = None,
         candles: CandleEngine | None = None,
+        session_statistics_authority: SessionStatisticsAuthority = (
+            _DISABLED_SESSION_STATISTICS_AUTHORITY
+        ),
     ) -> None:
         """Wire the engine to its registry, bus, clock/sequence, session, and candles.
 
@@ -78,6 +100,11 @@ class TickEngine:
                 stamped with session facts derived from the event's timestamp.
             candles: Optional candle engine; when present, accepted ticks are
                 aggregated and the resulting candle sets are stamped into the context.
+            session_statistics_authority: The injected per-source capability gating
+                authoritative session statistics (ADR-009 D6/D7). Defaults to **both
+                sources disabled** — a valid aggregate never becomes AUTHORITATIVE until
+                that source's own provider semantics are verified (P4.6D/E6); this default
+                must not be enabled in production wiring in this slice.
         """
         self._registry = registry
         self._bus = bus
@@ -85,6 +112,7 @@ class TickEngine:
         self._sequence: SequenceGenerator = sequence or MonotonicSequence()
         self._session = session
         self._candles = candles
+        self._session_statistics_authority = session_statistics_authority
         self._halt_active = False
 
     def set_halt(self, *, active: bool) -> None:
@@ -149,6 +177,27 @@ class TickEngine:
             self._candles.update(event, session)
         return self._candles.candle_sets_for(event.instrument)
 
+    def _session_statistics_for(
+        self, event: Tick | Quote, session: SessionContext | None, state: InstrumentState
+    ) -> tuple[SessionStatistics | None, SessionStatisticsObservation | None]:
+        """Resolve this datum's session statistics and remaining staged observation (P4.6B/E2).
+
+        An eligible staged observation (ADR-009) supplies the aggregate and is consumed,
+        taking precedence over the tick-carried provisional aggregate; otherwise the tick
+        aggregate (only a trade tick carries one, docs/06 §13.2) is applied. A quote-book
+        update carries no aggregate. All authority/phase/reset/reconciliation/precedence
+        policy lives in :func:`resolve_session_statistics` — never duplicated here.
+        """
+        aggregate = event.session_ohlc if isinstance(event, Tick) else None
+        return resolve_session_statistics(
+            aggregate=aggregate,
+            aggregate_as_of=event.event_timestamp,
+            staged=state.staged_session_statistics_observation,
+            session=session,
+            previous=state.session_statistics,
+            authority=self._session_statistics_authority,
+        )
+
     def _accept(self, event: Tick | Quote) -> ProcessResult:
         """Apply an accepted event: build the next context, publish, and store state."""
         state = self._registry.ensure(event.instrument)
@@ -157,6 +206,7 @@ class TickEngine:
         observed_at = self._clock.now()
         session = self._session_for(event)
         candle_sets = self._candle_sets_for(event, session)
+        statistics, staged_after = self._session_statistics_for(event, session, state)
         if state.context is None:
             context = MarketContext.initial(
                 event.instrument,
@@ -168,6 +218,7 @@ class TickEngine:
                 candle_sets=candle_sets,
                 session=session,
                 historical=state.historical,
+                session_statistics=statistics,
             )
             self._bus.publish(MarketContextCreated(context=context))
         else:
@@ -180,6 +231,7 @@ class TickEngine:
                 candle_sets=candle_sets,
                 session=session,
                 historical=state.historical,
+                session_statistics=statistics,
             )
             self._bus.publish(
                 MarketContextUpdated(context=context, previous_version=state.context.version)
@@ -189,4 +241,6 @@ class TickEngine:
         state.last_event_timestamp = event.event_timestamp
         state.last_sequence = sequence
         state.context = context
+        state.session_statistics = statistics
+        state.staged_session_statistics_observation = staged_after
         return ProcessResult(outcome=ValidationOutcome.ACCEPT, context=context)

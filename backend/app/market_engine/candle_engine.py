@@ -110,11 +110,7 @@ class CandleEngine:
         self._schedule = schedule
         self._timezone = ZoneInfo(exchange_timezone)
         self._finalized_window = finalized_window
-        session_length = self._session_length()
-        for timeframe in timeframes:
-            if timeframe.duration is not None and timeframe.duration >= session_length:
-                raise ValueError("an intraday timeframe must be shorter than the session")
-        self._timeframes = tuple(sorted(set(timeframes), key=lambda tf: (tf.is_session, tf.label)))
+        self._timeframes = self._ordered(self._validated(timeframes))
         self._states: dict[tuple[Instrument, Timeframe], _TimeframeState] = {}
         self._continuity_broken: set[Instrument] = set()
 
@@ -122,6 +118,47 @@ class CandleEngine:
     def timeframes(self) -> tuple[Timeframe, ...]:
         """Return the registered timeframes in deterministic order."""
         return self._timeframes
+
+    def set_required_timeframes(self, timeframes: Iterable[Timeframe]) -> None:
+        """Replace the active timeframe set with the effective required set (ADR-007 D8/D9).
+
+        Additive and strategy-blind: the engine receives only timeframes, never a
+        strategy, consumer key, or provider concept. Timeframes newly present begin
+        aggregating from the first future accepted datum (no live backfill is
+        fabricated — ADR-005/006); timeframes no longer required have their bounded
+        live state dropped so it stops surfacing (docs/06 §13, §27). Timeframes in
+        both the old and new set keep their existing partial/finalized/incomplete
+        state untouched, so re-applying the same set is a no-op. A later re-add of a
+        dropped timeframe starts fresh — removed live state is never resurrected.
+
+        Args:
+            timeframes: The effective required timeframe set (duplicates collapse).
+
+        Raises:
+            ValueError: If an intraday timeframe is not shorter than the session.
+        """
+        desired = self._validated(timeframes)
+        removed = set(self._timeframes) - desired
+        if removed:
+            self._states = {
+                key: state for key, state in self._states.items() if key[1] not in removed
+            }
+        self._timeframes = self._ordered(desired)
+
+    def _validated(self, timeframes: Iterable[Timeframe]) -> set[Timeframe]:
+        """Deduplicate and reject any intraday timeframe not shorter than the session."""
+        session_length = self._session_length()
+        result: set[Timeframe] = set()
+        for timeframe in timeframes:
+            if timeframe.duration is not None and timeframe.duration >= session_length:
+                raise ValueError("an intraday timeframe must be shorter than the session")
+            result.add(timeframe)
+        return result
+
+    @staticmethod
+    def _ordered(timeframes: set[Timeframe]) -> tuple[Timeframe, ...]:
+        """Return timeframes in the engine's deterministic canonical order."""
+        return tuple(sorted(timeframes, key=lambda tf: (tf.is_session, tf.label)))
 
     def update(self, tick: Tick, session: SessionContext) -> None:
         """Aggregate one accepted tick into every registered timeframe.
@@ -397,7 +434,7 @@ class CandleEngine:
             event_timestamp=event_timestamp,
             trading_date=trading_date,
             timeframe=timeframe,
-            schedule=self._schedule,
+            interval=self._schedule.bounds,
             timezone=self._timezone,
         )
 

@@ -1,0 +1,57 @@
+{
+  "dataset_id": "nse_cm_2026",
+  "version": "2026.1.0",
+  "segment": "NSE_EQ",
+  "coverage_start": "2026-01-01",
+  "coverage_end": "2026-12-31",
+  "closed_dates": [
+    "2026-01-15",
+    "2026-01-26",
+    "2026-03-03",
+    "2026-03-26",
+    "2026-03-31",
+    "2026-04-03",
+    "2026-04-14",
+    "2026-05-01",
+    "2026-05-28",
+    "2026-06-26",
+    "2026-09-14",
+    "2026-10-02",
+    "2026-10-20",
+    "2026-11-10",
+    "2026-11-24",
+    "2026-12-25"
+  ],
+  "open_sessions": [
+    "2026-02-01",
+    "2026-11-08"
+  ],
+  "session_overrides": [
+    {
+      "trading_date": "2026-02-01",
+      "intervals": [
+        { "start": "09:15", "end": "15:30" }
+      ]
+    }
+  ],
+  "provenance": [
+    {
+      "circular_id": "NSE/CMTR/71775",
+      "circular_date": "2025-12-12",
+      "segment": "Capital Market",
+      "fact": "2026 Capital Market trading-holiday list (weekday closures 2026-01-26, 2026-03-03, 2026-03-26, 2026-03-31, 2026-04-03, 2026-04-14, 2026-05-01, 2026-05-28, 2026-06-26, 2026-09-14, 2026-10-02, 2026-10-20, 2026-11-10, 2026-11-24, 2026-12-25) and Muhurat Trading exceptional OPEN on Sunday 2026-11-08 (timing to be notified subsequently; intraday NOT_PROVEN)."
+    },
+    {
+      "circular_id": "NSE/CMTR/72260",
+      "circular_date": "2026-01-12",
+      "segment": "Capital Market",
+      "fact": "Amendment adding Thursday 2026-01-15 as a Capital Market trading holiday (Maharashtra municipal corporation elections)."
+    },
+    {
+      "circular_id": "NSE/CMTR/72349",
+      "circular_date": "2026-01-16",
+      "segment": "Capital Market",
+      "fact": "Live Trading Session (Union Budget) exceptional OPEN on Sunday 2026-02-01 with one continuous normal-market interval 09:15-15:30 IST."
+    }
+  ]
+}

@@ -150,6 +150,7 @@ class ProviderCapability(StrEnum):
     LIVE_MARKET_DATA = "live_market_data"
     HISTORICAL_DATA = "historical_data"
     INSTRUMENTS = "instruments"
+    MARKET_QUOTE = "market_quote"
 
 
 class FeedContinuity(StrEnum):
@@ -173,6 +174,55 @@ def _require_aware_timestamp(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+class ProviderSessionOhlc(_CanonicalModel):
+    """A provider-supplied current-session OHLC aggregate (ADR-008 D1).
+
+    Broker-neutral and immutable: it transports one coherent session-to-date OHLC
+    aggregate as reported by the provider, and carries no provider field names,
+    packet codes, or identifiers. It makes **no** authority/completeness claim — that
+    it is present does not prove regular-session coverage; the authoritative
+    ``SessionStatistics`` fact and its verification are later P4.6 slices (ADR-008
+    D4/D5). Structural OHLC validity is enforced here so a malformed aggregate can
+    never enter the canonical boundary.
+    """
+
+    open_price: Decimal = Field(gt=0)
+    high_price: Decimal = Field(gt=0)
+    low_price: Decimal = Field(gt=0)
+    close_price: Decimal = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_ohlc_structure(self) -> ProviderSessionOhlc:
+        if self.high_price < self.low_price:
+            raise ValueError("session high price must be greater than or equal to low price")
+        if not self.low_price <= self.open_price <= self.high_price:
+            raise ValueError("session open price must be within the high-low range")
+        if not self.low_price <= self.close_price <= self.high_price:
+            raise ValueError("session close price must be within the high-low range")
+        return self
+
+
+class SessionStatisticsObservation(_CanonicalModel):
+    """A broker-neutral provider-side current-session statistics snapshot (ADR-009 D1).
+
+    Records that a provider-side current-session OHLC snapshot became known to the system
+    for one canonical instrument on one trading date. It is a recorded canonical *input*,
+    not a MarketContext fact: it makes **no** authority, freshness, phase, or strategy
+    claim — those belong to later source-verification and Market-Engine layers (ADR-009
+    D4/D6). ``trading_date`` is supplied explicitly by the composition layer from the
+    exchange calendar; it is never derived from ``observed_at`` or the host clock.
+    ``observed_at`` is when the snapshot became known (provider snapshot time when
+    available, else the source layer's completion instant) — not an exchange event time.
+    """
+
+    instrument: Instrument
+    trading_date: date
+    observed_at: datetime
+    session_ohlc: ProviderSessionOhlc
+
+    _validate_observed_at = field_validator("observed_at")(_require_aware_timestamp)
+
+
 class _EventData(_CanonicalModel):
     """Common fields for a provider event observed at the exchange."""
 
@@ -189,12 +239,16 @@ class Tick(_EventData):
     trade — not an interval or cumulative volume. ``session_cumulative_volume``
     is the exchange-reported session-to-date cumulative traded quantity and is
     the only correct basis for live candle volume (ADR-005); it is broker-neutral
-    and optional (absent when the provider does not report it).
+    and optional (absent when the provider does not report it). ``session_ohlc`` is
+    the optional provider-supplied current-session OHLC aggregate (ADR-008); it is
+    additive and independent of the fields above, and absent when the provider does
+    not report a valid aggregate.
     """
 
     last_price: Decimal = Field(gt=0)
     traded_quantity: int | None = Field(default=None, ge=0)
     session_cumulative_volume: int | None = Field(default=None, ge=0)
+    session_ohlc: ProviderSessionOhlc | None = None
 
 
 class Quote(_EventData):

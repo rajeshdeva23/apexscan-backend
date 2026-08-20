@@ -13,9 +13,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
-from app.market_engine.context import MarketContext
+from app.market_engine.context import MarketContext, SessionStatistics
 from app.market_engine.historical.context import HistoricalContext
-from app.schemas.market_data import Instrument, Quote, Tick
+from app.schemas.market_data import Instrument, Quote, SessionStatisticsObservation, Tick
 
 
 @dataclass(slots=True)
@@ -31,6 +31,12 @@ class InstrumentState:
         context: The current immutable MarketContext, if one exists yet.
         historical: The installed immutable historical snapshot, if any. Carried
             forward into each new context; installing it mints no version itself.
+        session_statistics: The current authoritative session statistics, if any
+            (ADR-008). The bounded per-instrument owner slot; written by the TickEngine
+            on the accepted-datum path (P4.6C).
+        staged_session_statistics_observation: A pending broker-neutral session-statistics
+            observation awaiting the next accepted datum to surface (ADR-009 D4). At most
+            one per instrument; staging mints no version and publishes no event.
     """
 
     instrument: Instrument
@@ -40,6 +46,8 @@ class InstrumentState:
     last_sequence: int | None = None
     context: MarketContext | None = None
     historical: HistoricalContext | None = None
+    session_statistics: SessionStatistics | None = None
+    staged_session_statistics_observation: SessionStatisticsObservation | None = None
 
 
 class InstrumentStateRegistry:
@@ -93,3 +101,34 @@ class InstrumentStateRegistry:
         if historical.instrument != instrument:
             raise ValueError("historical context instrument must match the target instrument")
         self.ensure(instrument).historical = historical
+
+    def stage_session_statistics_observation(
+        self, instrument: Instrument, observation: SessionStatisticsObservation
+    ) -> None:
+        """Stage a broker-neutral session-statistics observation for one instrument (ADR-009 D4).
+
+        Bounded to one pending observation per instrument, ordered by ``observed_at``: an
+        older observation is ignored (fail-closed); an identical one at the same instant is
+        idempotent; a *different* one at the same instant is rejected (no silent
+        last-write-wins). Staging mutates only this instrument's state — it mints no
+        MarketContext version, publishes no event, and fabricates no Tick; the observation
+        surfaces on the next accepted datum.
+
+        Args:
+            instrument: The instrument to stage the observation for.
+            observation: The immutable observation; its instrument must match ``instrument``.
+
+        Raises:
+            ValueError: If the observation's instrument does not match ``instrument``, or a
+                different observation is already staged at the same ``observed_at``.
+        """
+        if observation.instrument != instrument:
+            raise ValueError("session statistics observation instrument must match the target")
+        state = self.ensure(instrument)
+        current = state.staged_session_statistics_observation
+        if current is not None:
+            if observation.observed_at < current.observed_at:
+                return  # older observation ignored — never regress the staged one
+            if observation.observed_at == current.observed_at and observation != current:
+                raise ValueError("conflicting session statistics observation at the same instant")
+        state.staged_session_statistics_observation = observation

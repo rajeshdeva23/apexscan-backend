@@ -110,6 +110,17 @@ class ApplicationLifecycle:
         self._redis_state = DependencyState.UNKNOWN
         self._provider_state = DependencyState.UNKNOWN
 
+    @property
+    def provider(self) -> ProviderDependency | None:
+        """Return the owned provider dependency, if any (read-only; never constructs).
+
+        A minimal accessor for the transport layer to reach a lifecycle-owned, broker-neutral
+        capability (e.g. the scanner read seam, ADR-012 API15). This layer stays provider- and
+        scanner-agnostic: it returns the dependency object it already owns and takes no scanner
+        type dependency; the caller narrows it to the capability it needs.
+        """
+        return self._provider
+
     # Pre-existing Phase-2 complexity (9 > 8); tracked debt. Refactor is out of
     # P4.0 scope; new code is gated by C901 (docs/11 Rule 16).
     async def start(self, settings: Settings) -> None:  # noqa: C901

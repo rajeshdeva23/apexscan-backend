@@ -77,6 +77,7 @@ def test_canonical_contracts_are_immutable_and_broker_neutral() -> None:
         "last_price": "101.25",
         "traded_quantity": 10,
         "session_cumulative_volume": None,
+        "session_ohlc": None,
     }
     assert "dhan" not in repr(tick).lower()
 

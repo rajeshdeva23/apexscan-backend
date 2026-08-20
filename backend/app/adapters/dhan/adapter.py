@@ -6,7 +6,7 @@ import asyncio
 import logging
 import random
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from time import monotonic
@@ -21,6 +21,7 @@ from app.adapters.base.broker_adapter import (
     HistoricalDataAdapter,
     InstrumentDataAdapter,
     LiveMarketDataAdapter,
+    SessionStatisticsSource,
 )
 from app.adapters.base.errors import (
     NormalizationError,
@@ -61,6 +62,7 @@ from app.adapters.dhan.normalizer import (
     derive_equity_fno_universe,
     normalize_historical_payload,
     normalize_instrument_master,
+    normalize_session_statistics_payload,
     resolve_nse_cash_equity_live_universe,
 )
 from app.core.config import Settings
@@ -76,10 +78,13 @@ from app.schemas.market_data import (
     ProviderCapability,
     ProviderHealth,
     ProviderStatus,
+    SessionStatisticsObservation,
     SubscriptionRequest,
 )
 
 _DEFAULT_API_BASE_URL = "https://api.dhan.co/v2"
+_MARKET_QUOTE_OHLC_ENDPOINT = "/marketfeed/ohlc"
+_MARKET_QUOTE_MAX_INSTRUMENTS = 1000
 _INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 _INDIAN_MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 _SUPPORTED_INTRADAY_INTERVALS = frozenset({1, 5, 15, 25, 60})
@@ -155,14 +160,16 @@ class DhanRestAdapter(
     LiveMarketDataAdapter,
     HistoricalDataAdapter,
     InstrumentDataAdapter,
+    SessionStatisticsSource,
 ):
-    """Dhan reference, historical, and standard-feed behavior behind canonical contracts."""
+    """Dhan reference, historical, standard-feed, and market-quote behavior behind contracts."""
 
     capabilities = frozenset(
         {
             ProviderCapability.LIVE_MARKET_DATA,
             ProviderCapability.HISTORICAL_DATA,
             ProviderCapability.INSTRUMENTS,
+            ProviderCapability.MARKET_QUOTE,
         }
     )
 
@@ -232,8 +239,13 @@ class DhanRestAdapter(
         settings: Settings,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
     ) -> DhanRestAdapter:
-        """Create the concrete adapter from centralized, redacted application settings."""
+        """Create the concrete adapter from centralized, redacted application settings.
+
+        ``live_continuity_sink`` receives broker-neutral feed-continuity facts (ADR-006)
+        from the live stream; the composition layer binds it to the Market Engine.
+        """
         if settings.dhan_auth_mode == "totp":
             return cls(
                 token_provider=DhanAuthManager.from_settings(settings, transport=transport),
@@ -242,6 +254,7 @@ class DhanRestAdapter(
                 transport=transport,
                 live_smoke_enabled=settings.dhan_live_smoke_enabled,
                 live_client_id=settings.dhan_client_id,
+                live_continuity_sink=live_continuity_sink,
             )
         if settings.dhan_access_token is None:
             raise ProviderAuthenticationError()
@@ -252,6 +265,7 @@ class DhanRestAdapter(
             transport=transport,
             live_smoke_enabled=settings.dhan_live_smoke_enabled,
             live_client_id=settings.dhan_client_id,
+            live_continuity_sink=live_continuity_sink,
         )
 
     async def connect(self) -> None:
@@ -603,21 +617,71 @@ class DhanRestAdapter(
             candles.extend(normalized.candles)
         return HistoricalResult(request=request, candles=tuple(candles))
 
+    async def load_session_statistics(
+        self,
+        instruments: Sequence[Instrument],
+        *,
+        trading_date: date,
+        observed_at: datetime,
+    ) -> tuple[SessionStatisticsObservation, ...]:
+        """Load current-session OHLC via Market Quote and map to canonical observations.
+
+        Batched into a single documented Market Quote request (the ~208-instrument universe
+        fits well within the provider maximum). Instruments are deduplicated and canonically
+        ordered; an instrument the provider universe cannot resolve fails closed. The result
+        carries no provider identity and makes no authority claim (ADR-009 D6); a per-instrument
+        missing/sentinel/invalid OHLC is withheld by normalization, not fabricated.
+        """
+        pairs = self._market_quote_pairs(instruments)
+        if not pairs:
+            return ()
+        if self._live_client_id is None:
+            raise ProviderAuthenticationError()
+        response = await self._request_api_json(
+            "POST",
+            _MARKET_QUOTE_OHLC_ENDPOINT,
+            _market_quote_payload(pairs),
+            extra_headers={"client-id": self._live_client_id.get_secret_value()},
+        )
+        return normalize_session_statistics_payload(
+            response, pairs, trading_date=trading_date, observed_at=observed_at
+        )
+
+    def _market_quote_pairs(
+        self, instruments: Sequence[Instrument]
+    ) -> tuple[tuple[Instrument, DhanInstrumentReference], ...]:
+        unique = list(dict.fromkeys(instruments))  # dedup requested, preserve first occurrence
+        if len(unique) > _MARKET_QUOTE_MAX_INSTRUMENTS:
+            raise UnsupportedProviderRequestError()
+        ordered = sorted(unique, key=lambda instrument: (instrument.exchange, instrument.symbol))
+        pairs: list[tuple[Instrument, DhanInstrumentReference]] = []
+        for instrument in ordered:
+            reference = self._references.get(instrument)
+            if reference is None or reference.exchange_segment is None:
+                raise UnsupportedProviderRequestError()  # unmapped instrument — fail closed
+            pairs.append((instrument, reference))
+        return tuple(pairs)
+
     async def _request_api_json(
         self,
         method: str,
         endpoint: str,
         payload: Mapping[str, object] | None = None,
+        *,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Mapping[str, object]:
         client = self._require_api_client()
         token = await self._token_provider.get_access_token()
         await self._request_pacer.wait()
+        headers = {"access-token": token.get_secret_value()}
+        if extra_headers is not None:
+            headers.update(extra_headers)
         try:
             response = await client.request(
                 method,
                 endpoint,
                 json=payload,
-                headers={"access-token": token.get_secret_value()},
+                headers=headers,
             )
         except httpx.TimeoutException as error:
             raise ProviderTimeoutError() from error
@@ -684,6 +748,23 @@ def _event_matches_request(event: MarketData, request: SubscriptionRequest) -> b
     if isinstance(event, DepthSnapshot):
         return MarketDataKind.DEPTH in request.data_types
     return False
+
+
+def _market_quote_payload(
+    pairs: Sequence[tuple[Instrument, DhanInstrumentReference]],
+) -> dict[str, list[int]]:
+    """Group canonical (instrument, reference) pairs into the documented per-segment batch."""
+    grouped: dict[str, list[int]] = {}
+    for _instrument, reference in pairs:
+        segment = reference.exchange_segment
+        if segment is None:
+            raise UnsupportedProviderRequestError()
+        try:
+            security_id = int(reference.security_id)
+        except ValueError as error:
+            raise NormalizationError() from error
+        grouped.setdefault(segment, []).append(security_id)
+    return grouped
 
 
 def _historical_endpoint(interval: timedelta) -> str:

@@ -25,6 +25,17 @@ class OutsideCalendarCoverageError(ValueError):
     """Raised when trading-day resolution would leave the authoritative coverage."""
 
 
+class MissingSessionTimingError(ValueError):
+    """Raised when a date is known OPEN but its intraday session timing is unavailable.
+
+    Distinct from :class:`OutsideCalendarCoverageError` and any provider/source error:
+    the date *is* inside authoritative coverage and *is* a trading day, but an intraday
+    historical requirement cannot be resolved because the special OPEN session lacks
+    per-date session-hours metadata. It must fail closed (ADR-011 addendum M11/M16) and
+    never be swallowed into a satisfied warmup state.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class CalendarCoverage:
     """The inclusive date range over which the trading calendar is authoritative.

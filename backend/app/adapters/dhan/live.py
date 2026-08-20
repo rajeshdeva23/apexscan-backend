@@ -13,6 +13,7 @@ from typing import Protocol, cast
 from urllib.parse import urlencode
 
 import websockets
+from pydantic import ValidationError
 
 from app.adapters.base.errors import (
     NormalizationError,
@@ -26,6 +27,7 @@ from app.schemas.market_data import (
     DepthSnapshot,
     MarketData,
     MarketDataKind,
+    ProviderSessionOhlc,
     Quote,
     SubscriptionRequest,
     Tick,
@@ -296,6 +298,7 @@ def _decode_quote_packet(
                 last_price=Decimal(str(last_price)),
                 traded_quantity=last_trade_quantity,
                 session_cumulative_volume=volume,
+                session_ohlc=_session_ohlc(day_open, day_high, day_low, day_close),
             ),
         )
     except (OverflowError, OSError, ValueError) as error:
@@ -365,6 +368,7 @@ def _decode_full_packet(
             last_price=Decimal(str(last_price)),
             traded_quantity=last_trade_quantity,
             session_cumulative_volume=volume,
+            session_ohlc=_session_ohlc(day_open, day_high, day_low, day_close),
         )
         quote = Quote(
             instrument=reference.instrument,
@@ -425,6 +429,29 @@ def _resolve_reference(
         ):
             return reference
     raise UnknownProviderReferenceError()
+
+
+def _session_ohlc(
+    day_open: float, day_high: float, day_low: float, day_close: float
+) -> ProviderSessionOhlc | None:
+    """Map the provider day-OHLC aggregate to the canonical value, or None if unavailable.
+
+    A provider may report zero/uninitialised OHLC before a valid session aggregate
+    exists; such values cannot satisfy the canonical :class:`ProviderSessionOhlc`
+    contract and are surfaced as an absent aggregate (fail-closed). Nothing is ever
+    fabricated from other facts — no last price, previous close, or observed extremum
+    is substituted (ADR-008). Decimal conversion follows the same ``Decimal(str(...))``
+    convention as the tick's other prices.
+    """
+    try:
+        return ProviderSessionOhlc(
+            open_price=Decimal(str(day_open)),
+            high_price=Decimal(str(day_high)),
+            low_price=Decimal(str(day_low)),
+            close_price=Decimal(str(day_close)),
+        )
+    except ValidationError:
+        return None
 
 
 def _require_positive_finite(value: float) -> None:

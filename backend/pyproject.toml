@@ -33,6 +33,9 @@ build-backend = "setuptools.build_meta"
 include = ["app*"]
 exclude = ["alembic*", "tests*"]
 
+[tool.setuptools.package-data]
+"app.market_engine.calendar_data" = ["*.json"]
+
 [project.optional-dependencies]
 # Developer tooling: tests, linting, typing.
 dev = [

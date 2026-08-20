@@ -158,11 +158,13 @@ async def test_startup_snapshot_reports_initialization_in_progress() -> None:
     assert (await lifecycle.readiness_snapshot()).status == "not_ready"
 
 
-def test_composition_root_registers_no_unconfigured_provider() -> None:
-    """Regression (C1): the shipped lifecycle must not carry a provider that blocks startup."""
+def test_composition_root_registers_no_provider_when_disabled() -> None:
+    """Regression (C1): a provider-disabled lifecycle carries no provider that blocks startup."""
     main_module = import_module("app.main")
 
-    assert main_module.application_lifecycle._provider is None
+    lifecycle = main_module._build_application_lifecycle(_settings())  # provider disabled
+
+    assert lifecycle._provider is None
 
 
 async def test_lifecycle_wired_like_composition_root_reaches_ready() -> None:

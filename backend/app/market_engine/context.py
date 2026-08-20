@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.market_engine.historical.context import HistoricalContext
 from app.market_engine.timeframe import Timeframe
@@ -30,6 +30,13 @@ class MarketState(StrEnum):
     These are session phases as facts, never trading judgements. "Market open"
     and the regular continuous session (docs/06 §7.1) are represented by
     ``LIVE_SESSION``; the momentary open is that phase's inclusive start boundary.
+
+    ``CALENDAR_UNAVAILABLE`` means the instant's exchange-local trading date lies
+    outside the authoritative :class:`CalendarCoverage`, so the trading status is
+    not known (ADR-011 live out-of-coverage addendum LC2/LC8). It is treated
+    fail-closed and is mutually exclusive with every phase/closed state: it is
+    **not** ``LIVE_SESSION``, ``HOLIDAY``, ``MARKET_CLOSED``, or ``EMERGENCY_HALT``,
+    and is never inferred as trading, closed, or holiday.
     """
 
     PRE_OPEN = "pre_open"
@@ -39,6 +46,7 @@ class MarketState(StrEnum):
     MARKET_CLOSED = "market_closed"
     HOLIDAY = "holiday"
     EMERGENCY_HALT = "emergency_halt"
+    CALENDAR_UNAVAILABLE = "calendar_unavailable"
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -101,6 +109,63 @@ class SessionContext(_FrozenModel):
     trading_date: date
     market_state: MarketState
     exchange_timezone: str = Field(min_length=1)
+
+
+class SessionStatisticsQuality(StrEnum):
+    """Authority of a current-session statistics fact (ADR-008 D6).
+
+    The initial governed model has exactly two states. ``AUTHORITATIVE`` means the
+    values come from a verified provider session aggregate (ADR-008 D3/D4);
+    ``UNAVAILABLE`` means no verified aggregate is available or the session phase does
+    not permit regular-session statistics. No feed-gap/incomplete/stale sub-states are
+    introduced.
+    """
+
+    AUTHORITATIVE = "authoritative"
+    UNAVAILABLE = "unavailable"
+
+
+class SessionStatistics(_FrozenModel):
+    """Immutable current-session statistics fact for one instrument (docs/06 §17; ADR-008).
+
+    A broker-neutral market fact — never a signal, score, rank, or strategy verdict.
+    An ``AUTHORITATIVE`` value carries a coherent regular-session open/high/low from a
+    single verified provider aggregate; an ``UNAVAILABLE`` value carries no prices. The
+    absence of any current statistics is represented by ``None`` at the owning state,
+    not by a stale-priced object.
+
+    Attributes:
+        trading_date: The exchange-local trading date the statistics belong to.
+        open_price: The authoritative regular-session open, or ``None`` when unavailable.
+        high_price: The authoritative session-to-date high, or ``None`` when unavailable.
+        low_price: The authoritative session-to-date low, or ``None`` when unavailable.
+        quality: The authority state of these statistics.
+        as_of: The event time of the aggregate the statistics were built from (UTC).
+    """
+
+    trading_date: date
+    open_price: Decimal | None = Field(default=None, gt=0)
+    high_price: Decimal | None = Field(default=None, gt=0)
+    low_price: Decimal | None = Field(default=None, gt=0)
+    quality: SessionStatisticsQuality
+    as_of: datetime
+
+    _validate_as_of = field_validator("as_of")(_require_utc)
+
+    @model_validator(mode="after")
+    def _validate_quality_consistency(self) -> SessionStatistics:
+        open_price, high_price, low_price = self.open_price, self.high_price, self.low_price
+        if self.quality is SessionStatisticsQuality.UNAVAILABLE:
+            if any(price is not None for price in (open_price, high_price, low_price)):
+                raise ValueError("unavailable session statistics must carry no prices")
+            return self
+        if open_price is None or high_price is None or low_price is None:
+            raise ValueError("authoritative session statistics require open, high, and low prices")
+        if high_price < low_price:
+            raise ValueError("session high price must be greater than or equal to low price")
+        if not low_price <= open_price <= high_price:
+            raise ValueError("session open price must be within the high-low range")
+        return self
 
 
 class PartialCandle(_FrozenModel):
@@ -210,6 +275,7 @@ class MarketContext(_FrozenModel):
     facts: tuple[MarketFact, ...] = ()
     metadata: tuple[tuple[str, str], ...] = ()
     historical: HistoricalContext | None = None
+    session_statistics: SessionStatistics | None = None
     is_valid: bool = True
 
     _validate_event_timestamp = field_validator("event_timestamp")(_require_utc)
@@ -231,6 +297,7 @@ class MarketContext(_FrozenModel):
         facts: tuple[MarketFact, ...] = (),
         metadata: tuple[tuple[str, str], ...] = (),
         historical: HistoricalContext | None = None,
+        session_statistics: SessionStatistics | None = None,
         is_valid: bool = True,
     ) -> MarketContext:
         """Build the first (version 1) snapshot for an instrument.
@@ -248,6 +315,7 @@ class MarketContext(_FrozenModel):
             facts: Optional standardized market facts.
             metadata: Optional immutable provenance key/value pairs.
             historical: Optional immutable historical-context snapshot.
+            session_statistics: Optional current-session statistics fact (ADR-008).
             is_valid: Whether the snapshot is complete and trustworthy.
 
         Returns:
@@ -267,6 +335,7 @@ class MarketContext(_FrozenModel):
             facts=facts,
             metadata=metadata,
             historical=historical,
+            session_statistics=session_statistics,
             is_valid=is_valid,
         )
 
@@ -284,6 +353,7 @@ class MarketContext(_FrozenModel):
         facts: tuple[MarketFact, ...] = (),
         metadata: tuple[tuple[str, str], ...] = (),
         historical: HistoricalContext | None = None,
+        session_statistics: SessionStatistics | None = None,
         is_valid: bool = True,
     ) -> MarketContext:
         """Return a new snapshot for the same instrument at ``version + 1``.
@@ -305,6 +375,7 @@ class MarketContext(_FrozenModel):
             facts: Standardized market facts for the new snapshot.
             metadata: Immutable provenance key/value pairs.
             historical: Immutable historical-context snapshot carried forward.
+            session_statistics: Current-session statistics fact carried forward (ADR-008).
             is_valid: Whether the new snapshot is complete and trustworthy.
 
         Returns:
@@ -324,5 +395,6 @@ class MarketContext(_FrozenModel):
             facts=facts,
             metadata=metadata,
             historical=historical,
+            session_statistics=session_statistics,
             is_valid=is_valid,
         )

@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time
 import pytest
 from pydantic import ValidationError
 
+from app.market_engine.calendar_data import load_nse_cm_2026_dataset
 from app.market_engine.context import MarketState
 from app.market_engine.session import (
     MarketSessionClassifier,
@@ -141,3 +142,110 @@ def test_classification_is_deterministic_and_host_timezone_independent() -> None
     classifier = _classifier()
     instant = _utc(2026, 8, 6, 3, 45)
     assert classifier.classify(instant) == classifier.classify(instant)
+
+
+# --------------------------------------------------------------------------- #
+# Coverage-aware classification (ADR-011 live out-of-coverage addendum, §17)
+# --------------------------------------------------------------------------- #
+_DATASET = load_nse_cm_2026_dataset()
+
+
+def _covered_classifier() -> MarketSessionClassifier:
+    """A classifier over the packaged NSE 2026 dataset calendar + coverage."""
+    return MarketSessionClassifier(
+        schedule=_SCHEDULE,
+        calendar=_DATASET.trading_calendar(),
+        exchange_timezone=_TZ,
+        coverage=_DATASET.calendar_coverage(),
+    )
+
+
+def _live(year: int, month: int, day: int) -> datetime:
+    """06:30 UTC == 12:00 IST — mid-live-session on the same exchange-local date."""
+    return _utc(year, month, day, 6, 30)
+
+
+def test_marketstate_has_calendar_unavailable() -> None:
+    assert MarketState.CALENDAR_UNAVAILABLE.value == "calendar_unavailable"
+    assert MarketState.CALENDAR_UNAVAILABLE is not MarketState.LIVE_SESSION
+    assert MarketState.CALENDAR_UNAVAILABLE is not MarketState.HOLIDAY
+    assert MarketState.CALENDAR_UNAVAILABLE is not MarketState.MARKET_CLOSED
+    assert MarketState.CALENDAR_UNAVAILABLE is not MarketState.EMERGENCY_HALT
+
+
+def test_date_before_coverage_is_calendar_unavailable() -> None:
+    result = _covered_classifier().classify(_live(2025, 12, 31))
+    assert result.market_state is MarketState.CALENDAR_UNAVAILABLE
+    assert result.trading_date == date(2025, 12, 31)
+
+
+def test_date_after_coverage_is_calendar_unavailable() -> None:
+    result = _covered_classifier().classify(_live(2027, 1, 1))
+    assert result.market_state is MarketState.CALENDAR_UNAVAILABLE
+    assert result.trading_date == date(2027, 1, 1)
+
+
+def test_first_coverage_date_is_authoritative() -> None:
+    # 2026-01-01 (Thursday) is inside coverage and not a closed date -> classified,
+    # never CALENDAR_UNAVAILABLE (the inclusive lower boundary is authoritative).
+    result = _covered_classifier().classify(_live(2026, 1, 1))
+    assert result.market_state is MarketState.LIVE_SESSION
+
+
+def test_last_coverage_date_is_authoritative() -> None:
+    # 2026-12-31 (Thursday) is inside coverage (inclusive upper boundary).
+    result = _covered_classifier().classify(_live(2026, 12, 31))
+    assert result.market_state is MarketState.LIVE_SESSION
+
+
+def test_cross_midnight_uses_the_instant_not_startup_without_rebuild() -> None:
+    # One classifier, no rebuild: 2026-12-31 classifies authoritatively, then the very
+    # next exchange-local date 2027-01-01 is CALENDAR_UNAVAILABLE (per-classify check).
+    classifier = _covered_classifier()
+    last = classifier.classify(_live(2026, 12, 31))
+    first_after = classifier.classify(_live(2027, 1, 1))
+    assert last.market_state is MarketState.LIVE_SESSION
+    assert first_after.market_state is MarketState.CALENDAR_UNAVAILABLE
+
+
+def test_ordinary_weekday_inside_coverage_is_trading() -> None:
+    # 2026-08-06 (Thursday), not a closed date -> normal live phase.
+    result = _covered_classifier().classify(_live(2026, 8, 6))
+    assert result.market_state is MarketState.LIVE_SESSION
+
+
+def test_ordinary_sunday_inside_coverage_is_holiday() -> None:
+    # 2026-01-04 (Sunday), not an exceptional OPEN -> HOLIDAY (weekend closure).
+    assert _covered_classifier().classify(_live(2026, 1, 4)).market_state is MarketState.HOLIDAY
+
+
+@pytest.mark.parametrize("day", [date(2026, 1, 15), date(2026, 1, 26)])
+def test_configured_closed_dates_inside_coverage_are_holidays(day: date) -> None:
+    result = _covered_classifier().classify(_live(day.year, day.month, day.day))
+    assert result.market_state is MarketState.HOLIDAY
+
+
+@pytest.mark.parametrize("day", [date(2026, 2, 1), date(2026, 11, 8)])
+def test_exceptional_open_sundays_are_trading_capable_not_holiday(day: date) -> None:
+    # 2026-02-01 (Budget) & 2026-11-08 (Muhurat) are Sundays promoted to trading by
+    # open_sessions; date-level only — intraday phase still from the ordinary schedule.
+    result = _covered_classifier().classify(_live(day.year, day.month, day.day))
+    assert result.market_state is not MarketState.HOLIDAY
+    assert result.market_state is MarketState.LIVE_SESSION
+
+
+def test_no_settings_holidays_fallback_outside_coverage() -> None:
+    # 2027-01-01 is an ordinary Friday; without coverage a weekday-trading rule would
+    # infer LIVE_SESSION. Out of coverage it MUST be CALENDAR_UNAVAILABLE, never inferred.
+    assert _covered_classifier().classify(_live(2027, 1, 1)).market_state is (
+        MarketState.CALENDAR_UNAVAILABLE
+    )
+
+
+def test_coverage_none_preserves_legacy_no_check_behaviour() -> None:
+    # The default (coverage=None) performs no coverage check: an out-of-2026 weekday
+    # classifies via the calendar exactly as before this addendum (backward compat).
+    legacy = MarketSessionClassifier(
+        schedule=_SCHEDULE, calendar=TradingCalendar(), exchange_timezone=_TZ
+    )
+    assert legacy.classify(_live(2027, 1, 1)).market_state is MarketState.LIVE_SESSION

@@ -512,6 +512,7 @@ async def test_implements_the_authorized_broker_neutral_capabilities() -> None:
             ProviderCapability.HISTORICAL_DATA,
             ProviderCapability.INSTRUMENTS,
             ProviderCapability.LIVE_MARKET_DATA,
+            ProviderCapability.MARKET_QUOTE,
         }
     )
 

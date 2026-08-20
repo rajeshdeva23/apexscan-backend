@@ -70,28 +70,28 @@ def _live_partial_bounds(timeframe: Timeframe, at: datetime) -> tuple[datetime, 
 )
 def test_live_and_historical_buckets_match(minutes: int, at: datetime) -> None:
     timeframe = Timeframe.minutes(minutes)
-    live_start, live_end = _live_partial_bounds(timeframe, at)
+    partial_start, partial_end = _live_partial_bounds(timeframe, at)
     _, shared_start, shared_end = bucket_bounds(
         event_timestamp=at,
         trading_date=_DATE,
         timeframe=timeframe,
-        schedule=_SCHEDULE,
+        interval=_SCHEDULE.bounds,
         timezone=_IST,
     )
-    assert (live_start, live_end) == (shared_start, shared_end)
+    assert (partial_start, partial_end) == (shared_start, shared_end)
 
 
 def test_live_and_historical_final_truncated_bucket_match() -> None:
     # 7m does not divide the 375-minute session; the last bucket ends at 15:30.
     timeframe = Timeframe.minutes(7)
     at = datetime(2026, 8, 6, 15, 29, tzinfo=_IST)
-    live_start, live_end = _live_partial_bounds(timeframe, at)
+    partial_start, partial_end = _live_partial_bounds(timeframe, at)
     _, shared_start, shared_end = bucket_bounds(
         event_timestamp=at,
         trading_date=_DATE,
         timeframe=timeframe,
-        schedule=_SCHEDULE,
+        interval=_SCHEDULE.bounds,
         timezone=_IST,
     )
-    assert live_end == datetime(2026, 8, 6, 15, 30, tzinfo=_IST).astimezone(UTC)
-    assert (live_start, live_end) == (shared_start, shared_end)
+    assert partial_end == datetime(2026, 8, 6, 15, 30, tzinfo=_IST).astimezone(UTC)
+    assert (partial_start, partial_end) == (shared_start, shared_end)

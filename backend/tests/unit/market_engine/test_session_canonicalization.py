@@ -17,7 +17,7 @@ from app.market_engine.historical.session_candles import (
     canonical_session_series,
     canonicalize_session_candle,
 )
-from app.market_engine.session import SessionSchedule, TradingCalendar
+from app.market_engine.session import EffectiveSchedule, SessionSchedule, TradingCalendar
 from app.market_engine.state import InstrumentStateRegistry
 from app.market_engine.timeframe import Timeframe
 from app.schemas.market_data import Candle, Instrument, Tick
@@ -56,7 +56,10 @@ def _daily(day: date, *, hour: int = 12) -> Candle:
 
 def _canonical(candle: Candle, *, calendar: TradingCalendar | None = None) -> Candle | None:
     return canonicalize_session_candle(
-        candle, schedule=_SCHEDULE, calendar=calendar or TradingCalendar(), exchange_timezone=_TZ
+        candle,
+        effective=EffectiveSchedule(default=_SCHEDULE),
+        calendar=calendar or TradingCalendar(),
+        exchange_timezone=_TZ,
     )
 
 
@@ -92,7 +95,10 @@ def test_series_drops_non_trading_days_and_dedups() -> None:
         _daily(date(2026, 8, 6)),  # duplicate trading date — collapsed
     )
     series = canonical_session_series(
-        bars, schedule=_SCHEDULE, calendar=TradingCalendar(), exchange_timezone=_TZ
+        bars,
+        effective=EffectiveSchedule(default=_SCHEDULE),
+        calendar=TradingCalendar(),
+        exchange_timezone=_TZ,
     )
     dates = {c.start_timestamp.astimezone(_IST).date() for c in series}
     assert dates == {date(2026, 8, 6), date(2026, 8, 7)}
@@ -124,7 +130,10 @@ def test_canonicalization_is_timezone_generic_across_dst() -> None:
             traded_quantity=1,
         )
         result = canonicalize_session_candle(
-            bar, schedule=schedule, calendar=TradingCalendar(), exchange_timezone=ny
+            bar,
+            effective=EffectiveSchedule(default=schedule),
+            calendar=TradingCalendar(),
+            exchange_timezone=ny,
         )
         assert result is not None
         return result.start_timestamp

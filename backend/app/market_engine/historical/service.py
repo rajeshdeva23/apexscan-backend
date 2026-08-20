@@ -26,7 +26,10 @@ from pydantic import ValidationError
 
 from app.market_engine.candle_engine import CandleEngine
 from app.market_engine.context import IncompleteCandle
-from app.market_engine.historical.calendar_window import HistoricalCalendarWindow
+from app.market_engine.historical.calendar_window import (
+    HistoricalCalendarWindow,
+    MissingSessionTimingError,
+)
 from app.market_engine.historical.context import (
     HistoricalContext,
     HistoricalSeries,
@@ -53,7 +56,13 @@ from app.market_engine.historical.source import (
     HistoricalSourceError,
     interval_for_timeframe,
 )
-from app.market_engine.session import SessionSchedule, TradingCalendar
+from app.market_engine.session import (
+    EffectiveSchedule,
+    SessionSchedule,
+    TradingCalendar,
+    TradingInterval,
+    TradingSessionOverride,
+)
 from app.market_engine.state import InstrumentStateRegistry
 from app.market_engine.timeframe import Timeframe
 from app.schemas.market_data import Candle, Instrument
@@ -122,6 +131,7 @@ class HistoricalRangePlanner:
         exchange_timezone: str,
         calendar_window: HistoricalCalendarWindow,
         session_margin: int = _DEFAULT_SESSION_MARGIN,
+        overrides: Iterable[TradingSessionOverride] = (),
     ) -> None:
         """Wire the planner to a session schedule, timezone, and calendar window.
 
@@ -130,17 +140,25 @@ class HistoricalRangePlanner:
             exchange_timezone: The IANA exchange timezone (e.g. "Asia/Kolkata").
             calendar_window: Previous-trading-day resolver over authoritative coverage.
             session_margin: Extra completed sessions to over-fetch for intraday safety.
+            overrides: Per-date session-hour overrides for exceptional OPEN sessions;
+                empty preserves the ordinary single-schedule behaviour exactly.
         """
         self._schedule = schedule
         self._exchange_timezone = exchange_timezone
         self._timezone = ZoneInfo(exchange_timezone)
         self._window = calendar_window
         self._margin = session_margin
+        self._effective = EffectiveSchedule(default=schedule, overrides=overrides)
 
     @property
     def schedule(self) -> SessionSchedule:
         """Return the exchange session schedule."""
         return self._schedule
+
+    @property
+    def effective_schedule(self) -> EffectiveSchedule:
+        """Return the default-plus-override effective session-bounds resolver."""
+        return self._effective
 
     @property
     def exchange_timezone(self) -> str:
@@ -176,6 +194,11 @@ class HistoricalRangePlanner:
     ) -> tuple[datetime, datetime]:
         """Resolve the UTC window that safely covers the requirement's lookback.
 
+        Ordinary calendars (no in-window OPEN override) resolve exactly as before. When
+        the resolved window includes an exceptional OPEN session and the requirement is
+        intraday, resolution consults per-date effective bounds and fails closed if any
+        special session lacks session-hours metadata (ADR-011 addendum M15/M16).
+
         Args:
             requirement: The requirement whose window is being resolved.
             reference: The deterministic reference instant (UTC, tz-aware).
@@ -183,13 +206,55 @@ class HistoricalRangePlanner:
         Returns:
             A ``(start, end)`` pair of timezone-aware UTC instants over previous
             completed sessions (never the current, possibly-incomplete session).
+
+        Raises:
+            MissingSessionTimingError: If an intraday window includes an OPEN session
+                that lacks per-date session-hours metadata.
         """
         anchor = self.anchor_date(reference)
-        sessions = self._sessions_needed(requirement)
-        dates = self._window.previous_trading_days(anchor, sessions)
+        dates = self._window.previous_trading_days(anchor, self._sessions_needed(requirement))
+        special = tuple(day for day in dates if day in self.calendar.open_sessions)
+        if requirement.timeframe.is_session or not special:
+            return self._localize_default(dates)
+        for day in special:
+            self._guard_special(day)
+        return self._resolve_intraday_over_special(requirement, anchor)
+
+    def _localize_default(self, dates: tuple[date, ...]) -> tuple[datetime, datetime]:
+        """Localize a resolved date set with the default schedule bounds (unchanged path)."""
         start = self._localize(dates[0], self._schedule.regular_open)
         end = self._localize(dates[-1], self._schedule.regular_close)
         return start, end
+
+    def _resolve_intraday_over_special(
+        self, requirement: HistoricalRequirement, anchor: date
+    ) -> tuple[datetime, datetime]:
+        """Recompute an intraday window using each date's effective intraday capacity."""
+        interval_seconds = interval_for_timeframe(requirement.timeframe).total_seconds()
+        dates: list[date] = []
+        cumulative = 0
+        cursor = anchor
+        while cumulative < requirement.lookback:
+            cursor = self._window.previous_trading_day(cursor)
+            self._guard_special(cursor)
+            dates.append(cursor)
+            cumulative += self._capacity_for(cursor, interval_seconds)
+        for _ in range(self._margin):
+            cursor = self._window.previous_trading_day(cursor)
+            self._guard_special(cursor)
+            dates.append(cursor)
+        dates.reverse()
+        return (
+            self._localize(dates[0], self._effective.envelope_for(dates[0]).start),
+            self._localize(dates[-1], self._effective.envelope_for(dates[-1]).end),
+        )
+
+    def _guard_special(self, day: date) -> None:
+        """Fail closed if a special OPEN date lacks per-date session-hours metadata."""
+        if day in self.calendar.open_sessions and not self._effective.has_override(day):
+            raise MissingSessionTimingError(
+                f"OPEN session {day.isoformat()} lacks intraday session-hours metadata"
+            )
 
     def _sessions_needed(self, requirement: HistoricalRequirement) -> int:
         if requirement.timeframe.is_session:
@@ -203,9 +268,26 @@ class HistoricalRangePlanner:
         count = int(self._session_seconds() // interval_seconds)
         return max(count, 1)
 
+    def _capacity_for(self, day: date, interval_seconds: float) -> int:
+        """Return a date's intraday capacity: summed per-interval capacity (MI7/MI12).
+
+        Each live interval contributes ``floor(interval_seconds / delta)`` buckets
+        (at least one), and the closed gap between intervals contributes zero — the
+        capacity is never computed from the whole-day envelope.
+        """
+        total = 0
+        for interval in self._effective.intervals_for(day):
+            count = int(self._interval_seconds(interval) // interval_seconds)
+            total += max(count, 1)
+        return total
+
     def _session_seconds(self) -> float:
-        opened = datetime.combine(_DURATION_EPOCH, self._schedule.regular_open)
-        closed = datetime.combine(_DURATION_EPOCH, self._schedule.regular_close)
+        return self._interval_seconds(self._schedule.bounds)
+
+    @staticmethod
+    def _interval_seconds(interval: TradingInterval) -> float:
+        opened = datetime.combine(_DURATION_EPOCH, interval.start)
+        closed = datetime.combine(_DURATION_EPOCH, interval.end)
         return (closed - opened).total_seconds()
 
     def _localize(self, day: date, moment: time) -> datetime:
@@ -362,16 +444,35 @@ class HistoricalWarmupService:
         direct: frozenset[Timeframe],
         reference: datetime,
     ) -> _Descriptor:
-        """Classify one requirement as direct, reconstructable, or pending."""
+        """Classify one requirement as direct, reconstructable, pending, or failed."""
         timeframe = requirement.timeframe
         if timeframe in direct:
-            plan = self._fetch_plan(instrument, requirement, timeframe, reference)
-            return _Descriptor(requirement=requirement, kind="direct", plan=plan, base=None)
+            return self._planned(
+                instrument, requirement, timeframe, kind="direct", base=None, reference=reference
+            )
         base = select_base(timeframe, direct)
         if base is None:
             return _Descriptor(requirement=requirement, kind="pending", plan=None, base=None)
-        plan = self._fetch_plan(instrument, requirement, base, reference)
-        return _Descriptor(requirement=requirement, kind="reconstruct", plan=plan, base=base)
+        return self._planned(
+            instrument, requirement, base, kind="reconstruct", base=base, reference=reference
+        )
+
+    def _planned(
+        self,
+        instrument: Instrument,
+        requirement: HistoricalRequirement,
+        fetch_timeframe: Timeframe,
+        *,
+        kind: str,
+        base: Timeframe | None,
+        reference: datetime,
+    ) -> _Descriptor:
+        """Build a planned descriptor, failing closed on missing session timing (M11)."""
+        try:
+            plan = self._fetch_plan(instrument, requirement, fetch_timeframe, reference)
+        except MissingSessionTimingError:
+            return _Descriptor(requirement=requirement, kind="failed", plan=None, base=None)
+        return _Descriptor(requirement=requirement, kind=kind, plan=plan, base=base)
 
     def _fetch_plan(
         self,
@@ -426,6 +527,9 @@ class HistoricalWarmupService:
             if descriptor.kind == "pending":
                 pending.append(timeframe)
                 continue
+            if descriptor.kind == "failed":
+                unresolved.append(timeframe)
+                continue
             built = self._build_series(descriptor, fetched)
             if built is None:
                 unresolved.append(timeframe)
@@ -470,7 +574,7 @@ class HistoricalWarmupService:
         if timeframe.is_session:
             candles = canonical_session_series(
                 candles,
-                schedule=self._planner.schedule,
+                effective=self._planner.effective_schedule,
                 calendar=self._planner.calendar,
                 exchange_timezone=self._planner.exchange_timezone,
             )
@@ -488,7 +592,7 @@ class HistoricalWarmupService:
         rebuilt = reconstruct_series(
             source=source,
             target=descriptor.requirement.timeframe,
-            schedule=self._planner.schedule,
+            effective=self._planner.effective_schedule,
             calendar=self._planner.calendar,
             exchange_timezone=self._planner.exchange_timezone,
         )
@@ -622,7 +726,7 @@ class HistoricalWarmupService:
         return reconstruct_series(
             source=HistoricalSeries(timeframe=base, candles=base_candles),
             target=timeframe,
-            schedule=self._planner.schedule,
+            effective=self._planner.effective_schedule,
             calendar=self._planner.calendar,
             exchange_timezone=self._planner.exchange_timezone,
         )

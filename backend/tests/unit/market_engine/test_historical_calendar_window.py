@@ -79,3 +79,48 @@ def test_coverage_end_boundary_is_inclusive() -> None:
 def test_inverted_coverage_is_rejected() -> None:
     with pytest.raises(ValueError, match="must not precede"):
         CalendarCoverage(start_date=date(2026, 8, 31), end_date=date(2026, 8, 1))
+
+
+# --------------------------------------------------------------------------- #
+# Exceptional OPEN sessions (ADR-011 addendum M14)
+# --------------------------------------------------------------------------- #
+_SATURDAY = date(2026, 8, 8)
+_SUNDAY = date(2026, 8, 9)
+
+
+def _open_window(
+    *, open_sessions: tuple[date, ...], coverage: CalendarCoverage = _COVERAGE
+) -> HistoricalCalendarWindow:
+    return HistoricalCalendarWindow(
+        calendar=TradingCalendar(open_sessions=open_sessions), coverage=coverage
+    )
+
+
+def test_previous_trading_day_includes_weekend_open() -> None:
+    # Saturday 2026-08-08 is OPEN; from Monday it is the previous trading day.
+    window = _open_window(open_sessions=(_SATURDAY,))
+    assert window.previous_trading_day(date(2026, 8, 10)) == _SATURDAY
+
+
+def test_previous_trading_days_include_open_oldest_first() -> None:
+    # From Monday: Sat (open), Fri, Thu — ordered oldest to newest.
+    window = _open_window(open_sessions=(_SATURDAY,))
+    days = window.previous_trading_days(date(2026, 8, 10), 3)
+    assert days == (date(2026, 8, 6), date(2026, 8, 7), _SATURDAY)
+
+
+def test_explicit_closed_weekday_is_skipped() -> None:
+    # Friday 08-07 is closed via closed_dates; from Monday the walk skips the
+    # weekend and the closed Friday, landing on Thursday 08-06.
+    calendar = TradingCalendar(closed_dates=(date(2026, 8, 7),))
+    window = HistoricalCalendarWindow(calendar=calendar, coverage=_COVERAGE)
+    assert window.previous_trading_day(date(2026, 8, 10)) == date(2026, 8, 6)
+
+
+def test_open_override_outside_coverage_does_not_extend_authority() -> None:
+    # Saturday 08-08 is OPEN but coverage starts Monday 08-10; walking back from
+    # Monday leaves coverage before reaching it, so the OPEN date is never authoritative.
+    coverage = CalendarCoverage(start_date=date(2026, 8, 10), end_date=date(2026, 8, 31))
+    window = _open_window(open_sessions=(_SATURDAY,), coverage=coverage)
+    with pytest.raises(OutsideCalendarCoverageError):
+        window.previous_trading_day(date(2026, 8, 10))
