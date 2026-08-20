@@ -30,6 +30,10 @@ from app.strategies.implementations.previous_session_range_pct import (
     PreviousSessionRangePctConfiguration,
     PreviousSessionRangePctStrategy,
 )
+from app.strategies.implementations.previous_session_relative_range import (
+    PreviousSessionRelativeRangeConfiguration,
+    PreviousSessionRelativeRangeStrategy,
+)
 
 
 class UnknownEnabledStrategyError(RuntimeError):
@@ -112,7 +116,9 @@ def production_catalog() -> StrategyCatalog:
     so a mismatched literal fails at construction. Narrow CPR ranks ``cpr_width_pct`` ascending
     (narrowest first); Previous Session Range % ranks ``previous_range_pct`` descending (largest
     previous-session range first); Previous Session Body % ranks ``previous_body_pct`` descending
-    (largest absolute body first). All are independent completed-session plug-ins.
+    (largest absolute body first); Previous Session Relative Range ranks ``relative_range_ratio``
+    ascending (most compressed vs its own 20-session baseline first). All are independent
+    completed-session plug-ins.
     """
     return StrategyCatalog(
         (
@@ -141,6 +147,15 @@ def production_catalog() -> StrategyCatalog:
                     strategy_id="previous_session_body_pct",
                     metric_name="previous_body_pct",
                     ordering=ScannerOrdering.DESCENDING,
+                ),
+            ),
+            StrategyCatalogEntry(
+                strategy=PreviousSessionRelativeRangeStrategy(),
+                configuration=PreviousSessionRelativeRangeConfiguration(config_version="1.0.0"),
+                ranking_policy=ScannerRankingPolicy(
+                    strategy_id="previous_session_relative_range",
+                    metric_name="relative_range_ratio",
+                    ordering=ScannerOrdering.ASCENDING,
                 ),
             ),
         )
