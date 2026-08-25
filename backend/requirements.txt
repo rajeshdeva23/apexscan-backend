@@ -12,3 +12,6 @@ pydantic>=2.10
 pydantic-settings>=2.7
 redis>=5.2
 python-json-logger>=3.2
+httpx>=0.28
+pyotp>=2.10,<3
+websockets>=17,<18
