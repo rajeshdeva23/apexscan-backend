@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     dhan_rest_base_url: str = Field(default="https://api.dhan.co/v2")
     dhan_rest_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     dhan_live_smoke_enabled: bool = Field(default=False)
+    # Application-level stale-live-feed watchdog (DEPLOY-8.5 hardening; newly introduced by
+    # this slice — no prior document defined it). During an expected LIVE_SESSION with an
+    # active subscription, if no valid market-data tick arrives within this many seconds the
+    # adapter treats the feed as stale and performs one bounded reconnect (reusing the
+    # existing reconnect policy). Session-gated so market-closed/holiday silence never trips
+    # it; measured on a monotonic clock, never wall-clock subtraction.
+    dhan_live_stale_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
 
     # --- Market provider runtime (ADR-010 D14) -----------------------------
     # Explicit switch: the live-market runtime (provider + universe + ingestion)

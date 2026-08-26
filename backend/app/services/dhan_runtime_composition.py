@@ -41,6 +41,7 @@ from app.market_engine.calendar_data import (
     load_nse_cm_2026_dataset,
 )
 from app.market_engine.clock import Clock, SystemClock
+from app.market_engine.context import MarketState
 from app.market_engine.historical.service import HistoricalWarmupService
 from app.market_engine.sequence import SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule
@@ -111,6 +112,27 @@ class _DeferredContinuitySink:
         if self._target is None:
             raise RuntimeError("feed-continuity event received before runtime binding")
         self._target(event)
+
+
+class _DeferredLiveSessionGate:
+    """A live-session predicate bound once the runtime's classifier and clock exist.
+
+    Mirrors :class:`_DeferredContinuitySink`: it is passed to the adapter at construction so
+    the stale-feed watchdog fires only during an expected ``LIVE_SESSION``, and it is bound
+    after the runtime is composed. It fails closed (returns ``False``) while unbound, so an
+    unbound gate can never trigger a reconnect.
+    """
+
+    def __init__(self) -> None:
+        self._predicate: Callable[[], bool] | None = None
+
+    def bind(self, predicate: Callable[[], bool]) -> None:
+        """Point the gate at the composed classifier's live-session decision."""
+        self._predicate = predicate
+
+    def __call__(self) -> bool:
+        """Return whether an expected live regular session is currently in progress."""
+        return self._predicate() if self._predicate is not None else False
 
 
 @runtime_checkable
@@ -407,12 +429,17 @@ async def compose_market_runtime(
         return RuntimeComposition(runtime=runtime, provider_coordinator=None)
 
     sink: _DeferredContinuitySink | None = None
+    session_gate: _DeferredLiveSessionGate | None = None
     if adapter is not None:
         provider: LiveUniverseAdapter = adapter
     else:
         sink = _DeferredContinuitySink()
+        session_gate = _DeferredLiveSessionGate()
         provider = DhanRestAdapter.from_settings(
-            settings, transport=transport, live_continuity_sink=sink
+            settings,
+            transport=transport,
+            live_continuity_sink=sink,
+            live_session_predicate=session_gate,
         )
     coordinator = ProviderCoordinator(cast("BrokerAdapter", provider))
     try:
@@ -430,6 +457,7 @@ async def compose_market_runtime(
     monitor = _calendar_monitor(
         settings=settings, dataset=dataset, transport=transport, clock=clock
     )
+    session_classifier = _live_session_classifier(settings=settings, dataset=dataset)
     runtime = LiveMarketRuntime(
         settings=settings,
         error_threshold=error_threshold,
@@ -449,10 +477,18 @@ async def compose_market_runtime(
         autostart_strategy_ids=tuple(entry.strategy_id for entry in entries),
         clock=clock,
         sequence=sequence,
-        session_classifier=_live_session_classifier(settings=settings, dataset=dataset),
+        session_classifier=session_classifier,
     )
     if sink is not None:
         sink.bind(runtime.tick_engine.on_feed_continuity)  # same TickEngine the runtime owns
+    if session_gate is not None:
+        session_clock = clock or SystemClock()
+
+        def _in_live_session() -> bool:
+            state = session_classifier.classify(session_clock.now()).market_state
+            return state is MarketState.LIVE_SESSION
+
+        session_gate.bind(_in_live_session)
     return RuntimeComposition(runtime=runtime, provider_coordinator=coordinator)
 
 

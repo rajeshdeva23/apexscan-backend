@@ -155,6 +155,10 @@ class DhanRequestPacer:
             self._last_request_at = self._clock()
 
 
+class _LiveFeedStaleError(Exception):
+    """Internal signal: an expected live feed produced no valid tick within the stale window."""
+
+
 class DhanRestAdapter(
     BrokerAdapter,
     LiveMarketDataAdapter,
@@ -189,6 +193,9 @@ class DhanRestAdapter(
         live_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         live_random: Callable[[], float] = random.random,
         live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
+        live_stale_timeout_seconds: float | None = None,
+        live_session_predicate: Callable[[], bool] | None = None,
+        live_clock: Callable[[], float] = monotonic,
     ) -> None:
         if (access_token is None) == (token_provider is None):
             raise ProviderAuthenticationError()
@@ -225,6 +232,18 @@ class DhanRestAdapter(
         self._live_sleep = live_sleep
         self._live_random = live_random
         self._live_continuity_sink = live_continuity_sink
+        self._live_stale_timeout_seconds = live_stale_timeout_seconds
+        self._live_session_predicate = live_session_predicate
+        self._live_clock = live_clock
+        self._last_valid_event_at: float | None = None
+
+    def _stale_watchdog_active(self) -> bool:
+        """True only when a stale timeout is configured and an expected LIVE_SESSION is active."""
+        return (
+            self._live_stale_timeout_seconds is not None
+            and self._live_session_predicate is not None
+            and self._live_session_predicate()
+        )
 
     def _emit_continuity(self, status: FeedContinuity) -> None:
         """Emit a broker-neutral live-continuity fact to the injected sink, if any."""
@@ -240,6 +259,7 @@ class DhanRestAdapter(
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
+        live_session_predicate: Callable[[], bool] | None = None,
     ) -> DhanRestAdapter:
         """Create the concrete adapter from centralized, redacted application settings.
 
@@ -255,6 +275,8 @@ class DhanRestAdapter(
                 live_smoke_enabled=settings.dhan_live_smoke_enabled,
                 live_client_id=settings.dhan_client_id,
                 live_continuity_sink=live_continuity_sink,
+                live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
+                live_session_predicate=live_session_predicate,
             )
         if settings.dhan_access_token is None:
             raise ProviderAuthenticationError()
@@ -266,6 +288,8 @@ class DhanRestAdapter(
             live_smoke_enabled=settings.dhan_live_smoke_enabled,
             live_client_id=settings.dhan_client_id,
             live_continuity_sink=live_continuity_sink,
+            live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
+            live_session_predicate=live_session_predicate,
         )
 
     async def connect(self) -> None:
@@ -282,16 +306,33 @@ class DhanRestAdapter(
         self._reference_client = httpx.AsyncClient(timeout=timeout, transport=self._transport)
 
     async def disconnect(self) -> None:
-        """Close both adapter-owned clients idempotently without exposing transport details."""
+        """Close every adapter-owned resource; a socket-close failure never leaks the clients.
+
+        Each owned resource (live socket, HTTP API/reference clients, token provider) is
+        closed independently so one failure cannot skip the rest. The first error is
+        re-raised after all cleanup runs, so failures are surfaced rather than swallowed.
+        """
+        errors: list[BaseException] = []
         async with self._live_state_lock:
-            await self._close_live_socket()
+            try:
+                await self._close_live_socket()
+            except Exception as error:  # noqa: BLE001 - continue closing every owned resource
+                errors.append(error)
         clients = (self._api_client, self._reference_client)
         self._api_client = None
         self._reference_client = None
         for client in clients:
             if client is not None:
-                await client.aclose()
-        await self._token_provider.disconnect()
+                try:
+                    await client.aclose()
+                except Exception as error:  # noqa: BLE001 - continue closing every owned resource
+                    errors.append(error)
+        try:
+            await self._token_provider.disconnect()
+        except Exception as error:  # noqa: BLE001 - continue closing every owned resource
+            errors.append(error)
+        if errors:
+            raise errors[0]
 
     async def get_health(self) -> ProviderHealth:
         """Use the documented authenticated profile endpoint as the bounded health probe."""
@@ -376,10 +417,41 @@ class DhanRestAdapter(
                 if consumer.buffer:
                     continue
                 try:
-                    packet = await self._require_live_socket().recv()
+                    packet = await self._receive_live_frame()
                     self._distribute_live_packet(packet)
                 except (ConnectionError, OSError, TimeoutError):
                     await self._reconnect_live_subscription()
+                except _LiveFeedStaleError:
+                    logger.warning("Dhan live feed stale during live session; reconnecting")
+                    await self._reconnect_live_subscription()
+
+    async def _receive_live_frame(self) -> bytes | str:
+        """Receive one frame, enforcing a session-gated stale-feed deadline.
+
+        During an expected ``LIVE_SESSION`` with an active subscription, a frame that does
+        not arrive within ``dhan_live_stale_timeout_seconds`` — measured on a monotonic
+        clock since the last VALID market event — raises :class:`_LiveFeedStaleError`, which the
+        caller resolves with one bounded reconnect. Outside a live session the deadline is
+        not enforced, so market-closed/holiday silence never triggers a reconnect.
+        """
+        socket = self._require_live_socket()
+        if self._live_stale_timeout_seconds is None or not self._stale_watchdog_active():
+            return await socket.recv()
+        now = self._live_clock()
+        if self._last_valid_event_at is None:
+            self._last_valid_event_at = now
+        remaining = self._live_stale_timeout_seconds - (now - self._last_valid_event_at)
+        if remaining <= 0:
+            raise _LiveFeedStaleError()
+        try:
+            return await asyncio.wait_for(socket.recv(), remaining)
+        except TimeoutError as error:
+            if self._stale_watchdog_active():
+                raise _LiveFeedStaleError() from error
+            # The session ended while waiting: reset the baseline and wait without a
+            # deadline so a legitimately quiet closed market never reconnects.
+            self._last_valid_event_at = None
+            return await socket.recv()
 
     def _distribute_live_packet(self, packet: bytes | str) -> None:
         """Decode one frame and buffer its events per consumer, discarding bad frames.
@@ -400,6 +472,11 @@ class DhanRestAdapter(
         ):
             logger.warning("Discarded a malformed Dhan live frame")
             return
+        if events:
+            # A frame that decodes to >=1 canonical event is a valid market tick; reset the
+            # stale window here (not merely on any received frame) so silent-but-alive feeds
+            # are still detected.
+            self._last_valid_event_at = self._live_clock()
         for event in events:
             for consumer in self._live_consumers.values():
                 if _event_matches_request(event, consumer.request):
@@ -529,6 +606,7 @@ class DhanRestAdapter(
         """Reconnect only a bounded number of times and restore desired state on success."""
         async with self._live_state_lock:
             await self._mark_live_connection_lost()
+            logger.warning("Dhan live feed reconnect started")
             for attempt in range(1, self._live_reconnect_policy.maximum_attempts + 1):
                 await self._live_sleep(
                     self._live_reconnect_policy.delay_for_attempt(attempt, self._live_random())
@@ -540,11 +618,16 @@ class DhanRestAdapter(
                         return
                     await self._reconcile_live_subscriptions(plan)
                     self._emit_continuity(FeedContinuity.RECONNECTED)
+                    logger.info("Dhan live feed reconnect succeeded on attempt %d", attempt)
                     return
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     await self._mark_live_connection_lost()
+            logger.error(
+                "Dhan live feed reconnect failed after %d attempts",
+                self._live_reconnect_policy.maximum_attempts,
+            )
             raise ProviderUnavailableError()
 
     async def _unsubscribe_live_plan(self) -> None:
@@ -585,6 +668,7 @@ class DhanRestAdapter(
         self._live_socket = None
         self._active_live_batches = ()
         self._live_status = ProviderStatus.DEGRADED
+        self._last_valid_event_at = None
         if socket is not None:
             self._emit_continuity(FeedContinuity.CONTINUITY_LOST)
             try:
