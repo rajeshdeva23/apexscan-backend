@@ -450,7 +450,7 @@ async def test_production_transport_uses_documented_heartbeat_window(
     """A different heartbeat window risks false feed health or delayed loss detection."""
     live_module = import_module("app.adapters.dhan.live")
     observed: dict[str, object] = {}
-    socket = _FakeLiveSocket(())
+    socket = _FakeLiveSocket((b"frame",))
 
     async def connect(url: str, **kwargs: object) -> _FakeLiveSocket:
         observed["url"] = url
@@ -464,7 +464,8 @@ async def test_production_transport_uses_documented_heartbeat_window(
         timeout_seconds=3.0,
     )
 
-    assert connection is socket
+    # The transport wraps the connection at the boundary but delegates transparently.
+    assert await connection.recv() == b"frame"
     assert observed == {
         "url": "wss://fixture.example/feed",
         "open_timeout": 3.0,
