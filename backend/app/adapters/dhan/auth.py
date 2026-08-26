@@ -167,6 +167,7 @@ class DhanAuthManager:
                 raise ProviderNetworkError() from None
 
             self._raise_for_auth_failure(response)
+            _raise_for_generation_rate_limit(response)
             self._runtime_token = _parse_runtime_token(response, now)
             return self._runtime_token.access_token
 
@@ -255,6 +256,33 @@ def _parse_runtime_token(response: httpx.Response, now: datetime) -> _RuntimeAcc
     if expires_at <= now:
         raise NormalizationError()
     return _RuntimeAccessToken(access_token=SecretStr(raw_token.strip()), expires_at=expires_at)
+
+
+def _raise_for_generation_rate_limit(response: httpx.Response) -> None:
+    """Classify Dhan's token-generation frequency limit returned as an HTTP 2xx error body.
+
+    Dhan answers a too-soon token request with HTTP 200 and
+    ``{"status": "error", "message": "Token can be generated once every 2 minutes."}``.
+    Only this generation-frequency limit is mapped to :class:`ProviderRateLimitError`; any
+    other error-shaped or malformed 2xx body is left for the normal token-parse contract to
+    reject. The provider message is inspected but never logged or surfaced, so no credential
+    material can leak.
+    """
+    try:
+        payload: object = response.json()
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, Mapping):
+        return
+    status = payload.get("status")
+    message = payload.get("message")
+    if not (isinstance(status, str) and status.strip().lower() == "error"):
+        return
+    if not isinstance(message, str):
+        return
+    lowered = message.lower()
+    if "minute" in lowered and ("once every" in lowered or "can be generated" in lowered):
+        raise ProviderRateLimitError()
 
 
 def _error_code(response: httpx.Response) -> str | None:

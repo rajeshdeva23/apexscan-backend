@@ -113,6 +113,40 @@ class DhanFeedDisconnectedError(ConnectionError):
     """Safe signal that Dhan terminated the standard feed connection."""
 
 
+class _TranslatingDhanLiveSocket:
+    """Adapt a websockets connection so a transport-level close stays library-neutral.
+
+    Keeps ``websockets.exceptions`` types inside this transport boundary: a
+    :class:`websockets.exceptions.ConnectionClosed` (including the normal
+    ``ConnectionClosedOK``) raised while sending or receiving is translated into
+    :class:`DhanFeedDisconnectedError` — the ``ConnectionError``-derived signal the
+    adapter's existing bounded reconnect already recovers from. Normal frames and the
+    intentional ``close`` pass through unchanged, so the adapter and reconnect layers
+    never import a websockets exception type.
+    """
+
+    def __init__(self, connection: DhanLiveSocket) -> None:
+        self._connection = connection
+
+    async def send(self, message: str) -> None:
+        """Send one text frame, surfacing a transport close as a feed disconnect."""
+        try:
+            await self._connection.send(message)
+        except websockets.exceptions.ConnectionClosed as error:
+            raise DhanFeedDisconnectedError("Dhan live feed connection closed") from error
+
+    async def recv(self) -> bytes | str:
+        """Receive one frame, surfacing a transport close as a feed disconnect."""
+        try:
+            return await self._connection.recv()
+        except websockets.exceptions.ConnectionClosed as error:
+            raise DhanFeedDisconnectedError("Dhan live feed connection closed") from error
+
+    async def close(self) -> None:
+        """Close the underlying connection; an intentional close is not a feed outage."""
+        await self._connection.close()
+
+
 class WebsocketsDhanLiveTransport:
     """Production WebSocket transport with library-managed server ping/pong responses."""
 
@@ -125,7 +159,7 @@ class WebsocketsDhanLiveTransport:
             ping_timeout=40.0,
             close_timeout=timeout_seconds,
         )
-        return cast(DhanLiveSocket, connection)
+        return _TranslatingDhanLiveSocket(cast(DhanLiveSocket, connection))
 
 
 class DhanLiveFeedMode(StrEnum):
