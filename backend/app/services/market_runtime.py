@@ -518,12 +518,26 @@ class LiveMarketRuntime:
         if self._state is RuntimeState.SHUTDOWN:
             return
         self._state = RuntimeState.SHUTDOWN
-        await self._cancel_task(self._ingestion_task)  # 1. stop ingestion
-        await self._cancel_task(self._refresh_driver_task)  # 2. stop refresh driver
-        await self._cancel_task(self._calendar_monitor_task)  # 3. stop calendar monitor
-        self._scanner.unsubscribe()  # 4. detach the scanner aggregator
-        self._manager.unsubscribe()  # 5. unsubscribe the manager
+        errors: list[BaseException] = []
+        # Cancel every managed task even if one cancellation fails, so a single failure never
+        # leaves an unrelated task running (DEPLOY-8.5 shutdown hardening). Order preserved.
+        for task in (
+            self._ingestion_task,  # 1. stop ingestion
+            self._refresh_driver_task,  # 2. stop refresh driver
+            self._calendar_monitor_task,  # 3. stop calendar monitor
+        ):
+            try:
+                await self._cancel_task(task)
+            except Exception as error:  # noqa: BLE001 - clean up every owned resource
+                errors.append(error)
+        for detach in (self._scanner.unsubscribe, self._manager.unsubscribe):
+            try:
+                detach()  # 4. detach scanner aggregator, 5. unsubscribe manager
+            except Exception as error:  # noqa: BLE001 - clean up every owned resource
+                errors.append(error)
         self._manager_subscribed = False
+        if errors:
+            raise errors[0]
 
     def status(self) -> RuntimeStatus:
         """Return an immutable, non-sensitive snapshot of the composed runtime state."""
