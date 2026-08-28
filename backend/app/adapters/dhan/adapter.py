@@ -194,6 +194,7 @@ class DhanRestAdapter(
         live_random: Callable[[], float] = random.random,
         live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
         live_stale_timeout_seconds: float | None = None,
+        live_hard_stale_timeout_seconds: float | None = None,
         live_session_predicate: Callable[[], bool] | None = None,
         live_clock: Callable[[], float] = monotonic,
     ) -> None:
@@ -233,9 +234,11 @@ class DhanRestAdapter(
         self._live_random = live_random
         self._live_continuity_sink = live_continuity_sink
         self._live_stale_timeout_seconds = live_stale_timeout_seconds
+        self._live_hard_stale_timeout_seconds = live_hard_stale_timeout_seconds
         self._live_session_predicate = live_session_predicate
         self._live_clock = live_clock
         self._last_valid_event_at: float | None = None
+        self._suspect_stale_logged = False
 
     def _stale_watchdog_active(self) -> bool:
         """True only when a stale timeout is configured and an expected LIVE_SESSION is active."""
@@ -276,6 +279,7 @@ class DhanRestAdapter(
                 live_client_id=settings.dhan_client_id,
                 live_continuity_sink=live_continuity_sink,
                 live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
+                live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
                 live_session_predicate=live_session_predicate,
             )
         if settings.dhan_access_token is None:
@@ -289,6 +293,7 @@ class DhanRestAdapter(
             live_client_id=settings.dhan_client_id,
             live_continuity_sink=live_continuity_sink,
             live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
+            live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
             live_session_predicate=live_session_predicate,
         )
 
@@ -426,32 +431,58 @@ class DhanRestAdapter(
                     await self._reconnect_live_subscription()
 
     async def _receive_live_frame(self) -> bytes | str:
-        """Receive one frame, enforcing a session-gated stale-feed deadline.
+        """Receive one frame, enforcing a session-gated two-threshold stale deadline.
 
-        During an expected ``LIVE_SESSION`` with an active subscription, a frame that does
-        not arrive within ``dhan_live_stale_timeout_seconds`` — measured on a monotonic
-        clock since the last VALID market event — raises :class:`_LiveFeedStaleError`, which the
-        caller resolves with one bounded reconnect. Outside a live session the deadline is
+        During an expected ``LIVE_SESSION`` with an active subscription, elapsed time since
+        the last VALID canonical market event is measured on a monotonic clock. Crossing the
+        SOFT threshold (``dhan_live_stale_timeout_seconds``) logs a single *suspected stale*
+        warning but does NOT reconnect — this tolerates the legitimate low-tick lulls seen at
+        session boundaries. Only crossing the HARD threshold
+        (``dhan_live_hard_stale_timeout_seconds``) raises :class:`_LiveFeedStaleError`, which
+        the caller resolves with one bounded reconnect. Outside a live session the deadline is
         not enforced, so market-closed/holiday silence never triggers a reconnect.
         """
         socket = self._require_live_socket()
-        if self._live_stale_timeout_seconds is None or not self._stale_watchdog_active():
+        soft = self._live_stale_timeout_seconds
+        if soft is None or not self._stale_watchdog_active():
             return await socket.recv()
+        hard = self._live_hard_stale_timeout_seconds
+        if hard is None:
+            hard = soft
         now = self._live_clock()
         if self._last_valid_event_at is None:
             self._last_valid_event_at = now
-        remaining = self._live_stale_timeout_seconds - (now - self._last_valid_event_at)
-        if remaining <= 0:
+        elapsed = now - self._last_valid_event_at
+        if elapsed >= hard:
             raise _LiveFeedStaleError()
+        self._note_suspect_stale(elapsed, soft, hard)
         try:
-            return await asyncio.wait_for(socket.recv(), remaining)
+            return await asyncio.wait_for(socket.recv(), hard - elapsed)
         except TimeoutError as error:
             if self._stale_watchdog_active():
                 raise _LiveFeedStaleError() from error
             # The session ended while waiting: reset the baseline and wait without a
             # deadline so a legitimately quiet closed market never reconnects.
             self._last_valid_event_at = None
+            self._suspect_stale_logged = False
             return await socket.recv()
+
+    def _note_suspect_stale(self, elapsed: float, soft: float, hard: float) -> None:
+        """Log one degraded 'suspected stale' warning per episode (no reconnect).
+
+        Fires once when the soft threshold is first crossed within a stale episode; the flag
+        is cleared whenever a valid canonical event resets the freshness window (or a
+        reconnect is marked), so each distinct episode warns at most once (no log spam).
+        """
+        if self._suspect_stale_logged or elapsed < soft:
+            return
+        logger.warning(
+            "Dhan live feed suspected stale: no canonical market event for %.0fs "
+            "(monitoring; hard-reconnect threshold %.0fs)",
+            elapsed,
+            hard,
+        )
+        self._suspect_stale_logged = True
 
     def _distribute_live_packet(self, packet: bytes | str) -> None:
         """Decode one frame and buffer its events per consumer, discarding bad frames.
@@ -475,8 +506,9 @@ class DhanRestAdapter(
         if events:
             # A frame that decodes to >=1 canonical event is a valid market tick; reset the
             # stale window here (not merely on any received frame) so silent-but-alive feeds
-            # are still detected.
+            # are still detected. Also end any in-progress suspect-stale episode.
             self._last_valid_event_at = self._live_clock()
+            self._suspect_stale_logged = False
         for event in events:
             for consumer in self._live_consumers.values():
                 if _event_matches_request(event, consumer.request):
@@ -669,6 +701,7 @@ class DhanRestAdapter(
         self._active_live_batches = ()
         self._live_status = ProviderStatus.DEGRADED
         self._last_valid_event_at = None
+        self._suspect_stale_logged = False
         if socket is not None:
             self._emit_continuity(FeedContinuity.CONTINUITY_LOST)
             try:
