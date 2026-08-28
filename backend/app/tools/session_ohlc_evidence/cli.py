@@ -52,7 +52,7 @@ def _cmd_collect(args: argparse.Namespace) -> int:
             trading_date=date.fromisoformat(args.trading_date),
             session_identity=args.session_identity,
             source_sha=args.source_sha,
-            tick_size=Decimal(args.tick_size),
+            tick_size=Decimal(args.tick_size) if args.tick_size is not None else None,
             per_window_seconds=args.per_window_seconds,
         )
     )
@@ -80,7 +80,13 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--trading-date", dest="trading_date", required=True)
     co.add_argument("--session-identity", dest="session_identity", required=True)
     co.add_argument("--source-sha", dest="source_sha", required=True)
-    co.add_argument("--tick-size", dest="tick_size", default="0.05")
+    co.add_argument(
+        "--tick-size",
+        dest="tick_size",
+        default=None,
+        help="Explicit per-run high/low drift tick size; omit to require exact high/low "
+        "(unknown-tick differences are INDETERMINATE, never silently DRIFT).",
+    )
     co.add_argument("--per-window-seconds", dest="per_window_seconds", type=float, default=30.0)
     co.add_argument("--out", help="Output stem for .json/.md (optional).")
     co.set_defaults(func=_cmd_collect)

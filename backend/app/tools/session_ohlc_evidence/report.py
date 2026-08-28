@@ -46,12 +46,17 @@ def to_markdown(record: EvidenceRecord, verdict: Verdict) -> str:
         f"# Current-Session OHLC Authority Evidence — {record.trading_date.isoformat()}",
         "",
         f"- Provider: {record.provider}",
+        f"- Oracle: {record.oracle_source} (independent external truth: "
+        f"{record.oracle_independent}; both WS and REST are Dhan-derived — agreement proves "
+        f"provider-path consistency, not independent verification)",
         f"- Source SHA: {record.source_sha}",
         f"- Collector: {record.collector_version} (schema {record.schema_version})",
         f"- Session identity: {record.session_identity}",
         f"- Window: {record.collection_start.isoformat()} → {record.collection_end.isoformat()}",
-        f"- Universe: {record.universe_observed}/{record.universe_expected} observed",
-        f"- Sample windows: {', '.join(record.sample_windows) or '(none)'}",
+        f"- Universe: {len(record.instruments)}/{len(record.expected_instruments)} observed "
+        f"(identity-based coverage)",
+        f"- Sample windows: {', '.join(record.sample_windows) or '(none)'}; "
+        f"required: {', '.join(record.required_windows)}",
         f"- CSOA16 reconnect required: {record.csoa16_required}; oracle available: "
         f"{record.oracle_available}",
         "",

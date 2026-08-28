@@ -1,14 +1,17 @@
 """Read-only live collector for current-session OHLC authority evidence (DEPLOY-10 R4B).
 
 Observes the two Dhan sources for the production universe — WS tick-carried
-``Tick.session_ohlc`` and REST ``/marketfeed/ohlc`` (the oracle) — and assembles an
-:class:`EvidenceRecord`. It is a diagnostic tool: it never publishes StrategyResults,
-never mutates MarketContext / InstrumentState / scanner state, and never flips an
-authority bit. Executed only during a live session by the R4B procedure (never in R4A).
+``Tick.session_ohlc`` and REST ``/marketfeed/ohlc`` (the operational oracle; note both are
+Dhan-derived, so agreement proves provider-path consistency, not independent external
+truth) — and assembles an :class:`EvidenceRecord`. Diagnostic only: it never publishes
+StrategyResults, never mutates MarketContext / InstrumentState / scanner state, and never
+flips an authority bit. Executed only during a live session by the R4B procedure.
 
-Late-start and reconnect (CSOA16) evidence require a dedicated diagnostic subscription /
-observed reconnect and are left unobserved by a single straight-through run — an evidence
-record without them evaluates to INCONCLUSIVE, which is the correct honest outcome.
+Tick size is not exposed by the authoritative instrument metadata, so it is passed
+explicitly (per run) or left ``None``; a ``None`` tick means high/low differences are
+INDETERMINATE (never silently DRIFT). Late-start and reconnect (CSOA16) evidence require a
+dedicated diagnostic subscription / observed reconnect; a single straight-through run leaves
+them unobserved, so the record evaluates INCONCLUSIVE — the correct honest outcome.
 """
 
 from __future__ import annotations
@@ -39,8 +42,7 @@ from app.tools.session_ohlc_evidence.models import (
     ReconnectEvidence,
 )
 
-_COLLECTOR_VERSION = "1.0.0"
-_DEFAULT_TICK_SIZE = Decimal("0.05")  # NSE default; per-instrument bands are a future refinement
+_COLLECTOR_VERSION = "2.0.0"
 
 
 def _key(instrument: Instrument) -> str:
@@ -104,6 +106,7 @@ async def fetch_rest(
             source="rest",
             window=window,
             observed_at=obs.observed_at,
+            trading_date=obs.trading_date,
             open_price=obs.session_ohlc.open_price,
             high_price=obs.session_ohlc.high_price,
             low_price=obs.session_ohlc.low_price,
@@ -113,7 +116,7 @@ async def fetch_rest(
 
 
 def _comparisons(
-    window: str, ws: OhlcObservation, rest: OhlcObservation, tick_size: Decimal
+    window: str, ws: OhlcObservation, rest: OhlcObservation, tick_size: Decimal | None
 ) -> tuple[OracleComparison, ...]:
     fields = (
         ("open", ws.open_price, rest.open_price, True),
@@ -126,6 +129,7 @@ def _comparisons(
             field=name,
             ws_value=ws_v,
             rest_value=rest_v,
+            tick_size=None if exact else tick_size,
             classification=classify_price(ws_v, rest_v, tick_size=tick_size, exact=exact),
         )
         for name, ws_v, rest_v, exact in fields
@@ -139,7 +143,7 @@ def build_instrument_evidence(
     *,
     ws_by_window: dict[str, OhlcObservation],
     rest_by_window: dict[str, OhlcObservation],
-    tick_size: Decimal,
+    tick_size: Decimal | None,
 ) -> InstrumentEvidence:
     """Assemble one instrument's multi-window observations, comparisons, and monotonicity."""
     ws_obs = tuple(ws_by_window[w] for w in sorted(ws_by_window))
@@ -168,15 +172,10 @@ async def run_collect(
     trading_date: date,
     session_identity: str,
     source_sha: str,
-    tick_size: Decimal = _DEFAULT_TICK_SIZE,
+    tick_size: Decimal | None = None,
     per_window_seconds: float = 30.0,
 ) -> EvidenceRecord:
-    """Run a straight-through collection over the given windows (read-only; R4B use only).
-
-    Late-start / reconnect evidence is not captured by this straight-through pass (they need
-    a dedicated diagnostic subscription / observed reconnect); the resulting record therefore
-    evaluates INCONCLUSIVE until those are supplied — the honest default.
-    """
+    """Run a straight-through read-only collection over the given windows (R4B use only)."""
     adapter = DhanRestAdapter.from_settings(settings)
     await adapter.connect()
     ws_acc: dict[str, dict[str, OhlcObservation]] = {}
@@ -236,10 +235,11 @@ def _assemble(
     trading_date: date,
     session_identity: str,
     source_sha: str,
-    tick_size: Decimal,
+    tick_size: Decimal | None,
     windows: Sequence[str],
     start: datetime,
 ) -> EvidenceRecord:
+    expected_ids = tuple(_key(ref.instrument) for ref in universe)
     instruments_evidence: list[InstrumentEvidence] = []
     for ref in universe:
         instrument = ref.instrument
@@ -264,8 +264,7 @@ def _assemble(
         session_identity=session_identity,
         collection_start=start,
         collection_end=datetime.now(UTC),
-        universe_expected=len(universe),
-        universe_observed=len(instruments_evidence),
+        expected_instruments=expected_ids,
         sample_windows=tuple(windows),
         instruments=tuple(instruments_evidence),
         late_start=LateStartEvidence(observed=False, detail="not captured by straight-through run"),
