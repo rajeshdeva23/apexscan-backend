@@ -82,13 +82,17 @@ class Settings(BaseSettings):
     dhan_rest_base_url: str = Field(default="https://api.dhan.co/v2")
     dhan_rest_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     dhan_live_smoke_enabled: bool = Field(default=False)
-    # Application-level stale-live-feed watchdog (DEPLOY-8.5 hardening; newly introduced by
-    # this slice — no prior document defined it). During an expected LIVE_SESSION with an
-    # active subscription, if no valid market-data tick arrives within this many seconds the
-    # adapter treats the feed as stale and performs one bounded reconnect (reusing the
-    # existing reconnect policy). Session-gated so market-closed/holiday silence never trips
-    # it; measured on a monotonic clock, never wall-clock subtraction.
+    # Application-level stale-live-feed watchdog (DEPLOY-8.5; two-threshold since DEPLOY-9.6).
+    # Session-gated, monotonic-clock, measured since the last VALID canonical market event.
+    # SOFT threshold: after this many seconds with no canonical event the feed is logged once
+    # as *suspected stale* (degraded observability only — NO reconnect). This tolerates the
+    # legitimate low-tick lulls seen at session boundaries (open/close) without churn.
     dhan_live_stale_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    # HARD threshold: only after this many seconds with no canonical event does the adapter
+    # treat the feed as genuinely stuck and perform one bounded reconnect (reusing the
+    # existing reconnect policy). Must be strictly greater than the soft threshold. This is
+    # the stuck-feed detection latency ceiling.
+    dhan_live_hard_stale_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
 
     # --- Market provider runtime (ADR-010 D14) -----------------------------
     # Explicit switch: the live-market runtime (provider + universe + ingestion)
@@ -277,6 +281,21 @@ class Settings(BaseSettings):
                     "STRATEGIES_ENABLED entries must be lowercase snake_case strategy ids"
                 )
         return value
+
+    @model_validator(mode="after")
+    def validate_stale_watchdog_thresholds(self) -> Self:
+        """Require the hard reconnect threshold to exceed the soft suspect threshold.
+
+        The two-threshold watchdog (DEPLOY-9.6) only makes sense when the reconnect
+        (hard) deadline is strictly larger than the suspect (soft) deadline; an inverted
+        or equal relationship would collapse back to single-threshold churn.
+        """
+        if self.dhan_live_hard_stale_timeout_seconds <= self.dhan_live_stale_timeout_seconds:
+            raise ValueError(
+                "DHAN_LIVE_HARD_STALE_TIMEOUT_SECONDS must be greater than "
+                "DHAN_LIVE_STALE_TIMEOUT_SECONDS"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_provider_enabled_credentials(self) -> Self:
