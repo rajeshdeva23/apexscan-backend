@@ -22,6 +22,11 @@ from app.services.cross_instrument_scanner import ScannerOrdering, ScannerRankin
 from app.strategies.configuration import StrategyConfiguration
 from app.strategies.contracts import Strategy
 from app.strategies.implementations.narrow_cpr import NarrowCprConfiguration, NarrowCprStrategy
+from app.strategies.implementations.open_extreme import (
+    OpenExtremeConfiguration,
+    OpenHighStrategy,
+    OpenLowStrategy,
+)
 from app.strategies.implementations.previous_session_body_pct import (
     PreviousSessionBodyPctConfiguration,
     PreviousSessionBodyPctStrategy,
@@ -117,8 +122,11 @@ def production_catalog() -> StrategyCatalog:
     (narrowest first); Previous Session Range % ranks ``previous_range_pct`` descending (largest
     previous-session range first); Previous Session Body % ranks ``previous_body_pct`` descending
     (largest absolute body first); Previous Session Relative Range ranks ``relative_range_ratio``
-    ascending (most compressed vs its own 20-session baseline first). All are independent
-    completed-session plug-ins.
+    ascending (most compressed vs its own 20-session baseline first). Open=High and Open=Low
+    are current-session opening-structure plug-ins (ADR-009 CSOA22): each ranks
+    ``session_range_pct`` descending (widest open-to-extreme travel first). Membership in the
+    catalog does not enable any strategy — only ``Settings.strategies_enabled`` does, and the
+    current-session pair additionally requires authoritative session statistics at runtime.
     """
     return StrategyCatalog(
         (
@@ -156,6 +164,24 @@ def production_catalog() -> StrategyCatalog:
                     strategy_id="previous_session_relative_range",
                     metric_name="relative_range_ratio",
                     ordering=ScannerOrdering.ASCENDING,
+                ),
+            ),
+            StrategyCatalogEntry(
+                strategy=OpenHighStrategy(),
+                configuration=OpenExtremeConfiguration(config_version="1.0.0"),
+                ranking_policy=ScannerRankingPolicy(
+                    strategy_id="open_high",
+                    metric_name="session_range_pct",
+                    ordering=ScannerOrdering.DESCENDING,
+                ),
+            ),
+            StrategyCatalogEntry(
+                strategy=OpenLowStrategy(),
+                configuration=OpenExtremeConfiguration(config_version="1.0.0"),
+                ranking_policy=ScannerRankingPolicy(
+                    strategy_id="open_low",
+                    metric_name="session_range_pct",
+                    ordering=ScannerOrdering.DESCENDING,
                 ),
             ),
         )
