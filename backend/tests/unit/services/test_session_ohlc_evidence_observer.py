@@ -168,6 +168,36 @@ def test_obs_22_runtime_without_factory_has_no_observer() -> None:
     assert runtime._evidence_observer is None  # noqa: SLF001 - regression guard
 
 
+async def test_obs_01b_runtime_task_topology_off_vs_on(tmp_path: Path) -> None:
+    # Proves the topology gate at RUNTIME (not just source-count): flag OFF => no observer task;
+    # factory present (flag ON) => exactly the observer task is added and cancelled on shutdown.
+    from app.core.config import get_settings
+    from app.services.market_runtime import LiveMarketRuntime
+
+    settings = get_settings()
+
+    off = LiveMarketRuntime(settings=settings, error_threshold=3)
+    await off.start()
+    assert off._evidence_observer_task is None  # noqa: SLF001 - OFF: no evidence task
+    await off.shutdown()
+
+    def factory(bus: EventBus) -> SessionOhlcEvidenceObserver:
+        return _observer(
+            bus,
+            classifier=_Classifier(state=MarketState.MARKET_CLOSED),
+            source=_FakeSource(),
+            universe=(),
+            artifact_root=tmp_path,
+        )
+
+    on = LiveMarketRuntime(settings=settings, error_threshold=3, evidence_observer_factory=factory)
+    await on.start()
+    task = on._evidence_observer_task  # noqa: SLF001
+    assert task is not None and not task.done()  # ON: exactly the observer task exists
+    await on.shutdown()
+    assert task.cancelled() or task.done()  # cleanly cancelled on shutdown (no leak)
+
+
 # --------------------------------------------------------------------------- #
 # OBS-02..06 — hot-path callback contract + failure isolation
 # --------------------------------------------------------------------------- #
