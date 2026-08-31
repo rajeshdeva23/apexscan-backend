@@ -37,6 +37,7 @@ from app.market_engine.session_statistics import SessionStatisticsAuthority
 from app.market_engine.state import InstrumentStateRegistry
 from app.market_engine.tick_engine import TickEngine
 from app.schemas.market_data import (
+    FeedContinuityEvent,
     Instrument,
     MarketData,
     MarketDataKind,
@@ -53,6 +54,7 @@ from app.services.cross_instrument_scanner import (
     ScannerRankingPolicyRegistry,
     ScannerSnapshot,
 )
+from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_driver import (
     DrivenSessionStatisticsRefresh,
     SessionStatisticsRefreshDriver,
@@ -227,6 +229,7 @@ class LiveMarketRuntime:
         clock: Clock | None = None,
         sequence: SequenceGenerator | None = None,
         session_classifier: MarketSessionClassifier | None = None,
+        evidence_observer_factory: Callable[[EventBus], SessionOhlcEvidenceObserver] | None = None,
     ) -> None:
         """Compose the shared runtime core (no provider I/O in the constructor).
 
@@ -272,6 +275,9 @@ class LiveMarketRuntime:
                 coverage so out-of-coverage dates classify as ``CALENDAR_UNAVAILABLE``
                 (ADR-011 live out-of-coverage addendum LC5/LC6). The ``CandleEngine`` always
                 keeps the settings ``SessionSchedule`` regardless (LC17).
+            evidence_observer_factory: Optional builder for the read-only Session-OHLC evidence
+                observer (ADR-015), called with the shared bus; ``None`` (default) wires no
+                observer, so there is zero evidence subscription, task, REST, or artifact.
 
         Raises:
             ValueError: If ``error_threshold`` is not positive (from the manager).
@@ -295,6 +301,10 @@ class LiveMarketRuntime:
         self._clock: Clock = clock or SystemClock()
         self._sequence: SequenceGenerator = sequence or MonotonicSequence()
         self._bus = EventBus()
+        self._evidence_observer = (
+            evidence_observer_factory(self._bus) if evidence_observer_factory is not None else None
+        )
+        self._evidence_observer_task: asyncio.Task[None] | None = None
         self._scanner = CrossInstrumentStrategyScanner(
             instruments=known,
             policies=ScannerRankingPolicyRegistry(scanner_ranking_policies),
@@ -382,6 +392,10 @@ class LiveMarketRuntime:
             return
         self._manager.subscribe()  # subscribers installed before the first live datum
         self._scanner.subscribe()  # aggregates StrategyResultsPublished; installed pre-ingestion
+        if self._evidence_observer is not None:
+            self._evidence_observer.subscribe()  # read-only; installed before ingestion
+            self._evidence_observer_task = asyncio.create_task(self._evidence_observer.run())
+            self._evidence_observer_task.add_done_callback(self._on_evidence_observer_done)
         self._manager_subscribed = True
         self._state = RuntimeState.STARTED
         for strategy_id in self._autostart_strategy_ids:
@@ -525,11 +539,13 @@ class LiveMarketRuntime:
             self._ingestion_task,  # 1. stop ingestion
             self._refresh_driver_task,  # 2. stop refresh driver
             self._calendar_monitor_task,  # 3. stop calendar monitor
+            self._evidence_observer_task,  # 3b. stop evidence observer driver
         ):
             try:
                 await self._cancel_task(task)
             except Exception as error:  # noqa: BLE001 - clean up every owned resource
                 errors.append(error)
+        self._teardown_evidence_observer(errors)
         for detach in (self._scanner.unsubscribe, self._manager.unsubscribe):
             try:
                 detach()  # 4. detach scanner aggregator, 5. unsubscribe manager
@@ -612,6 +628,41 @@ class LiveMarketRuntime:
     def tick_engine(self) -> TickEngine:
         """The tick engine (RUN-C dispatches the live stream into it)."""
         return self._tick_engine
+
+    def on_feed_continuity(self, event: FeedContinuityEvent) -> None:
+        """Broker-neutral continuity entry point: forward to the engine, then observe (evidence).
+
+        The provider's continuity sink binds here. The Market-Engine target is always invoked;
+        the read-only evidence observer (when present) then observes the same fact. An observer
+        failure can never disrupt the engine's continuity handling.
+        """
+        self._tick_engine.on_feed_continuity(event)
+        if self._evidence_observer is not None:
+            self._evidence_observer.on_feed_continuity(event)
+
+    def _teardown_evidence_observer(self, errors: list[BaseException]) -> None:
+        """Unsubscribe and finalize the evidence observer during shutdown (never blocks it)."""
+        if self._evidence_observer is None:
+            return
+        try:
+            self._evidence_observer.unsubscribe()
+            self._evidence_observer.finalize_session()
+        except Exception as error:  # noqa: BLE001 - evidence never blocks shutdown
+            errors.append(error)
+
+    def _on_evidence_observer_done(self, task: asyncio.Task[None]) -> None:
+        """Observe evidence-observer driver completion. Cancellation is the normal shutdown path.
+
+        Evidence collection is subordinate: a non-cancel end is logged, never made fatal to the
+        runtime (it must not affect ingestion, authority, or strategies).
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        logger.warning(
+            "evidence observer driver ended (%s); evidence collection stopped, ingestion intact",
+            "returned" if error is None else type(error).__name__,
+        )
 
     @property
     def strategy_manager(self) -> StrategyManager:

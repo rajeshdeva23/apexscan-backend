@@ -30,6 +30,7 @@ context that forced it, the alternatives weighed, and its consequences.
 | [ADR-012](ADR-012-cross-instrument-strategy-scanner.md) | Cross-Instrument Strategy Scanner | Accepted | 2026-08-16 |
 | [ADR-013](ADR-013-production-strategy-registration.md) | Production Strategy Registration & Enablement (Strategy Catalog) | Accepted | 2026-08-16 |
 | [ADR-014](ADR-014-evidence-price-canonicalization-and-resumable-collection.md) | Evidence Price Canonicalization & Resumable Collection (DEPLOY-10 R4C) | Proposed | 2026-08-31 |
+| [ADR-015](ADR-015-single-account-session-ohlc-evidence-observer.md) | Single-Account In-Process Session-OHLC Evidence Observer (DEPLOY-10 R4D) | Proposed | 2026-08-31 |
 
 ## Subordinate operational & evidence artifacts
 

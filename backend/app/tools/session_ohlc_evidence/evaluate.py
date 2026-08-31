@@ -26,6 +26,7 @@ from app.tools.session_ohlc_evidence.models import (
     EvidenceRecord,
     InstrumentEvidence,
     LateStartEvidence,
+    LateStartKind,
     MonotonicityResult,
     OhlcObservation,
     OracleComparison,
@@ -247,6 +248,11 @@ def _late_start_incomplete(ev: LateStartEvidence | None) -> list[str]:
         ev.prior_open, ev.prior_high, ev.prior_low, ev.first_open, ev.first_high, ev.first_low
     ):
         return ["late-start evidence incomplete (missing raw prior/first values)"]
+    if ev.kind is LateStartKind.OBSERVER_LATE_ATTACH:
+        # ADR-015 D7: an observer attaching to an already-live subscription proves the observer
+        # saw pre-attach extrema, NOT that the provider re-sends session-to-date extrema on a
+        # fresh subscription (ADR-008 §A6). Provider late-start stays unproven → INCONCLUSIVE.
+        return ["provider late-start not proven (observer-late-attach only; ADR-008 §A6 unmet)"]
     return []
 
 

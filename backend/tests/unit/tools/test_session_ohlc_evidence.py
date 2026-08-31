@@ -273,6 +273,37 @@ def test_evid_09_late_start_loses_high_rejected() -> None:
     assert any("late-start lost" in r for r in verdict.reasons)
 
 
+def test_observer_late_attach_does_not_satisfy_provider_late_start() -> None:
+    # ADR-015 D7: observer-late-attach must NOT stand in for provider-late-subscription.
+    from app.tools.session_ohlc_evidence.models import LateStartKind
+
+    provider_late = _good_late()  # default kind = provider_late_subscription
+    assert (
+        evaluate_record(
+            _record(instruments=(_accepted_instrument(),), late_start=provider_late)
+        ).outcome
+        is VerdictOutcome.ACCEPTED
+    )
+    observer_late = _good_late().model_copy(update={"kind": LateStartKind.OBSERVER_LATE_ATTACH})
+    verdict = evaluate_record(
+        _record(instruments=(_accepted_instrument(),), late_start=observer_late)
+    )
+    assert verdict.outcome is VerdictOutcome.INCONCLUSIVE
+    assert any("provider late-start not proven" in r for r in verdict.reasons)
+
+
+def test_observer_late_attach_extrema_loss_still_rejected() -> None:
+    # A genuine extrema loss is a hard REJECT regardless of kind.
+    from app.tools.session_ohlc_evidence.models import LateStartKind
+
+    bad = _good_late().model_copy(
+        update={"kind": LateStartKind.OBSERVER_LATE_ATTACH, "first_low": Decimal("98")}  # > 97
+    )
+    verdict = evaluate_record(_record(instruments=(_accepted_instrument(),), late_start=bad))
+    assert verdict.outcome is VerdictOutcome.REJECTED
+    assert any("late-start lost" in r for r in verdict.reasons)
+
+
 def test_late_start_incomplete_is_inconclusive() -> None:
     late = LateStartEvidence(observed=True, prior_high=Decimal("104"))  # missing most raw values
     verdict = evaluate_record(_record(instruments=(_accepted_instrument(),), late_start=late))
