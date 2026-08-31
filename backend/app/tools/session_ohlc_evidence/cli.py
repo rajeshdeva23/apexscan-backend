@@ -17,7 +17,7 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.tools.session_ohlc_evidence.collect import run_collect
-from app.tools.session_ohlc_evidence.evaluate import evaluate_record
+from app.tools.session_ohlc_evidence.evaluate import combine_records, evaluate_record
 from app.tools.session_ohlc_evidence.models import EvidenceRecord, Verdict
 from app.tools.session_ohlc_evidence.report import to_json, to_markdown
 
@@ -36,6 +36,16 @@ def _write_outputs(out_stem: Path, record: EvidenceRecord, verdict: Verdict) -> 
 
 def _cmd_evaluate(args: argparse.Namespace) -> int:
     record = _load_record(Path(args.input))
+    verdict = evaluate_record(record)
+    if args.out:
+        _write_outputs(Path(args.out), record, verdict)
+    print(to_markdown(record, verdict))
+    return 0
+
+
+def _cmd_combine(args: argparse.Namespace) -> int:
+    records = [_load_record(Path(path)) for path in args.inputs]
+    record = combine_records(records)
     verdict = evaluate_record(record)
     if args.out:
         _write_outputs(Path(args.out), record, verdict)
@@ -74,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("input", help="Path to a captured evidence JSON file.")
     ev.add_argument("--out", help="Output stem for .json/.md (optional).")
     ev.set_defaults(func=_cmd_evaluate)
+
+    cb = sub.add_parser(
+        "combine",
+        help="Merge per-window partial records for one session, then re-derive the verdict.",
+    )
+    cb.add_argument(
+        "inputs", nargs="+", help="Paths to captured evidence JSON files (one session)."
+    )
+    cb.add_argument("--out", help="Output stem for .json/.md (optional).")
+    cb.set_defaults(func=_cmd_combine)
 
     co = sub.add_parser("collect", help="Run the read-only live collector (R4B live session only).")
     co.add_argument("--windows", nargs="+", default=["early", "mid", "late"])

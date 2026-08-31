@@ -13,11 +13,14 @@ comparison with an unknown tick size is INDETERMINATE (→ INCONCLUSIVE), never 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 
+from app.tools.session_ohlc_evidence.canonical import float32_equivalent, is_finite_price
 from app.tools.session_ohlc_evidence.models import (
     Classification,
     EvidenceRecord,
+    InstrumentEvidence,
     LateStartEvidence,
     MonotonicityResult,
     OhlcObservation,
@@ -37,15 +40,21 @@ def classify_price(
 ) -> Classification:
     """Classify a WS value against the oracle: MATCH / DRIFT / INDETERMINATE / MISMATCH.
 
-    A missing value on either side is a MISMATCH (fail closed). ``exact`` (the session open)
-    permits only equality. Otherwise, when the values differ: an unknown ``tick_size``
-    (``None``) yields INDETERMINATE (drift cannot be justified — fail safe), a difference
+    A missing or non-finite value on either side is a MISMATCH (fail closed). Identical
+    Decimals are a MATCH; values that encode to the same IEEE-754 float32 wire representation
+    are PROTOCOL_EQUIVALENT (resolving float32 serialisation noise *before* any tolerance).
+    Only after that: ``exact`` (the session open) permits nothing further (MISMATCH); for
+    high/low an unknown ``tick_size`` yields INDETERMINATE (fail safe), a genuine difference
     within an explicit ``tick_size`` is DRIFT, and anything larger is a MISMATCH.
     """
     if ws_value is None or rest_value is None:
         return Classification.MISMATCH
+    if not (is_finite_price(ws_value) and is_finite_price(rest_value)):
+        return Classification.MISMATCH
     if ws_value == rest_value:
         return Classification.MATCH
+    if float32_equivalent(ws_value, rest_value):
+        return Classification.PROTOCOL_EQUIVALENT
     if exact:
         return Classification.MISMATCH
     if tick_size is None:
@@ -106,18 +115,28 @@ def evaluate_monotonicity(observations: tuple[OhlcObservation, ...]) -> Monotoni
 
 
 def _tally(comparison: OracleComparison, counts: dict[str, int]) -> None:
-    if comparison.field == "open" and comparison.classification is Classification.MISMATCH:
+    cls = comparison.classification
+    if cls is Classification.PROTOCOL_EQUIVALENT:
+        counts["proto"] += 1
+    elif comparison.field == "open" and cls is Classification.MISMATCH:
         counts["open_mismatch"] += 1
-    elif comparison.classification is Classification.DRIFT:
+    elif cls is Classification.DRIFT:
         counts["hl_drift"] += 1
-    elif comparison.classification is Classification.INDETERMINATE:
+    elif cls is Classification.INDETERMINATE:
         counts["hl_indeterminate"] += 1
-    elif comparison.field != "open" and comparison.classification is Classification.MISMATCH:
+    elif comparison.field != "open" and cls is Classification.MISMATCH:
         counts["hl_mismatch"] += 1
 
 
 def _count_signals(record: EvidenceRecord) -> dict[str, int]:
-    counts = {"open_mismatch": 0, "mono": 0, "hl_drift": 0, "hl_indeterminate": 0, "hl_mismatch": 0}
+    counts = {
+        "open_mismatch": 0,
+        "mono": 0,
+        "proto": 0,
+        "hl_drift": 0,
+        "hl_indeterminate": 0,
+        "hl_mismatch": 0,
+    }
     for inst in record.instruments:
         for comparison in inst.oracle_comparisons:
             _tally(comparison, counts)
@@ -259,6 +278,7 @@ def evaluate_record(record: EvidenceRecord) -> Verdict:
             reasons=tuple(rejections),
             open_mismatches=counts["open_mismatch"],
             monotonicity_violations=counts["mono"],
+            protocol_equivalent=counts["proto"],
             high_low_drift=counts["hl_drift"],
             high_low_indeterminate=counts["hl_indeterminate"],
             high_low_mismatch=counts["hl_mismatch"],
@@ -268,15 +288,102 @@ def evaluate_record(record: EvidenceRecord) -> Verdict:
         return Verdict(
             outcome=VerdictOutcome.INCONCLUSIVE,
             reasons=tuple(inconclusive),
+            protocol_equivalent=counts["proto"],
             high_low_drift=counts["hl_drift"],
             high_low_indeterminate=counts["hl_indeterminate"],
         )
     return Verdict(
         outcome=VerdictOutcome.ACCEPTED,
         reasons=(
-            "all mandatory evidence satisfied: open exact, high/low within recorded tolerance, "
-            "monotonic, identity-complete coverage, all required windows, late-start extrema "
-            "retained, reconnect continuity",
+            "all mandatory evidence satisfied: open exact/protocol-equivalent, high/low within "
+            "recorded tolerance, monotonic, identity-complete coverage, all required windows, "
+            "late-start extrema retained, reconnect continuity",
         ),
+        protocol_equivalent=counts["proto"],
         high_low_drift=counts["hl_drift"],
+    )
+
+
+def _merge_instrument(items: Sequence[InstrumentEvidence]) -> InstrumentEvidence:
+    """Merge one instrument's evidence across per-window partial records."""
+    first = items[0]
+    ws = tuple(o for it in items for o in it.ws_observations)
+    ws = tuple(sorted(ws, key=lambda o: (o.window, o.observed_at)))
+    rest = tuple(o for it in items for o in it.rest_observations)
+    comparisons = tuple(c for it in items for c in it.oracle_comparisons)
+    return first.model_copy(
+        update={
+            "ws_observations": ws,
+            "rest_observations": rest,
+            "oracle_comparisons": comparisons,
+            "monotonicity": evaluate_monotonicity(ws),
+        }
+    )
+
+
+def _merge_late_start(records: Sequence[EvidenceRecord]) -> LateStartEvidence | None:
+    """Keep the earliest observed late-start (the actual subscription-time capture)."""
+    observed = [
+        r.late_start
+        for r in records
+        if r.late_start and r.late_start.observed and r.late_start.first_observed_at is not None
+    ]
+    if not observed:
+        return next((r.late_start for r in records if r.late_start and r.late_start.observed), None)
+    return min(observed, key=lambda ev: ev.first_observed_at)  # type: ignore[arg-type,return-value]
+
+
+def _merge_reconnect(records: Sequence[EvidenceRecord]) -> ReconnectEvidence | None:
+    """Span the earliest pre and latest post across all observed reconnects (CSOA16).
+
+    Selecting a single record's reconnect could let an earlier good capture mask a later
+    continuity loss. Checking the earliest pre against the latest post instead verifies
+    session-to-date extrema were preserved end-to-end across every reconnect in the span.
+    """
+    observed = [r.reconnect for r in records if r.reconnect and r.reconnect.observed]
+    if not observed:
+        return None
+    pres = [ev.pre for ev in observed if ev.pre is not None]
+    posts = [ev.post for ev in observed if ev.post is not None]
+    if not pres or not posts:
+        return observed[0]
+    pre = min(pres, key=lambda o: o.observed_at)
+    post = max(posts, key=lambda o: o.observed_at)
+    detail = f"end-to-end continuity across {len(observed)} observed reconnect(s)"
+    return ReconnectEvidence(observed=True, pre=pre, post=post, detail=detail)
+
+
+def combine_records(records: Sequence[EvidenceRecord]) -> EvidenceRecord:
+    """Deterministically combine per-window partial records for one trading date/session.
+
+    Rejects records that disagree on trading_date / session_identity / source_sha (a combine
+    must not span sessions). Per-instrument observations, comparisons, and monotonicity are
+    merged; sample_windows and pending identities are recomputed from the union. Late-start
+    keeps the earliest capture; reconnect continuity is spanned earliest-pre → latest-post so
+    a later loss cannot be masked by an earlier good capture.
+    """
+    if not records:
+        raise ValueError("combine_records requires at least one record")
+    keys = {(r.trading_date, r.session_identity, r.source_sha) for r in records}
+    if len(keys) != 1:
+        raise ValueError("cannot combine records across different trading_date/session/source")
+    by_identity: dict[str, list[InstrumentEvidence]] = {}
+    for record in records:
+        for inst in record.instruments:
+            by_identity.setdefault(inst.identity, []).append(inst)
+    merged = tuple(_merge_instrument(items) for items in by_identity.values())
+    observed = {inst.identity for inst in merged}
+    expected = tuple(sorted({i for r in records for i in r.expected_instruments}))
+    windows = tuple(sorted({w for r in records for w in r.sample_windows}))
+    return records[0].model_copy(
+        update={
+            "collection_start": min(r.collection_start for r in records),
+            "collection_end": max(r.collection_end for r in records),
+            "expected_instruments": expected,
+            "pending_instruments": tuple(sorted(set(expected) - observed)),
+            "sample_windows": windows,
+            "instruments": merged,
+            "late_start": _merge_late_start(records),
+            "reconnect": _merge_reconnect(records),
+        }
     )

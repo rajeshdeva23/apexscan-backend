@@ -29,7 +29,8 @@ class _Frozen(BaseModel):
 class Classification(StrEnum):
     """Result of one WS-vs-oracle price comparison."""
 
-    MATCH = "match"
+    MATCH = "match"  # identical Decimal values
+    PROTOCOL_EQUIVALENT = "protocol_equivalent"  # identical IEEE-754 float32 wire representation
     DRIFT = "drift"  # differ but within an explicit, recorded one-tick allowance
     INDETERMINATE = "indeterminate"  # differ but tick size unknown → cannot classify (fail safe)
     MISMATCH = "mismatch"
@@ -68,6 +69,9 @@ class OracleComparison(_Frozen):
     rest_value: Decimal | None
     tick_size: Decimal | None
     classification: Classification
+    method: str = "exact"  # exact | float32 | tick | unknown_tick | missing
+    ws_float32_bits: str | None = None  # IEEE-754 float32 hex of ws_value (audit)
+    rest_float32_bits: str | None = None  # IEEE-754 float32 hex of rest_value (audit)
 
 
 class MonotonicityResult(_Frozen):
@@ -128,7 +132,7 @@ class ReconnectEvidence(_Frozen):
 class EvidenceRecord(_Frozen):
     """The complete immutable evidence record for one collection run."""
 
-    schema_version: str = "2.0.0"
+    schema_version: str = "2.1.0"
     collector_version: str
     source_sha: str
     provider: str
@@ -139,6 +143,7 @@ class EvidenceRecord(_Frozen):
     collection_start: datetime
     collection_end: datetime
     expected_instruments: tuple[str, ...]  # identity keys "EXCHANGE:SYMBOL"
+    pending_instruments: tuple[str, ...] = ()  # expected identities with no WS observation
     required_windows: tuple[str, ...] = ("early", "mid", "late")
     sample_windows: tuple[str, ...]
     instruments: tuple[InstrumentEvidence, ...]
@@ -155,6 +160,7 @@ class Verdict(_Frozen):
     reasons: tuple[str, ...]
     open_mismatches: int = 0
     monotonicity_violations: int = 0
+    protocol_equivalent: int = 0  # comparisons that matched only by float32 wire representation
     high_low_drift: int = 0
     high_low_indeterminate: int = 0
     high_low_mismatch: int = 0

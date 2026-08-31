@@ -32,8 +32,10 @@ from app.schemas.market_data import (
     SubscriptionRequest,
     Tick,
 )
+from app.tools.session_ohlc_evidence.canonical import float32_hex
 from app.tools.session_ohlc_evidence.evaluate import classify_price, evaluate_monotonicity
 from app.tools.session_ohlc_evidence.models import (
+    Classification,
     EvidenceRecord,
     InstrumentEvidence,
     LateStartEvidence,
@@ -41,6 +43,14 @@ from app.tools.session_ohlc_evidence.models import (
     OracleComparison,
     ReconnectEvidence,
 )
+
+_METHOD_BY_CLASS = {
+    Classification.MATCH: "exact",
+    Classification.PROTOCOL_EQUIVALENT: "float32",
+    Classification.DRIFT: "tick",
+    Classification.INDETERMINATE: "unknown_tick",
+    Classification.MISMATCH: "none",
+}
 
 _COLLECTOR_VERSION = "2.0.0"
 
@@ -123,17 +133,23 @@ def _comparisons(
         ("high", ws.high_price, rest.high_price, False),
         ("low", ws.low_price, rest.low_price, False),
     )
-    return tuple(
-        OracleComparison(
-            window=window,
-            field=name,
-            ws_value=ws_v,
-            rest_value=rest_v,
-            tick_size=None if exact else tick_size,
-            classification=classify_price(ws_v, rest_v, tick_size=tick_size, exact=exact),
+    comparisons: list[OracleComparison] = []
+    for name, ws_v, rest_v, exact in fields:
+        classification = classify_price(ws_v, rest_v, tick_size=tick_size, exact=exact)
+        comparisons.append(
+            OracleComparison(
+                window=window,
+                field=name,
+                ws_value=ws_v,
+                rest_value=rest_v,
+                tick_size=None if exact else tick_size,
+                classification=classification,
+                method=_METHOD_BY_CLASS[classification],
+                ws_float32_bits=float32_hex(ws_v),
+                rest_float32_bits=float32_hex(rest_v),
+            )
         )
-        for name, ws_v, rest_v, exact in fields
-    )
+    return tuple(comparisons)
 
 
 def build_instrument_evidence(
@@ -240,6 +256,7 @@ def _assemble(
     start: datetime,
 ) -> EvidenceRecord:
     expected_ids = tuple(_key(ref.instrument) for ref in universe)
+    pending_ids = tuple(key for key in expected_ids if key not in ws_acc)
     instruments_evidence: list[InstrumentEvidence] = []
     for ref in universe:
         instrument = ref.instrument
@@ -265,6 +282,7 @@ def _assemble(
         collection_start=start,
         collection_end=datetime.now(UTC),
         expected_instruments=expected_ids,
+        pending_instruments=pending_ids,
         sample_windows=tuple(windows),
         instruments=tuple(instruments_evidence),
         late_start=LateStartEvidence(observed=False, detail="not captured by straight-through run"),
