@@ -54,7 +54,7 @@ def to_markdown(record: EvidenceRecord, verdict: Verdict) -> str:
         f"- Session identity: {record.session_identity}",
         f"- Window: {record.collection_start.isoformat()} → {record.collection_end.isoformat()}",
         f"- Universe: {len(record.instruments)}/{len(record.expected_instruments)} observed "
-        f"(identity-based coverage)",
+        f"(identity-based coverage); pending: {len(record.pending_instruments)}",
         f"- Sample windows: {', '.join(record.sample_windows) or '(none)'}; "
         f"required: {', '.join(record.required_windows)}",
         f"- CSOA16 reconnect required: {record.csoa16_required}; oracle available: "
@@ -69,8 +69,14 @@ def to_markdown(record: EvidenceRecord, verdict: Verdict) -> str:
         "## Counts",
         f"- Open mismatches: {verdict.open_mismatches}",
         f"- Monotonicity violations: {verdict.monotonicity_violations}",
+        f"- Protocol-equivalent (float32 wire) matches: {verdict.protocol_equivalent}",
         f"- High/Low one-tick drift: {verdict.high_low_drift}",
+        f"- High/Low indeterminate: {verdict.high_low_indeterminate}",
         f"- High/Low mismatches: {verdict.high_low_mismatch}",
+        "",
+        "Protocol-equivalent = WS and REST prices differ as widened binary64 Decimals but "
+        "encode to the identical IEEE-754 float32 wire representation (the Dhan feed carries "
+        "prices as float32); this is a true match, not a tolerance.",
     ]
     late = record.late_start
     reconnect = record.reconnect

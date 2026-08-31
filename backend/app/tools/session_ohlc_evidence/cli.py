@@ -16,8 +16,12 @@ from decimal import Decimal
 from pathlib import Path
 
 from app.core.config import get_settings
-from app.tools.session_ohlc_evidence.collect import run_collect
-from app.tools.session_ohlc_evidence.evaluate import evaluate_record
+from app.tools.session_ohlc_evidence.collect import (
+    run_capture_late_start,
+    run_capture_reconnect,
+    run_collect,
+)
+from app.tools.session_ohlc_evidence.evaluate import combine_records, evaluate_record
 from app.tools.session_ohlc_evidence.models import EvidenceRecord, Verdict
 from app.tools.session_ohlc_evidence.report import to_json, to_markdown
 
@@ -40,6 +44,52 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     if args.out:
         _write_outputs(Path(args.out), record, verdict)
     print(to_markdown(record, verdict))
+    return 0
+
+
+def _cmd_combine(args: argparse.Namespace) -> int:
+    records = [_load_record(Path(path)) for path in args.inputs]
+    record = combine_records(records)
+    verdict = evaluate_record(record)
+    if args.out:
+        _write_outputs(Path(args.out), record, verdict)
+    print(to_markdown(record, verdict))
+    return 0
+
+
+def _cmd_capture_late_start(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    record = asyncio.run(
+        run_capture_late_start(
+            settings,
+            symbol=args.symbol,
+            trading_date=date.fromisoformat(args.trading_date),
+            session_identity=args.session_identity,
+            source_sha=args.source_sha,
+            deadline_seconds=args.deadline_seconds,
+        )
+    )
+    stem = Path(args.out or f"late_start_{datetime.now(UTC):%Y%m%dT%H%M%SZ}")
+    _write_outputs(stem, record, evaluate_record(record))
+    print(to_markdown(record, evaluate_record(record)))
+    return 0
+
+
+def _cmd_capture_reconnect(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    record = asyncio.run(
+        run_capture_reconnect(
+            settings,
+            symbol=args.symbol,
+            trading_date=date.fromisoformat(args.trading_date),
+            session_identity=args.session_identity,
+            source_sha=args.source_sha,
+            deadline_seconds=args.deadline_seconds,
+        )
+    )
+    stem = Path(args.out or f"reconnect_{datetime.now(UTC):%Y%m%dT%H%M%SZ}")
+    _write_outputs(stem, record, evaluate_record(record))
+    print(to_markdown(record, evaluate_record(record)))
     return 0
 
 
@@ -74,6 +124,37 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("input", help="Path to a captured evidence JSON file.")
     ev.add_argument("--out", help="Output stem for .json/.md (optional).")
     ev.set_defaults(func=_cmd_evaluate)
+
+    cb = sub.add_parser(
+        "combine",
+        help="Merge per-window partial records for one session, then re-derive the verdict.",
+    )
+    cb.add_argument(
+        "inputs", nargs="+", help="Paths to captured evidence JSON files (one session)."
+    )
+    cb.add_argument("--out", help="Output stem for .json/.md (optional).")
+    cb.set_defaults(func=_cmd_combine)
+
+    for name, func, helptext in (
+        (
+            "capture-late-start",
+            _cmd_capture_late_start,
+            "Diagnostic late-start capture for one instrument (REST prior vs first WS tick).",
+        ),
+        (
+            "capture-reconnect",
+            _cmd_capture_reconnect,
+            "Diagnostic reconnect capture for one instrument (pre/post across a fresh socket).",
+        ),
+    ):
+        cap = sub.add_parser(name, help=helptext)
+        cap.add_argument("--symbol", required=True, help="Instrument symbol in the live universe.")
+        cap.add_argument("--trading-date", dest="trading_date", required=True)
+        cap.add_argument("--session-identity", dest="session_identity", required=True)
+        cap.add_argument("--source-sha", dest="source_sha", required=True)
+        cap.add_argument("--deadline-seconds", dest="deadline_seconds", type=float, default=60.0)
+        cap.add_argument("--out", help="Output stem for .json/.md (optional).")
+        cap.set_defaults(func=func)
 
     co = sub.add_parser("collect", help="Run the read-only live collector (R4B live session only).")
     co.add_argument("--windows", nargs="+", default=["early", "mid", "late"])

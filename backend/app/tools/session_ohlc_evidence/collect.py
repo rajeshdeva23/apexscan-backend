@@ -32,8 +32,10 @@ from app.schemas.market_data import (
     SubscriptionRequest,
     Tick,
 )
+from app.tools.session_ohlc_evidence.canonical import float32_hex
 from app.tools.session_ohlc_evidence.evaluate import classify_price, evaluate_monotonicity
 from app.tools.session_ohlc_evidence.models import (
+    Classification,
     EvidenceRecord,
     InstrumentEvidence,
     LateStartEvidence,
@@ -41,6 +43,14 @@ from app.tools.session_ohlc_evidence.models import (
     OracleComparison,
     ReconnectEvidence,
 )
+
+_METHOD_BY_CLASS = {
+    Classification.MATCH: "exact",
+    Classification.PROTOCOL_EQUIVALENT: "float32",
+    Classification.DRIFT: "tick",
+    Classification.INDETERMINATE: "unknown_tick",
+    Classification.MISMATCH: "none",
+}
 
 _COLLECTOR_VERSION = "2.0.0"
 
@@ -115,6 +125,88 @@ async def fetch_rest(
     }
 
 
+async def capture_late_start(
+    adapter: DhanRestAdapter,
+    instrument: Instrument,
+    *,
+    trading_date: date,
+    observed_at: datetime,
+    deadline_seconds: float,
+) -> LateStartEvidence:
+    """Capture raw late-start evidence: a pre-subscription REST snapshot vs the first WS obs.
+
+    ``prior_*`` is the oracle's session-to-date extrema taken *before* subscribing; ``first_*``
+    is the first post-subscription WS observation. The evaluator derives (never trusts) whether
+    the first tick already carried the prior extrema. Bounded by ``deadline_seconds``; the
+    diagnostic WS stream is opened and closed by :func:`sample_ws` (clean shutdown).
+    """
+    rest = await fetch_rest(
+        adapter, [instrument], window="prior", trading_date=trading_date, observed_at=observed_at
+    )
+    prior = rest.get(_key(instrument))
+    request = SubscriptionRequest(
+        instruments=(instrument,), data_types=frozenset({MarketDataKind.TICK})
+    )
+    ws = await sample_ws(
+        adapter, request, window="first", expected=1, deadline_seconds=deadline_seconds
+    )
+    first = ws.get(_key(instrument))
+    if prior is None or first is None:
+        return LateStartEvidence(
+            observed=False,
+            detail="late-start capture incomplete (prior REST or first WS observation missing)",
+        )
+    return LateStartEvidence(
+        observed=True,
+        prior_observed_at=prior.observed_at,
+        prior_open=prior.open_price,
+        prior_high=prior.high_price,
+        prior_low=prior.low_price,
+        first_observed_at=first.observed_at,
+        first_open=first.open_price,
+        first_high=first.high_price,
+        first_low=first.low_price,
+        detail="prior=REST snapshot before subscription; first=first post-subscription WS tick",
+    )
+
+
+async def capture_reconnect(
+    adapter: DhanRestAdapter,
+    instrument: Instrument,
+    *,
+    deadline_seconds: float,
+) -> ReconnectEvidence:
+    """Capture raw pre/post evidence across a fresh diagnostic socket (a reconnect, CSOA16).
+
+    Two sequential :func:`sample_ws` calls each open and cleanly close their own diagnostic
+    stream, so the second observation is taken over a brand-new socket — a reconnect. Continuity
+    (session-to-date extrema preserved post-reconnect) is derived by the evaluator, not asserted
+    here. Bounded by ``deadline_seconds`` per leg. The production feed socket is never touched.
+    """
+    request = SubscriptionRequest(
+        instruments=(instrument,), data_types=frozenset({MarketDataKind.TICK})
+    )
+    pre_map = await sample_ws(
+        adapter, request, window="pre", expected=1, deadline_seconds=deadline_seconds
+    )
+    post_map = await sample_ws(
+        adapter, request, window="post", expected=1, deadline_seconds=deadline_seconds
+    )
+    pre = pre_map.get(_key(instrument))
+    post = post_map.get(_key(instrument))
+    if pre is None or post is None:
+        return ReconnectEvidence(
+            observed=False,
+            detail="reconnect capture incomplete (pre or post observation missing)",
+        )
+    return ReconnectEvidence(
+        observed=True,
+        pre=pre,
+        post=post,
+        detail="pre and post captured across a fresh diagnostic socket (reconnect)",
+    )
+
+
 def _comparisons(
     window: str, ws: OhlcObservation, rest: OhlcObservation, tick_size: Decimal | None
 ) -> tuple[OracleComparison, ...]:
@@ -123,17 +215,23 @@ def _comparisons(
         ("high", ws.high_price, rest.high_price, False),
         ("low", ws.low_price, rest.low_price, False),
     )
-    return tuple(
-        OracleComparison(
-            window=window,
-            field=name,
-            ws_value=ws_v,
-            rest_value=rest_v,
-            tick_size=None if exact else tick_size,
-            classification=classify_price(ws_v, rest_v, tick_size=tick_size, exact=exact),
+    comparisons: list[OracleComparison] = []
+    for name, ws_v, rest_v, exact in fields:
+        classification = classify_price(ws_v, rest_v, tick_size=tick_size, exact=exact)
+        comparisons.append(
+            OracleComparison(
+                window=window,
+                field=name,
+                ws_value=ws_v,
+                rest_value=rest_v,
+                tick_size=None if exact else tick_size,
+                classification=classification,
+                method=_METHOD_BY_CLASS[classification],
+                ws_float32_bits=float32_hex(ws_v),
+                rest_float32_bits=float32_hex(rest_v),
+            )
         )
-        for name, ws_v, rest_v, exact in fields
-    )
+    return tuple(comparisons)
 
 
 def build_instrument_evidence(
@@ -227,6 +325,110 @@ async def _load_universe(adapter: DhanRestAdapter) -> DhanCashEquityLiveUniverse
     return adapter.load_nse_cash_equity_live_universe()
 
 
+def _find_ref(universe: Sequence[DhanInstrumentReference], symbol: str) -> DhanInstrumentReference:
+    for ref in universe:
+        if ref.instrument.symbol == symbol:
+            return ref
+    raise ValueError(f"symbol {symbol!r} not in the authoritative live universe")
+
+
+def _partial_record(
+    universe: Sequence[DhanInstrumentReference],
+    *,
+    trading_date: date,
+    session_identity: str,
+    source_sha: str,
+    start: datetime,
+    late_start: LateStartEvidence | None,
+    reconnect: ReconnectEvidence | None,
+) -> EvidenceRecord:
+    """A window-less partial record carrying only continuity evidence, for later ``combine``."""
+    expected_ids = tuple(_key(ref.instrument) for ref in universe)
+    return EvidenceRecord(
+        collector_version=_COLLECTOR_VERSION,
+        source_sha=source_sha,
+        provider="dhan",
+        trading_date=trading_date,
+        session_identity=session_identity,
+        collection_start=start,
+        collection_end=datetime.now(UTC),
+        expected_instruments=expected_ids,
+        pending_instruments=expected_ids,
+        sample_windows=(),
+        instruments=(),
+        late_start=late_start,
+        reconnect=reconnect,
+    )
+
+
+async def run_capture_late_start(
+    settings: Settings,
+    *,
+    symbol: str,
+    trading_date: date,
+    session_identity: str,
+    source_sha: str,
+    deadline_seconds: float = 60.0,
+) -> EvidenceRecord:
+    """Run a read-only diagnostic late-start capture for one instrument (R4D use only)."""
+    adapter = DhanRestAdapter.from_settings(settings)
+    await adapter.connect()
+    start = datetime.now(UTC)
+    try:
+        universe = (await _load_universe(adapter)).cash_references
+        ref = _find_ref(universe, symbol)
+        late = await capture_late_start(
+            adapter,
+            ref.instrument,
+            trading_date=trading_date,
+            observed_at=datetime.now(UTC),
+            deadline_seconds=deadline_seconds,
+        )
+    finally:
+        await adapter.disconnect()
+    return _partial_record(
+        universe,
+        trading_date=trading_date,
+        session_identity=session_identity,
+        source_sha=source_sha,
+        start=start,
+        late_start=late,
+        reconnect=None,
+    )
+
+
+async def run_capture_reconnect(
+    settings: Settings,
+    *,
+    symbol: str,
+    trading_date: date,
+    session_identity: str,
+    source_sha: str,
+    deadline_seconds: float = 60.0,
+) -> EvidenceRecord:
+    """Run a read-only diagnostic reconnect capture for one instrument (R4D use only)."""
+    adapter = DhanRestAdapter.from_settings(settings)
+    await adapter.connect()
+    start = datetime.now(UTC)
+    try:
+        universe = (await _load_universe(adapter)).cash_references
+        ref = _find_ref(universe, symbol)
+        reconnect = await capture_reconnect(
+            adapter, ref.instrument, deadline_seconds=deadline_seconds
+        )
+    finally:
+        await adapter.disconnect()
+    return _partial_record(
+        universe,
+        trading_date=trading_date,
+        session_identity=session_identity,
+        source_sha=source_sha,
+        start=start,
+        late_start=None,
+        reconnect=reconnect,
+    )
+
+
 def _assemble(
     universe: Sequence[DhanInstrumentReference],
     ws_acc: dict[str, dict[str, OhlcObservation]],
@@ -240,6 +442,7 @@ def _assemble(
     start: datetime,
 ) -> EvidenceRecord:
     expected_ids = tuple(_key(ref.instrument) for ref in universe)
+    pending_ids = tuple(key for key in expected_ids if key not in ws_acc)
     instruments_evidence: list[InstrumentEvidence] = []
     for ref in universe:
         instrument = ref.instrument
@@ -265,6 +468,7 @@ def _assemble(
         collection_start=start,
         collection_end=datetime.now(UTC),
         expected_instruments=expected_ids,
+        pending_instruments=pending_ids,
         sample_windows=tuple(windows),
         instruments=tuple(instruments_evidence),
         late_start=LateStartEvidence(observed=False, detail="not captured by straight-through run"),
