@@ -33,11 +33,17 @@ def is_finite_price(value: Decimal | float) -> bool:
 def float32_hex(value: Decimal | float | None) -> str | None:
     """Return the 8-char hex of ``value``'s IEEE-754 float32 encoding, or ``None``.
 
-    ``None`` for a missing or non-finite value (no canonical wire form exists).
+    ``None`` (fail closed) for a missing, non-finite, or out-of-float32-range value: a value
+    can be finite as binary64 yet overflow float32 (e.g. ``1e100``), for which ``struct.pack``
+    raises. Such a value has no canonical wire form — it can never be a real Dhan feed price —
+    so it is never treated as equivalent to anything and its comparison stays a MISMATCH.
     """
     if value is None or not is_finite_price(value):
         return None
-    return _FLOAT32.pack(float(value)).hex()
+    try:
+        return _FLOAT32.pack(float(value)).hex()
+    except (OverflowError, ValueError, struct.error):
+        return None
 
 
 def float32_equivalent(left: Decimal | float | None, right: Decimal | float | None) -> bool:

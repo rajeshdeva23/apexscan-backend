@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import struct
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -467,6 +468,41 @@ def test_prec_06_one_paisa_apart_not_equivalent() -> None:
     assert float32_hex(Decimal("212.37")) != float32_hex(Decimal("212.38"))
 
 
+def _next_float32_up(value: float) -> float:
+    """Return the next representable float32 above ``value`` (adjacent bit pattern)."""
+    bits = struct.unpack("<I", struct.pack("<f", value))[0] + 1
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def test_prec_06b_adjacent_float32_bits_not_equivalent() -> None:
+    # Constructed from adjacent representable float32 bit patterns (not arbitrary decimals):
+    # identical bits collapse, adjacent bits must not.
+    base = struct.unpack("<f", struct.pack("<f", 212.37))[0]
+    nxt = _next_float32_up(base)
+    assert float32_hex(Decimal(str(base))) != float32_hex(Decimal(str(nxt)))
+    assert not float32_equivalent(Decimal(str(base)), Decimal(str(nxt)))
+    assert float32_equivalent(Decimal(str(base)), Decimal(str(base)))
+
+
+def test_prec_11_out_of_float32_range_fails_closed() -> None:
+    # Finite as binary64 but overflows float32 -> no canonical wire form -> fail closed.
+    assert float32_hex(Decimal("1e100")) is None
+    assert float32_hex(Decimal("-1e100")) is None
+    assert float32_hex(Decimal("3.5e38")) is None  # just above float32 max (~3.4e38)
+    assert not float32_equivalent(Decimal("1e100"), Decimal("1e100"))
+
+
+def test_prec_12_overflow_values_never_crash_and_stay_mismatch() -> None:
+    assert (
+        classify_price(Decimal("1e100"), Decimal("2e100"), tick_size=None, exact=True)
+        is Classification.MISMATCH
+    )
+    assert (
+        classify_price(Decimal("1e100"), Decimal("212.37"), tick_size=None)
+        is Classification.MISMATCH
+    )
+
+
 def test_prec_07_non_finite_rejected_no_canonical_form() -> None:
     assert float32_hex(Decimal("NaN")) is None
     assert float32_hex(Decimal("Infinity")) is None
@@ -603,6 +639,19 @@ def test_win_05_combine_recomputes_pending_from_union() -> None:
 def test_win_06_combine_empty_raises() -> None:
     with pytest.raises(ValueError, match="at least one"):
         combine_records([])
+
+
+def test_win_07_duplicate_window_rejected() -> None:
+    # Accidentally combining the same window twice must not silently corrupt coverage.
+    a = _window_record("mid", _T0)
+    b = _window_record("mid", _T1)
+    with pytest.raises(ValueError, match="duplicate sample window"):
+        combine_records([a, b])
+
+
+def test_win_08_distinct_windows_still_combine() -> None:
+    combined = combine_records([_window_record("early", _T0), _window_record("mid", _T1)])
+    assert combined.sample_windows == ("early", "mid")
 
 
 # --------------------------------------------------------------------------- #

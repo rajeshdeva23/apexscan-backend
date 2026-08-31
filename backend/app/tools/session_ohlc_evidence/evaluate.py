@@ -16,7 +16,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from decimal import Decimal
 
-from app.tools.session_ohlc_evidence.canonical import float32_equivalent, is_finite_price
+from app.tools.session_ohlc_evidence.canonical import (
+    float32_equivalent,
+    float32_hex,
+    is_finite_price,
+)
 from app.tools.session_ohlc_evidence.models import (
     Classification,
     EvidenceRecord,
@@ -55,6 +59,8 @@ def classify_price(
         return Classification.MATCH
     if float32_equivalent(ws_value, rest_value):
         return Classification.PROTOCOL_EQUIVALENT
+    if float32_hex(ws_value) is None or float32_hex(rest_value) is None:
+        return Classification.MISMATCH  # out-of-float32-range: not a valid feed price, fail closed
     if exact:
         return Classification.MISMATCH
     if tick_size is None:
@@ -367,6 +373,15 @@ def combine_records(records: Sequence[EvidenceRecord]) -> EvidenceRecord:
     keys = {(r.trading_date, r.session_identity, r.source_sha) for r in records}
     if len(keys) != 1:
         raise ValueError("cannot combine records across different trading_date/session/source")
+    seen_windows: set[str] = set()
+    for record in records:
+        overlap = seen_windows & set(record.sample_windows)
+        if overlap:
+            raise ValueError(
+                f"duplicate sample window(s) across records: {sorted(overlap)} "
+                "(each window must be collected once; do not combine a window twice)"
+            )
+        seen_windows |= set(record.sample_windows)
     by_identity: dict[str, list[InstrumentEvidence]] = {}
     for record in records:
         for inst in record.instruments:
