@@ -44,6 +44,20 @@ class VerdictOutcome(StrEnum):
     INCONCLUSIVE = "inconclusive"
 
 
+class LateStartKind(StrEnum):
+    """How late-start evidence was obtained (ADR-015 D7).
+
+    ``provider_late_subscription`` (ADR-008 §A6) is a *new* provider subscription mid-session
+    re-sending session-to-date extrema. ``observer_late_attach`` is an in-process evidence
+    observer attaching to an already-live subscription: it proves the observer sees pre-attach
+    extrema, but NOT that the provider re-sends them on a fresh subscription — so it does not by
+    itself satisfy the ADR-008 provider late-start criterion.
+    """
+
+    PROVIDER_LATE_SUBSCRIPTION = "provider_late_subscription"
+    OBSERVER_LATE_ATTACH = "observer_late_attach"
+
+
 class OhlcObservation(_Frozen):
     """One open/high/low observation from a single source at one instant."""
 
@@ -109,6 +123,8 @@ class LateStartEvidence(_Frozen):
     """
 
     observed: bool
+    kind: LateStartKind = LateStartKind.PROVIDER_LATE_SUBSCRIPTION
+    observer_attach_timestamp: datetime | None = None
     prior_observed_at: datetime | None = None
     prior_open: Decimal | None = None
     prior_high: Decimal | None = None
@@ -132,9 +148,10 @@ class ReconnectEvidence(_Frozen):
 class EvidenceRecord(_Frozen):
     """The complete immutable evidence record for one collection run."""
 
-    schema_version: str = "2.1.0"
+    schema_version: str = "2.2.0"
     collector_version: str
     source_sha: str
+    production_image: str | None = None  # running image tag when runtime-derivable (ADR-015 D10)
     provider: str
     oracle_source: str = "dhan_rest_marketfeed_ohlc"
     oracle_independent: bool = False  # both WS and REST are Dhan-derived (not external truth)

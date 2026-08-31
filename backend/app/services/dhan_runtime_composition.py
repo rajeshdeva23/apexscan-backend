@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
 
 import httpx
@@ -36,6 +37,7 @@ from app.adapters.dhan.calendar_monitor_parser import DhanMarketHolidayParser
 from app.adapters.dhan.calendar_monitor_source import DhanMarketHolidaySource
 from app.adapters.dhan.models import DhanCashEquityLiveUniverse
 from app.core.config import Settings
+from app.events.bus import EventBus
 from app.market_engine.calendar_data import (
     TradingCalendarDataset,
     load_nse_cm_2026_dataset,
@@ -63,6 +65,7 @@ from app.services.market_runtime import (
     _parse_time,
     _schedule_and_calendar,
 )
+from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_activation import SessionStatisticsRefreshCoordinator
 from app.services.session_statistics_refresh import SessionStatisticsRefreshService
 from app.services.strategy_catalog import StrategyCatalog, production_catalog
@@ -283,6 +286,41 @@ def _dhan_requirements_factory(
     return factory
 
 
+def _evidence_observer_factory(
+    *,
+    settings: Settings,
+    provider: LiveUniverseAdapter,
+    session_classifier: MarketSessionClassifier,
+    universe: tuple[Instrument, ...],
+    clock: Clock | None,
+) -> Callable[[EventBus], SessionOhlcEvidenceObserver] | None:
+    """Build the read-only evidence-observer factory, or ``None`` when the flag is off (ADR-015).
+
+    Reuses the EXISTING authenticated provider as a broker-neutral ``SessionStatisticsSource``
+    (its cached token, its single WS) — it never constructs another adapter/auth manager/WS.
+    """
+    if not settings.session_ohlc_evidence_observer_enabled:
+        return None
+    observer_clock = clock or SystemClock()
+    statistics_source = cast("SessionStatisticsSource", provider)
+    image_tag = settings.apexscan_image_tag
+
+    def factory(bus: EventBus) -> SessionOhlcEvidenceObserver:
+        return SessionOhlcEvidenceObserver(
+            bus=bus,
+            classifier=session_classifier.classify,
+            clock=observer_clock.now,
+            statistics_source=statistics_source,
+            universe=universe,
+            artifact_root=Path("artifacts/deploy10-r4d"),
+            source_sha=image_tag or "unknown",
+            production_image=image_tag,
+            exchange_timezone=settings.exchange_timezone,
+        )
+
+    return factory
+
+
 async def _safe_shutdown(coordinator: ProviderCoordinator) -> None:
     """Best-effort provider cleanup during fail-closed composition unwinding."""
     try:
@@ -458,6 +496,13 @@ async def compose_market_runtime(
         settings=settings, dataset=dataset, transport=transport, clock=clock
     )
     session_classifier = _live_session_classifier(settings=settings, dataset=dataset)
+    evidence_observer_factory = _evidence_observer_factory(
+        settings=settings,
+        provider=provider,
+        session_classifier=session_classifier,
+        universe=universe,
+        clock=clock,
+    )
     runtime = LiveMarketRuntime(
         settings=settings,
         error_threshold=error_threshold,
@@ -478,9 +523,11 @@ async def compose_market_runtime(
         clock=clock,
         sequence=sequence,
         session_classifier=session_classifier,
+        evidence_observer_factory=evidence_observer_factory,
     )
     if sink is not None:
-        sink.bind(runtime.tick_engine.on_feed_continuity)  # same TickEngine the runtime owns
+        # Runtime entry point tees to the TickEngine (always) and the evidence observer (if any).
+        sink.bind(runtime.on_feed_continuity)
     if session_gate is not None:
         session_clock = clock or SystemClock()
 

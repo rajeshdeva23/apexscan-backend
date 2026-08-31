@@ -99,6 +99,14 @@ class Settings(BaseSettings):
     # is composed only when this is true. Never inferred from credential presence,
     # environment name, or debug. Default off so ordinary local/CI runs stay dormant.
     market_provider_enabled: bool = Field(default=False)
+    # Enables the read-only in-process Session-OHLC evidence observer (ADR-015; DEPLOY-10 R4D).
+    # Evidence collection ONLY — never an authority or strategy flag. Default off: when false
+    # the observer is not constructed, so there is zero subscription, REST, artifact, or
+    # behavioral difference.
+    session_ohlc_evidence_observer_enabled: bool = Field(default=False)
+    # Running image tag, injected at deploy for evidence provenance (ADR-015 D10); None when the
+    # runtime cannot derive it (recorded as unknown, never fabricated).
+    apexscan_image_tag: str | None = Field(default=None)
     # Consecutive-failure threshold moving a strategy to ERROR (docs/07 §20 leaves the
     # number to configuration). Exercised only once concrete strategies run.
     strategy_error_threshold: int = Field(default=3, ge=1)
