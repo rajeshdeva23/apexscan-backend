@@ -24,7 +24,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,13 @@ from app.tools.session_ohlc_evidence.report import to_json, to_markdown
 _LOGGER = logging.getLogger(__name__)
 _COLLECTOR_VERSION = "3.0.0"
 _REQUIRED_WINDOWS = ("early", "mid", "late")
+
+# Per-window lifecycle (ADR-015 B7): a window is COLLECTING while it accumulates passive
+# observations and only becomes FINALIZED (exactly one artifact) on full frozen-universe
+# coverage or at the governed deadline. Absence of an entry == NOT_STARTED. Window eligibility
+# must NOT mean immediate snapshot.
+_PHASE_COLLECTING = "collecting"
+_PHASE_FINALIZED = "finalized"
 
 _METHOD_BY_CLASS = {
     "match": "exact",
@@ -156,7 +163,10 @@ class SessionOhlcEvidenceObserver:
         self._subscriptions: list[Subscription[Any]] = []
         self._latest: dict[str, _Snapshot] = {}
         self._partials: list[EvidenceRecord] = []
-        self._captured_windows: set[str] = set()
+        self._window_phase: dict[
+            str, str
+        ] = {}  # window -> COLLECTING | FINALIZED (absent = not started)
+        self._window_deadline: dict[str, datetime] = {}
         self._session_trading_date: date | None = None
         self._frozen_universe: tuple[str, ...] | None = None
         self._attach_timestamp: datetime | None = None
@@ -196,16 +206,72 @@ class SessionOhlcEvidenceObserver:
             await asyncio.sleep(self._poll_seconds)
 
     async def _tick_once(self) -> None:
+        """One driver poll: advance COLLECTING windows, then open a newly-eligible window.
+
+        Opening a window only begins COLLECTING — it never snapshots immediately. A window is
+        finalized (exactly once) on full frozen-universe coverage or at its governed deadline.
+        """
         session = self._classify(self._now())
         if session.market_state is not MarketState.LIVE_SESSION:
-            if self._captured_windows and not self._finalized:
+            await self._finalize_all_collecting()  # session ending is a hard deadline
+            if any(p == _PHASE_FINALIZED for p in self._window_phase.values()) and (
+                not self._finalized
+            ):
                 self.finalize_session()
                 self._finalized = True
             return
-        local = self._now().astimezone(ZoneInfo(self._exchange_timezone)).time()
-        window = _due_window(local)
-        if window is not None and window not in self._captured_windows:
-            await self.capture_window(window)
+        self._roll_session(session.trading_date)
+        now = self._now()
+        await self._advance_collecting(session.trading_date, now)
+        band = _due_window(now.astimezone(ZoneInfo(self._exchange_timezone)).time())
+        if band is not None and band not in self._window_phase:
+            self._begin_collecting(band, now)  # NOT_STARTED -> COLLECTING (no capture yet)
+
+    def _begin_collecting(self, window: str, now: datetime) -> None:
+        """Open a window for accumulation; freeze the deadline. Does NOT finalize."""
+        self._window_phase[window] = _PHASE_COLLECTING
+        self._window_deadline[window] = now + timedelta(seconds=self._per_window_seconds)
+
+    def _coverage_complete(self) -> bool:
+        """True iff every frozen-expected identity has a live observation."""
+        frozen = set(self._frozen_universe or ())
+        if not frozen:
+            return False
+        return frozen.issubset(self._latest.keys())
+
+    async def _advance_collecting(self, trading_date: date, now: datetime) -> None:
+        """Finalize each COLLECTING window that reached full coverage or its deadline."""
+        for window in [w for w, p in self._window_phase.items() if p == _PHASE_COLLECTING]:
+            if self._coverage_complete() or now >= self._window_deadline.get(window, now):
+                await self._finalize_window(window, trading_date)
+
+    async def _finalize_all_collecting(self) -> None:
+        """Finalize any still-collecting windows (e.g. at session close)."""
+        if self._session_trading_date is None:
+            return
+        for window in [w for w, p in self._window_phase.items() if p == _PHASE_COLLECTING]:
+            await self._finalize_window(window, self._session_trading_date)
+
+    async def _finalize_window(self, window: str, trading_date: date) -> None:
+        """Snapshot, REST-compare, and persist one window exactly once (write before mark).
+
+        The window is marked FINALIZED only after the artifact is atomically committed
+        (B7 fix for WINDOW_MARK_BEFORE_ARTIFACT_WRITE). A write failure leaves the window
+        COLLECTING so it is retried on a later poll; since session OHLC is monotonic and
+        coverage only grows, a retry captures an equal-or-more-complete snapshot, never a
+        cherry-picked favorable one. If it never commits, the window stays absent (the
+        evaluator then treats the missing window as INCONCLUSIVE — fail closed).
+        """
+        if self._window_phase.get(window) == _PHASE_FINALIZED:
+            return
+        ws_snapshots = dict(self._latest)
+        rest = await self._load_rest(trading_date, self._now())
+        record = self._build_partial(
+            window, trading_date, self._frozen_universe or (), ws_snapshots, rest
+        )
+        self._write_record_json(trading_date, window, record)  # atomic; raises on failure
+        self._partials.append(record)
+        self._window_phase[window] = _PHASE_FINALIZED  # only after the artifact is committed
 
     # ------------------------------------------------------------------ #
     # Hot path — non-throwing O(1) boundary (ADR-015 D2/D3)
@@ -269,29 +335,27 @@ class SessionOhlcEvidenceObserver:
     # Window capture (off the hot path; classifier-gated)
     # ------------------------------------------------------------------ #
     async def capture_window(self, window: str) -> WindowResult:
-        """Capture one governed window: classifier-gated, universe-frozen, REST-compared."""
+        """Finalize one governed window NOW from the current accumulated snapshot state.
+
+        This is the finalize primitive (classifier-gated, universe-frozen, REST-compared,
+        write-before-mark). The window driver drives *when* this is invoked via the COLLECTING
+        state machine (full coverage or deadline); it is never called on a window's first
+        eligible poll. Refuses if the window is already FINALIZED (duplicate-window guard).
+        """
         session = self._classify(self._now())
         if session.market_state is not MarketState.LIVE_SESSION:
             return WindowResult(window, executed=False, reason="not LIVE_SESSION")
         self._roll_session(session.trading_date)
-        if window in self._captured_windows:
+        if self._window_phase.get(window) == _PHASE_FINALIZED:
             return WindowResult(window, executed=False, reason="window already captured")
-
-        expected = self._frozen_universe or ()
-        ws_snapshots = dict(self._latest)
-        observed_at = self._now()
-        rest = await self._load_rest(session.trading_date, observed_at)
-        record = self._build_partial(window, session.trading_date, expected, ws_snapshots, rest)
-        self._partials.append(record)
-        self._captured_windows.add(window)
-        self._write_record_json(session.trading_date, window, record)
-        pending = len(record.pending_instruments)
+        await self._finalize_window(window, session.trading_date)
+        record = self._partials[-1]
         return WindowResult(
             window,
             executed=True,
             reason="captured",
             observed=len(record.instruments),
-            pending=pending,
+            pending=len(record.pending_instruments),
         )
 
     def _roll_session(self, trading_date: date) -> None:
@@ -301,7 +365,8 @@ class SessionOhlcEvidenceObserver:
         self._session_trading_date = trading_date
         self._frozen_universe = tuple(sorted(_identity(i) for i in self._universe))
         self._partials.clear()
-        self._captured_windows.clear()
+        self._window_phase.clear()
+        self._window_deadline.clear()
         self._reconnect = None
 
     async def _load_rest(

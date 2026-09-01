@@ -573,12 +573,12 @@ async def test_obs_29_trading_date_rollover_resets_session(tmp_path: Path) -> No
     )
     obs.subscribe()
     await obs.capture_window("early")
-    assert obs._captured_windows == {"early"}  # noqa: SLF001
+    assert obs._window_phase == {"early": "finalized"}  # noqa: SLF001
     obs._classify = _Classifier(trading_date=date(2026, 9, 1)).classify  # noqa: SLF001 - roll date
     await obs.capture_window("early")
     assert obs._session_trading_date == date(2026, 9, 1)  # noqa: SLF001
-    assert obs._captured_windows == {
-        "early"
+    assert obs._window_phase == {
+        "early": "finalized"
     }  # reset then re-captured for the new date  # noqa: SLF001
 
 
@@ -599,3 +599,115 @@ def test_obs_30_unsubscribe_is_clean_and_idempotent(tmp_path: Path) -> None:
         MarketContextUpdated(context=_context("AAA", "100", "101", "99"), previous_version=0)
     )
     assert obs._latest == {}  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------- #
+# B7 — window-capture timing state machine (NOT_STARTED -> COLLECTING -> FINALIZED)
+# --------------------------------------------------------------------------- #
+def _json_files(root: Path, pattern: str = "*.json") -> list[Path]:
+    """Sync artifact lister (keeps Path I/O out of async test bodies; ASYNC240)."""
+    return list(root.rglob(pattern))
+
+
+def _mid_clock() -> datetime:
+    # 12:13 IST == 06:43 UTC — inside the MID band (12:00-12:30 IST).
+    return datetime(2026, 9, 1, 6, 43, 0, tzinfo=UTC)
+
+
+def _b7_observer(bus: EventBus, tmp_path: Path, *, universe, deadline=300.0):  # noqa: ANN001,ANN202
+    return SessionOhlcEvidenceObserver(
+        bus=bus,
+        classifier=_Classifier().classify,
+        clock=_mid_clock,
+        statistics_source=_FakeSource(tuple(_obs(s, "100", "101", "99") for s in universe)),
+        universe=tuple(_inst(s) for s in universe),
+        artifact_root=tmp_path,
+        source_sha="4d4e653",
+        production_image="4d4e653",
+        exchange_timezone=_TZ,
+        per_window_seconds=300.0,
+    )
+
+
+async def test_b7_01_starts_collecting_not_finalized_when_started_in_window(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - first poll inside MID with empty snapshot
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001 - NOT finalized
+    assert _json_files(tmp_path) == []  # B7-02: no artifact yet
+
+
+async def test_b7_02_first_poll_does_not_consume_window(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001
+    await obs._tick_once()  # noqa: SLF001 - still collecting; only AAA seen so far -> partial
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "101", "99"), previous_version=0)
+    )
+    await obs._tick_once()  # noqa: SLF001 - coverage still incomplete (BBB missing)
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001
+
+
+async def test_b7_04_full_coverage_finalizes_early_once(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - begin collecting
+    for s in ("AAA", "BBB"):
+        bus.publish(
+            MarketContextUpdated(context=_context(s, "100", "101", "99"), previous_version=0)
+        )
+    await obs._tick_once()  # noqa: SLF001 - full coverage -> finalize
+    assert obs._window_phase.get("mid") == "finalized"  # noqa: SLF001
+    rec = obs._partials[-1]  # noqa: SLF001
+    assert len(rec.instruments) == 2 and len(rec.pending_instruments) == 0
+    await obs._tick_once()  # noqa: SLF001 - B7-06/07: no second finalize
+    assert len([p for p in obs._partials if "mid" in p.sample_windows]) == 1  # noqa: SLF001
+
+
+async def test_b7_05_deadline_finalizes_with_pending(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - begin collecting (deadline = now + 300s)
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "101", "99"), previous_version=0)
+    )
+    # jump the clock past the deadline; BBB never arrived
+    obs._now = lambda: datetime(2026, 9, 1, 6, 49, 0, tzinfo=UTC)  # noqa: SLF001 - +6min
+    await obs._tick_once()  # noqa: SLF001
+    assert obs._window_phase.get("mid") == "finalized"  # noqa: SLF001
+    rec = obs._partials[-1]  # noqa: SLF001
+    assert len(rec.instruments) == 1 and rec.pending_instruments == ("NSE:BBB",)
+
+
+async def test_b7_13_market_closed_does_not_start_capture(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA"])
+    obs._classify = _Classifier(state=MarketState.MARKET_CLOSED).classify  # noqa: SLF001
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001
+    assert obs._window_phase == {}  # noqa: SLF001 - no window opened
+    assert _json_files(tmp_path) == []
+
+
+async def test_b7_15_write_failure_is_fail_closed(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - collecting
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "101", "99"), previous_version=0)
+    )
+
+    def _boom(*a: object, **k: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(obs, "_write_record_json", _boom)
+    with pytest.raises(OSError):
+        await obs._finalize_window("mid", _D)  # noqa: SLF001 - write fails
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001 - NOT marked finalized
+    assert _json_files(tmp_path, "mid.json") == []  # no valid-looking artifact
