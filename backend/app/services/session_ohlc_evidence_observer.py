@@ -370,13 +370,22 @@ class SessionOhlcEvidenceObserver:
     def _roll_session(self, trading_date: date) -> None:
         if self._session_trading_date == trading_date:
             return
-        # new trading date: finalize nothing implicitly; freeze the universe and reset accumulators
+        # Distinguish first-observation init (None -> date) from a genuine trading-date rollover.
+        rolled = self._session_trading_date is not None
         self._session_trading_date = trading_date
         self._frozen_universe = tuple(sorted(_identity(i) for i in self._universe))
+        if not rolled:
+            return  # initialization: keep any snapshots already accumulated before the first poll
+        # Genuine rollover: reset per-day state. _latest MUST be cleared — with B10 retention a
+        # valid snapshot is never overwritten by a later None, so a prior-day value would otherwise
+        # persist and falsely satisfy this day's coverage (prior-day price leak).
+        self._latest.clear()
         self._partials.clear()
         self._window_phase.clear()
         self._window_deadline.clear()
+        self._pre_reconnect = None
         self._reconnect = None
+        self._finalized = False
 
     async def _load_rest(
         self, trading_date: date, observed_at: datetime

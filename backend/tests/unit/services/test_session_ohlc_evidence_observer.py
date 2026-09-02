@@ -839,3 +839,51 @@ async def test_b10_full_valid_coverage_then_finalize_has_real_prices(tmp_path: P
         o.get("open_price") for i in rec.instruments for o in [i.ws_observations[0].model_dump()]
     ]
     assert all(v is not None for v in opens) and len(rec.instruments) == 2  # real prices captured
+
+
+# --------------------------------------------------------------------------- #
+# B10.1 — trading-date rollover must not leak retained OHLC; A/B adversarial
+# --------------------------------------------------------------------------- #
+async def test_b10_1_rollover_does_not_leak_prior_day_ohlc(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA"])  # classifier date _D
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - Day 1 poll establishes session trading_date=_D
+    # Day 1: AAA gets a valid retained snapshot.
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=0)
+    )
+    assert obs._latest["NSE:AAA"].high_price == Decimal("105")  # noqa: SLF001
+    # Roll to a new trading date; the first Day-2 poll must clear retained state.
+    obs._classify = _Classifier(trading_date=date(2026, 9, 3)).classify  # noqa: SLF001
+    await obs._tick_once()  # noqa: SLF001 - _roll_session detects _D -> Day-2, clears _latest
+    assert obs._latest == {}  # noqa: SLF001 - Day-1 value did NOT leak into Day-2
+    # Day 2: AAA only sends a None-OHLC context so far -> still pending, not covered by leak.
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))
+    assert not obs._coverage_complete()  # noqa: SLF001
+
+
+async def test_b10_1_adversarial_none_valid_none_ab_sequence(tmp_path: Path) -> None:
+    # Models the diagnosed production behavior: A flickers None->valid->None, B lags then valid.
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - begin collecting
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=1)
+    )
+    bus.publish(
+        MarketContextUpdated(context=_context_no_ohlc("AAA", version=3), previous_version=2)
+    )
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("BBB"), previous_version=0))
+    await obs._tick_once()  # noqa: SLF001 - not full (BBB has no valid OHLC yet)
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001
+    bus.publish(MarketContextUpdated(context=_context("BBB", "50", "55", "49"), previous_version=1))
+    await obs._tick_once()  # noqa: SLF001 - now full VALID coverage -> finalize
+    assert obs._window_phase.get("mid") == "finalized"  # noqa: SLF001
+    rec = obs._partials[-1]  # noqa: SLF001
+    by_id = {i.security_id: i.ws_observations[0] for i in rec.instruments}
+    assert by_id["NSE:AAA"].high_price == Decimal("105")  # A's retained valid, not the later None
+    assert by_id["NSE:BBB"].high_price == Decimal("55")
+    assert len(rec.pending_instruments) == 0
