@@ -284,21 +284,30 @@ class SessionOhlcEvidenceObserver:
             _LOGGER.warning("evidence observer snapshot skipped", exc_info=True)
 
     def _record_snapshot(self, context: MarketContext) -> None:
+        # B10: only retain a snapshot with a VALID WS session OHLC. Around open the Dhan
+        # day-OHLC fields are 0/sentinel, so `_session_ohlc` fail-closes to None; recording
+        # those None snapshots made `_coverage_complete` (identity-presence) finalize the
+        # window instantly with empty prices, and let a later None overwrite a valid value.
+        # Skipping None keeps the last valid OHLC per instrument (retention) and makes
+        # coverage mean "has valid WS OHLC" — so the window collects until real values exist
+        # or the deadline. Instruments that never get valid OHLC stay pending (fail-closed).
         tick = context.latest_tick
         ohlc = tick.session_ohlc if tick is not None else None
-        snapshot = _Snapshot(
-            identity=_identity(context.instrument),
+        if ohlc is None:
+            return
+        identity = _identity(context.instrument)
+        self._latest[identity] = _Snapshot(  # O(1) replace; state is O(universe)
+            identity=identity,
             exchange=context.instrument.exchange,
             symbol=context.instrument.symbol,
             trading_date=context.session.trading_date if context.session is not None else None,
             event_timestamp=context.event_timestamp,
             observed_at=context.observed_at,
             version=context.version,
-            open_price=ohlc.open_price if ohlc is not None else None,
-            high_price=ohlc.high_price if ohlc is not None else None,
-            low_price=ohlc.low_price if ohlc is not None else None,
+            open_price=ohlc.open_price,
+            high_price=ohlc.high_price,
+            low_price=ohlc.low_price,
         )
-        self._latest[snapshot.identity] = snapshot  # O(1) replace; state is O(universe)
 
     # ------------------------------------------------------------------ #
     # Continuity (CSOA16, natural reconnect only)
@@ -361,13 +370,22 @@ class SessionOhlcEvidenceObserver:
     def _roll_session(self, trading_date: date) -> None:
         if self._session_trading_date == trading_date:
             return
-        # new trading date: finalize nothing implicitly; freeze the universe and reset accumulators
+        # Distinguish first-observation init (None -> date) from a genuine trading-date rollover.
+        rolled = self._session_trading_date is not None
         self._session_trading_date = trading_date
         self._frozen_universe = tuple(sorted(_identity(i) for i in self._universe))
+        if not rolled:
+            return  # initialization: keep any snapshots already accumulated before the first poll
+        # Genuine rollover: reset per-day state. _latest MUST be cleared — with B10 retention a
+        # valid snapshot is never overwritten by a later None, so a prior-day value would otherwise
+        # persist and falsely satisfy this day's coverage (prior-day price leak).
+        self._latest.clear()
         self._partials.clear()
         self._window_phase.clear()
         self._window_deadline.clear()
+        self._pre_reconnect = None
         self._reconnect = None
+        self._finalized = False
 
     async def _load_rest(
         self, trading_date: date, observed_at: datetime

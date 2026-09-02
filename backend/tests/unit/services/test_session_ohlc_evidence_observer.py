@@ -68,6 +68,26 @@ def _context(symbol: str, o: str, h: str, low: str, *, version: int = 1) -> Mark
     )
 
 
+def _context_no_ohlc(symbol: str, *, version: int = 1) -> MarketContext:
+    """A production-like MarketContext whose latest_tick carries NO session OHLC.
+
+    Mirrors the open-time reality: Dhan day-OHLC is 0/sentinel so `_session_ohlc` fail-closes
+    to None and the tick has `session_ohlc=None`.
+    """
+    tick = Tick(instrument=_inst(symbol), event_timestamp=_T, last_price=Decimal("100"))
+    return MarketContext(
+        instrument=_inst(symbol),
+        version=version,
+        sequence=version,
+        event_timestamp=_T,
+        observed_at=_T,
+        latest_tick=tick,
+        session=SessionContext(
+            trading_date=_D, market_state=MarketState.LIVE_SESSION, exchange_timezone=_TZ
+        ),
+    )
+
+
 def _obs(symbol: str, o: str, h: str, low: str) -> SessionStatisticsObservation:
     return SessionStatisticsObservation(
         instrument=_inst(symbol),
@@ -711,3 +731,159 @@ async def test_b7_15_write_failure_is_fail_closed(tmp_path: Path, monkeypatch) -
         await obs._finalize_window("mid", _D)  # noqa: SLF001 - write fails
     assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001 - NOT marked finalized
     assert _json_files(tmp_path, "mid.json") == []  # no valid-looking artifact
+
+
+# --------------------------------------------------------------------------- #
+# B10 — WS session-OHLC source retention (only valid OHLC counts; None never wins)
+# --------------------------------------------------------------------------- #
+def test_b10_02_none_ohlc_context_is_not_recorded(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _observer(
+        bus,
+        classifier=_Classifier(),
+        source=_FakeSource(),
+        universe=(_inst("AAA"),),
+        artifact_root=tmp_path,
+    )
+    obs.subscribe()
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))
+    assert obs._latest == {}  # noqa: SLF001 - None OHLC snapshot skipped (fail-closed)
+
+
+def test_b10_01_valid_ohlc_is_recorded(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _observer(
+        bus,
+        classifier=_Classifier(),
+        source=_FakeSource(),
+        universe=(_inst("AAA"),),
+        artifact_root=tmp_path,
+    )
+    obs.subscribe()
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=0)
+    )
+    assert obs._latest["NSE:AAA"].open_price == Decimal("100")  # noqa: SLF001
+
+
+def test_b10_06_later_none_does_not_overwrite_valid(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _observer(
+        bus,
+        classifier=_Classifier(),
+        source=_FakeSource(),
+        universe=(_inst("AAA"),),
+        artifact_root=tmp_path,
+    )
+    obs.subscribe()
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=0)
+    )
+    bus.publish(
+        MarketContextUpdated(context=_context_no_ohlc("AAA", version=2), previous_version=1)
+    )
+    assert obs._latest["NSE:AAA"].high_price == Decimal("105")  # noqa: SLF001 - valid retained
+
+
+def test_b10_07_newer_valid_updates_retained(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _observer(
+        bus,
+        classifier=_Classifier(),
+        source=_FakeSource(),
+        universe=(_inst("AAA"),),
+        artifact_root=tmp_path,
+    )
+    obs.subscribe()
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=0)
+    )
+    bus.publish(
+        MarketContextUpdated(
+            context=_context("AAA", "100", "108", "95", version=2), previous_version=1
+        )
+    )
+    assert obs._latest["NSE:AAA"].high_price == Decimal("108")  # noqa: SLF001
+
+
+async def test_b10_coverage_requires_valid_ohlc_no_premature_finalize(tmp_path: Path) -> None:
+    # The B9 defect: all-None contexts must NOT count as coverage / must NOT finalize the window.
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    for s in ("AAA", "BBB"):
+        bus.publish(MarketContextUpdated(context=_context_no_ohlc(s), previous_version=0))
+    await obs._tick_once()  # noqa: SLF001 - begins collecting; coverage is 0 (no valid OHLC)
+    assert not obs._coverage_complete()  # noqa: SLF001
+    await obs._tick_once()  # noqa: SLF001 - still collecting, not finalized (no premature empty capture)
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001
+    assert _json_files(tmp_path) == []  # no all-None artifact written
+
+
+async def test_b10_full_valid_coverage_then_finalize_has_real_prices(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - begin collecting
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))  # None
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "101", "99"), previous_version=1)
+    )  # valid
+    bus.publish(
+        MarketContextUpdated(context=_context("BBB", "50", "55", "49"), previous_version=0)
+    )  # valid
+    await obs._tick_once()  # noqa: SLF001 - full VALID coverage -> finalize
+    assert obs._window_phase.get("mid") == "finalized"  # noqa: SLF001
+    rec = obs._partials[-1]  # noqa: SLF001
+    opens = [
+        o.get("open_price") for i in rec.instruments for o in [i.ws_observations[0].model_dump()]
+    ]
+    assert all(v is not None for v in opens) and len(rec.instruments) == 2  # real prices captured
+
+
+# --------------------------------------------------------------------------- #
+# B10.1 — trading-date rollover must not leak retained OHLC; A/B adversarial
+# --------------------------------------------------------------------------- #
+async def test_b10_1_rollover_does_not_leak_prior_day_ohlc(tmp_path: Path) -> None:
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA"])  # classifier date _D
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - Day 1 poll establishes session trading_date=_D
+    # Day 1: AAA gets a valid retained snapshot.
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=0)
+    )
+    assert obs._latest["NSE:AAA"].high_price == Decimal("105")  # noqa: SLF001
+    # Roll to a new trading date; the first Day-2 poll must clear retained state.
+    obs._classify = _Classifier(trading_date=date(2026, 9, 3)).classify  # noqa: SLF001
+    await obs._tick_once()  # noqa: SLF001 - _roll_session detects _D -> Day-2, clears _latest
+    assert obs._latest == {}  # noqa: SLF001 - Day-1 value did NOT leak into Day-2
+    # Day 2: AAA only sends a None-OHLC context so far -> still pending, not covered by leak.
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))
+    assert not obs._coverage_complete()  # noqa: SLF001
+
+
+async def test_b10_1_adversarial_none_valid_none_ab_sequence(tmp_path: Path) -> None:
+    # Models the diagnosed production behavior: A flickers None->valid->None, B lags then valid.
+    bus = EventBus()
+    obs = _b7_observer(bus, tmp_path, universe=["AAA", "BBB"])
+    obs.subscribe()
+    await obs._tick_once()  # noqa: SLF001 - begin collecting
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("AAA"), previous_version=0))
+    bus.publish(
+        MarketContextUpdated(context=_context("AAA", "100", "105", "96"), previous_version=1)
+    )
+    bus.publish(
+        MarketContextUpdated(context=_context_no_ohlc("AAA", version=3), previous_version=2)
+    )
+    bus.publish(MarketContextUpdated(context=_context_no_ohlc("BBB"), previous_version=0))
+    await obs._tick_once()  # noqa: SLF001 - not full (BBB has no valid OHLC yet)
+    assert obs._window_phase.get("mid") == "collecting"  # noqa: SLF001
+    bus.publish(MarketContextUpdated(context=_context("BBB", "50", "55", "49"), previous_version=1))
+    await obs._tick_once()  # noqa: SLF001 - now full VALID coverage -> finalize
+    assert obs._window_phase.get("mid") == "finalized"  # noqa: SLF001
+    rec = obs._partials[-1]  # noqa: SLF001
+    by_id = {i.security_id: i.ws_observations[0] for i in rec.instruments}
+    assert by_id["NSE:AAA"].high_price == Decimal("105")  # A's retained valid, not the later None
+    assert by_id["NSE:BBB"].high_price == Decimal("55")
+    assert len(rec.pending_instruments) == 0
