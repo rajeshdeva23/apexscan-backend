@@ -284,21 +284,30 @@ class SessionOhlcEvidenceObserver:
             _LOGGER.warning("evidence observer snapshot skipped", exc_info=True)
 
     def _record_snapshot(self, context: MarketContext) -> None:
+        # B10: only retain a snapshot with a VALID WS session OHLC. Around open the Dhan
+        # day-OHLC fields are 0/sentinel, so `_session_ohlc` fail-closes to None; recording
+        # those None snapshots made `_coverage_complete` (identity-presence) finalize the
+        # window instantly with empty prices, and let a later None overwrite a valid value.
+        # Skipping None keeps the last valid OHLC per instrument (retention) and makes
+        # coverage mean "has valid WS OHLC" — so the window collects until real values exist
+        # or the deadline. Instruments that never get valid OHLC stay pending (fail-closed).
         tick = context.latest_tick
         ohlc = tick.session_ohlc if tick is not None else None
-        snapshot = _Snapshot(
-            identity=_identity(context.instrument),
+        if ohlc is None:
+            return
+        identity = _identity(context.instrument)
+        self._latest[identity] = _Snapshot(  # O(1) replace; state is O(universe)
+            identity=identity,
             exchange=context.instrument.exchange,
             symbol=context.instrument.symbol,
             trading_date=context.session.trading_date if context.session is not None else None,
             event_timestamp=context.event_timestamp,
             observed_at=context.observed_at,
             version=context.version,
-            open_price=ohlc.open_price if ohlc is not None else None,
-            high_price=ohlc.high_price if ohlc is not None else None,
-            low_price=ohlc.low_price if ohlc is not None else None,
+            open_price=ohlc.open_price,
+            high_price=ohlc.high_price,
+            low_price=ohlc.low_price,
         )
-        self._latest[snapshot.identity] = snapshot  # O(1) replace; state is O(universe)
 
     # ------------------------------------------------------------------ #
     # Continuity (CSOA16, natural reconnect only)
