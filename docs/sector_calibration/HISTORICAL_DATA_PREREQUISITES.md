@@ -189,6 +189,57 @@ never succeeded), though the auth/recovery mechanics themselves functioned. SECT
 `get_health` profile normalization; then run the P1/P3/P4/P5 probes as designed. No adapter
 change is warranted — the adapter fail-closed correctly on an unmapped instrument.
 
+## R3.1 — corrected probe offline preflight (no auth, no network, no production)
+
+Root cause confirmed from source (not just the R3 report): `DhanRestAdapter.connect()`
+(adapter.py:300, docstring *"without making a provider request"*) creates HTTP clients only
+and does **not** populate `self._references` (init empty, 219). `load_instruments()` (349)
+fetches the master and sets `self._references = {Instrument: reference}` (367), returning the
+canonical `Instrument` tuple. `load_historical_data` looks up `self._references.get(request
+.instrument)` (720) and raises `UnsupportedProviderRequestError` when `None` (722) — the
+intended fail-closed. R3 skipped `load_instruments()`, so resolution failed. The R3
+`get_health`/`/profile` `NormalizationError` was the token-generation response failing to
+parse at that instant (via `get_health → _request_api_json → get_access_token`), **not** an
+adapter defect (the identical path succeeded on the R3 recovery). Classification: **PROBE
+MISUSE** (call order + treating one token-gen failure as fatal); no adapter change warranted.
+
+**Corrected call order (frozen):** `connect() → load_instruments() → resolve Instrument from
+the returned tuple → load_historical_data(...)`. The `/profile` health step is **skipped** in
+R3.2 (redundant — the historical call authenticates). RELIANCE is resolved *from*
+`load_instruments()` output (exact canonical `Instrument` key), never a constructed guess or
+hard-coded security id.
+
+**Offline evidence tooling added** (`app/tools/sector_historical_probe/`, NOT imported by any
+runtime): pure evaluators — `classify_bar_label` (LEFT/RIGHT/AMBIGUOUS/INVALID, requires
+first-start==open **and** last-end==close for a verdict; a lone 09:15 → AMBIGUOUS, §12),
+`feature_eligible` (`end ≤ T`), `resolve_instrument` (unique-or-None), `session_quality`
+(missing/dup/invalid/out-of-session/non-monotonic; no fill/synthesis), `write_raw_artifact`
+(sha256 + sanitized meta; rejects credential-like keys), and `run_probe` (corrected flow,
+adapter injected via Protocol). Dry-run (`tests/unit/tools/test_sector_historical_probe.py`,
+8 tests) with an httpx kill-switch proves: master-loaded → RELIANCE resolves → reaches the
+historical-call boundary; **without** master → fail-closed `LookupError`, no historical call;
+evaluators behave; **network calls = 0**. Mocks are not provider evidence — no prerequisite
+verdict is upgraded (P1..P10 unchanged).
+
+### R3.2 request manifest (proposed; ≤10 historical/reference calls, 1 research auth)
+
+| # | purpose | call | instrument | interval | date/range | evidence |
+|---|---------|------|-----------|----------|-----------|----------|
+| — | instrument master (unauth) | `load_instruments()` | all | — | current | resolve RELIANCE |
+| 1 | P1/P3/P4/P5 full session | `load_historical_data` (1st ⇒ token gen ×1) | RELIANCE | 1m | latest completed normal session (calendar-resolved, **strictly before** exec date), 09:15–15:30 IST | bars, first/last ts, 09:30 boundary, missing/dup/invalid |
+| 2 | depth ~30d | `load_historical_data` | RELIANCE | 1m | ~30 cal-days back, 09:15–09:20 | retrievability |
+| 3 | depth ~90d | " | RELIANCE | 1m | ~90d back window | retrievability |
+| 4 | depth ~180d | " | RELIANCE | 1m | ~180d back window | retrievability |
+| 5 | depth ~365d | " | RELIANCE | 1m | ~365d back window | oldest verified depth |
+| 6 | prev-close / daily | `load_historical_data` | RELIANCE | 1 day | ~8 completed days | daily semantics + prev-close source |
+
+Total: 1 unauth master + 6 historical = within the ≤10 target / 20 ceiling. **R3.2 auth budget:**
+research token generation ×1, production-recovery auth ×1; no retry, no RenewToken, no
+concurrent-token experiment. R3.2 retains the governed maintenance rule (MARKET_CLOSED,
+restart-policy off, graceful stop, ≥30-min quiet before the single controlled recovery,
+restore policy after health, post-recovery soak). Sample-date selection is deterministic:
+the latest trading day strictly before the R3.2 execution date per the authoritative calendar.
+
 ## Sources
 
 - [DhanHQ v2 Historical Data API](https://dhanhq.co/docs/v2/historical-data/)
