@@ -156,6 +156,39 @@ executed** — blocked before any authentication:
 To unblock: a **dedicated non-production Dhan Data-API credential** remains the recommended
 path (production-safe, no coexistence assumption needed).
 
+## R3 — governed single-account closed-market execution (2026-09-02, 23:05–23:38 IST)
+
+Executed the governed maintenance window (market authoritatively `market_closed`). Backend
+restart policy set to `no`, backend stopped (freeing the production token), and an isolated
+one-off probe container (`docker compose run --no-deps`, entrypoint = probe, creds via the
+normal `dhan.env` env_file — **not** `dhan-r4d.env`) was run.
+
+**Outcome: evidence NOT obtained — probe-construction error, not a provider/account limit.**
+- `connect()` succeeded; a token generation occurred (the single §9-budgeted evidence auth).
+- The probe called `connect()` but **not** `adapter.load_instruments()`, so the instrument
+  master was never loaded → `load_historical_data(RELIANCE)` hit `reference is None` →
+  `UnsupportedProviderRequestError` (adapter.py:721-722, fail-closed on unmapped instrument).
+  `get_health()`/`/profile` returned `NormalizationError`.
+- No historical bars retrieved; **no raw artifacts written** (`r3evidence/` empty); no secrets.
+- Per §9 (max one evidence generation) the run was **not** retried.
+
+**Production recovery: SUCCESS.** After a >30-min quiet interval, one controlled `docker start`
+at 23:38:38 IST authenticated cleanly (`Application startup complete`, provider **healthy**, no
+rate-limit), confirming the **governed single-account closed-market auth + recovery path works**
+end-to-end. Restart policy restored to `unless-stopped`; 10-min soak stable (RestartCount 0,
+CPU ~0.15%, no errors); image `bd0c67f`; observer ON / authority OFF / strategies empty /
+trading disabled; B9 artifact SHA unchanged (`af348246…`).
+
+**Verdicts unchanged for the blocking gates:** P1/P3/P4/P5 remain **PARTIAL/UNRESOLVED** (no
+empirical bars). P10 remains **BLOCKED** for *historical read-only access* (the historical call
+never succeeded), though the auth/recovery mechanics themselves functioned. SECTOR-5B stays
+**not authorized** (hard gate P3∧P4∧P9∧P10 unmet).
+
+**Fix for a future R3 re-run** (one corrected probe, one fresh window): after `connect()`, call
+`await adapter.load_instruments()` before any `load_historical_data(...)`; skip/relax the
+`get_health` profile normalization; then run the P1/P3/P4/P5 probes as designed. No adapter
+change is warranted — the adapter fail-closed correctly on an unmapped instrument.
+
 ## Sources
 
 - [DhanHQ v2 Historical Data API](https://dhanhq.co/docs/v2/historical-data/)
