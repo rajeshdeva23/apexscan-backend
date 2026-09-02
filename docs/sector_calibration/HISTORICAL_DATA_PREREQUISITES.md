@@ -134,6 +134,28 @@ Current: P9 PASS; P3/P4 PARTIAL; **P10 BLOCKED** ⇒ SECTOR-5B implementation **
 3. Assemble **point-in-time F&O eligibility** from NSE daily derivatives archives (P8) if
    unbiased calibration is required (else proceed current-universe-retrospective, labeled).
 
+## R2.2 — same-account multi-token coexistence check (evidence, no auth performed)
+
+Investigated whether an *additional* same-account Dhan access token could be generated for
+read-only historical use while production's token stays valid (would move P10 → PASS). **Not
+executed** — blocked before any authentication:
+
+- **Multi-token support is NOT documented (current official Dhan material).** The v2
+  Authentication doc has no statement permitting multiple simultaneously-active tokens; the one
+  explicit constraint in the API-Key/consent flow is *"at any given point of time, only one
+  token will be generated"* (leans **single**). `RenewToken` is documented as *"expires your
+  current token and provides a new token"*. Fresh-generation invalidation of *other* tokens is
+  **NOT_DOCUMENTED**. Classification: max-simultaneous-tokens = **NOT_DOCUMENTED**; RenewToken =
+  DOCUMENTED_CURRENT; generation-invalidation = NOT_DOCUMENTED.
+- **No safe credential path** to generate a test token regardless (no local Dhan credentials;
+  production creds / `dhan-r4d.env` forbidden).
+- Therefore ADR-015's "single active token" is **not contradicted** by evidence and stands; no
+  ADR change. **P10 remains BLOCKED**; P3/P4 remain PARTIAL. 0 auth attempts, 0 requests,
+  production untouched.
+
+To unblock: a **dedicated non-production Dhan Data-API credential** remains the recommended
+path (production-safe, no coexistence assumption needed).
+
 ## Sources
 
 - [DhanHQ v2 Historical Data API](https://dhanhq.co/docs/v2/historical-data/)
