@@ -27,6 +27,7 @@ from app.schemas.market_data import (
     DepthSnapshot,
     MarketData,
     MarketDataKind,
+    MarketReference,
     ProviderSessionOhlc,
     Quote,
     SubscriptionRequest,
@@ -292,7 +293,7 @@ def decode_standard_live_packet(
     if response_code == _FULL_RESPONSE_CODE:
         return _decode_full_packet(packet, reference)
     if response_code == _PREVIOUS_CLOSE_RESPONSE_CODE:
-        return _decode_previous_close_packet(packet)
+        return _decode_previous_close_packet(packet, reference)
     raise UnsupportedProviderRequestError()
 
 
@@ -423,8 +424,15 @@ def _decode_full_packet(
         raise NormalizationError() from error
 
 
-def _decode_previous_close_packet(packet: bytes) -> tuple[MarketData, ...]:
-    """Validate Dhan's auxiliary packet without inventing a canonical live event."""
+def _decode_previous_close_packet(
+    packet: bytes, reference: DhanInstrumentReference
+) -> tuple[MarketData, ...]:
+    """Surface Dhan's previous-close packet as a provider-independent MarketReference.
+
+    A previous close of zero (Dhan's absent/unknown sentinel) is not fabricated into a
+    reference; nothing is emitted in that case. ``open_interest`` is validated but not
+    surfaced — it is not part of the canonical session reference.
+    """
     if len(packet) != _HEADER.size + _PREVIOUS_CLOSE_PAYLOAD.size:
         raise NormalizationError()
     try:
@@ -433,7 +441,14 @@ def _decode_previous_close_packet(packet: bytes) -> tuple[MarketData, ...]:
         _require_nonnegative_integral(open_interest)
     except ValueError as error:
         raise NormalizationError() from error
-    return ()
+    if previous_close <= 0:
+        return ()
+    return (
+        MarketReference(
+            instrument=reference.instrument,
+            previous_close=Decimal(str(previous_close)),
+        ),
+    )
 
 
 def _decode_feed_disconnect_packet(packet: bytes) -> None:

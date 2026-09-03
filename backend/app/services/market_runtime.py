@@ -41,6 +41,7 @@ from app.schemas.market_data import (
     Instrument,
     MarketData,
     MarketDataKind,
+    MarketReference,
     ProviderHealth,
     ProviderStatus,
     Quote,
@@ -450,7 +451,7 @@ class LiveMarketRuntime:
 
     def _dispatch(self, datum: MarketData) -> None:
         """Route one canonical datum to the TickEngine, fail-closed on an unsupported type."""
-        if isinstance(datum, (Tick, Quote)):
+        if isinstance(datum, (Tick, Quote, MarketReference)):
             self._tick_engine.process(datum)
             return
         raise UnsupportedLiveDatumError(

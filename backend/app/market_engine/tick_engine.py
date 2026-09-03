@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 
 from app.events.bus import EventBus
 from app.market_engine.candle_engine import CandleEngine
@@ -34,6 +35,7 @@ from app.market_engine.state import InstrumentState, InstrumentStateRegistry
 from app.market_engine.validation import ValidationOutcome, classify
 from app.schemas.market_data import (
     FeedContinuityEvent,
+    MarketReference,
     Quote,
     SessionStatisticsObservation,
     Tick,
@@ -71,6 +73,24 @@ def _merge(event: Tick | Quote, state: InstrumentState | None) -> tuple[Tick | N
     if isinstance(event, Tick):
         return event, prior_quote
     return prior_tick, event
+
+
+def _carried_previous_close(
+    prior: MarketContext, new_session: SessionContext | None
+) -> Decimal | None:
+    """Carry a known previous_close forward across updates; reset on a genuine rollover.
+
+    A later Tick/Quote whose session trading date differs from the prior context's clears
+    the reference (a new session's previous close arrives via its own MarketReference); an
+    event that merely omits it (every Tick/Quote does) never erases a valid same-day value.
+    """
+    if (
+        new_session is not None
+        and prior.session is not None
+        and new_session.trading_date != prior.session.trading_date
+    ):
+        return None
+    return prior.previous_close
 
 
 class TickEngine:
@@ -133,15 +153,17 @@ class TickEngine:
         if self._candles is not None:
             self._candles.record_continuity(event)
 
-    def process(self, event: Tick | Quote) -> ProcessResult:
+    def process(self, event: Tick | Quote | MarketReference) -> ProcessResult:
         """Validate and route one canonical event, updating state only if accepted.
 
         Args:
-            event: The canonical tick or quote to process.
+            event: The canonical tick, quote, or session reference to process.
 
         Returns:
             A :class:`ProcessResult` carrying the outcome and any new context.
         """
+        if isinstance(event, MarketReference):
+            return self._accept_reference(event)
         instrument = event.instrument
         state = self._registry.get(instrument)
         outcome = classify(
@@ -232,6 +254,7 @@ class TickEngine:
                 session=session,
                 historical=state.historical,
                 session_statistics=statistics,
+                previous_close=_carried_previous_close(state.context, session),
             )
             self._bus.publish(
                 MarketContextUpdated(context=context, previous_version=state.context.version)
@@ -243,4 +266,56 @@ class TickEngine:
         state.context = context
         state.session_statistics = statistics
         state.staged_session_statistics_observation = staged_after
+        return ProcessResult(outcome=ValidationOutcome.ACCEPT, context=context)
+
+    def _accept_reference(self, event: MarketReference) -> ProcessResult:
+        """Apply a session reference (previous_close) onto the instrument's context.
+
+        Unlike a Tick/Quote, a MarketReference carries no wire timestamp (the provider
+        packet has none), so the engine stamps its own clock time and classifies the
+        session from it. Unknown instruments fail closed. All prior observable state
+        (tick, quote, candles, session statistics, historical) is preserved unchanged;
+        only ``previous_close`` is set. No candle aggregation or statistics resolution
+        runs — a reference is not a trade.
+        """
+        if not self._registry.is_known(event.instrument):
+            logger.debug("rejected MarketReference for unknown %s", event.instrument.symbol)
+            return ProcessResult(outcome=ValidationOutcome.INVALID, context=None)
+        state = self._registry.ensure(event.instrument)
+        sequence = self._sequence.next_value()
+        now = self._clock.now()
+        session = (
+            self._session.classify(now, halt_active=self._halt_active)
+            if self._session is not None
+            else None
+        )
+        if state.context is None:
+            context = MarketContext.initial(
+                event.instrument,
+                sequence=sequence,
+                event_timestamp=now,
+                observed_at=now,
+                session=session,
+                historical=state.historical,
+                previous_close=event.previous_close,
+            )
+            self._bus.publish(MarketContextCreated(context=context))
+        else:
+            context = state.context.with_update(
+                sequence=sequence,
+                event_timestamp=now,
+                observed_at=now,
+                latest_tick=state.latest_tick,
+                latest_quote=state.latest_quote,
+                candle_sets=state.context.candle_sets,
+                session=session if session is not None else state.context.session,
+                historical=state.historical,
+                session_statistics=state.session_statistics,
+                previous_close=event.previous_close,
+            )
+            self._bus.publish(
+                MarketContextUpdated(context=context, previous_version=state.context.version)
+            )
+        state.last_sequence = sequence
+        state.context = context
         return ProcessResult(outcome=ValidationOutcome.ACCEPT, context=context)

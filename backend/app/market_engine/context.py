@@ -276,6 +276,7 @@ class MarketContext(_FrozenModel):
     metadata: tuple[tuple[str, str], ...] = ()
     historical: HistoricalContext | None = None
     session_statistics: SessionStatistics | None = None
+    previous_close: Decimal | None = Field(default=None, gt=0)
     is_valid: bool = True
 
     _validate_event_timestamp = field_validator("event_timestamp")(_require_utc)
@@ -298,6 +299,7 @@ class MarketContext(_FrozenModel):
         metadata: tuple[tuple[str, str], ...] = (),
         historical: HistoricalContext | None = None,
         session_statistics: SessionStatistics | None = None,
+        previous_close: Decimal | None = None,
         is_valid: bool = True,
     ) -> MarketContext:
         """Build the first (version 1) snapshot for an instrument.
@@ -316,6 +318,7 @@ class MarketContext(_FrozenModel):
             metadata: Optional immutable provenance key/value pairs.
             historical: Optional immutable historical-context snapshot.
             session_statistics: Optional current-session statistics fact (ADR-008).
+            previous_close: Optional prior-session reference close for this instrument.
             is_valid: Whether the snapshot is complete and trustworthy.
 
         Returns:
@@ -336,6 +339,7 @@ class MarketContext(_FrozenModel):
             metadata=metadata,
             historical=historical,
             session_statistics=session_statistics,
+            previous_close=previous_close,
             is_valid=is_valid,
         )
 
@@ -354,6 +358,7 @@ class MarketContext(_FrozenModel):
         metadata: tuple[tuple[str, str], ...] = (),
         historical: HistoricalContext | None = None,
         session_statistics: SessionStatistics | None = None,
+        previous_close: Decimal | None = None,
         is_valid: bool = True,
     ) -> MarketContext:
         """Return a new snapshot for the same instrument at ``version + 1``.
@@ -376,6 +381,8 @@ class MarketContext(_FrozenModel):
             metadata: Immutable provenance key/value pairs.
             historical: Immutable historical-context snapshot carried forward.
             session_statistics: Current-session statistics fact carried forward (ADR-008).
+            previous_close: Prior-session reference close for this instrument; replaces the
+                prior value (``None`` clears it — the engine carries it forward explicitly).
             is_valid: Whether the new snapshot is complete and trustworthy.
 
         Returns:
@@ -396,5 +403,6 @@ class MarketContext(_FrozenModel):
             metadata=metadata,
             historical=historical,
             session_statistics=session_statistics,
+            previous_close=previous_close,
             is_valid=is_valid,
         )

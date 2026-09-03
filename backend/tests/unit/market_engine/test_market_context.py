@@ -130,3 +130,39 @@ def test_context_carries_optional_data_slots() -> None:
     assert context.latest_tick == tick
     assert context.latest_quote is None
     assert context.latest_candle is None
+
+
+def test_previous_close_defaults_to_none() -> None:
+    context = _initial(ManualClock(_EVENT_TIME), MonotonicSequence())
+    assert context.previous_close is None
+
+
+def test_with_update_sets_and_clears_previous_close() -> None:
+    sequence = MonotonicSequence()
+    context = _initial(ManualClock(_EVENT_TIME), sequence)
+    with_reference = context.with_update(
+        sequence=sequence.next_value(),
+        event_timestamp=_EVENT_TIME,
+        observed_at=_EVENT_TIME,
+        previous_close=Decimal("100"),
+    )
+    assert with_reference.previous_close == Decimal("100")
+    assert context.previous_close is None  # prior snapshot is untouched
+
+    cleared = with_reference.with_update(
+        sequence=sequence.next_value(),
+        event_timestamp=_EVENT_TIME,
+        observed_at=_EVENT_TIME,
+    )
+    assert cleared.previous_close is None
+
+
+def test_previous_close_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        MarketContext.initial(
+            _instrument(),
+            sequence=1,
+            event_timestamp=_EVENT_TIME,
+            observed_at=_EVENT_TIME,
+            previous_close=Decimal("0"),
+        )
