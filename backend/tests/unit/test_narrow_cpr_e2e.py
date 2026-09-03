@@ -508,10 +508,10 @@ async def test_clean_shutdown_stops_ingestion_and_disconnects_provider() -> None
 
 
 # --------------------------------------------------------------------------- #
-# Proof 16 — the runtime owns exactly four managed asyncio tasks (ingestion, refresh
-# driver, calendar monitor, and the ADR-015 evidence-observer driver — the last gated
-# by its default-OFF flag); the E2E adds none.
+# Proof 16 — the runtime owns exactly five managed asyncio tasks (ingestion, refresh
+# driver, calendar monitor, the ADR-015 evidence-observer driver, and the SECTOR-VIEW-1B
+# sector-shadow evaluator — the last two gated by their default-OFF flags); the E2E adds none.
 # --------------------------------------------------------------------------- #
-def test_market_runtime_creates_exactly_four_tasks() -> None:
+def test_market_runtime_creates_exactly_five_tasks() -> None:
     source = Path(market_runtime_module.__file__).read_text()
-    assert source.count("asyncio.create_task") == 4
+    assert source.count("asyncio.create_task") == 5

@@ -47,6 +47,7 @@ from app.market_engine.context import MarketState
 from app.market_engine.historical.service import HistoricalWarmupService
 from app.market_engine.sequence import SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule
+from app.market_intelligence.sector import MembershipResolver, load_sector_membership_dataset
 from app.schemas.market_data import (
     FeedContinuityEvent,
     Instrument,
@@ -65,6 +66,7 @@ from app.services.market_runtime import (
     _parse_time,
     _schedule_and_calendar,
 )
+from app.services.sector_intelligence import SectorShadowRuntime, ShadowRuntimeConfig
 from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_activation import SessionStatisticsRefreshCoordinator
 from app.services.session_statistics_refresh import SessionStatisticsRefreshService
@@ -321,6 +323,25 @@ def _evidence_observer_factory(
     return factory
 
 
+def _sector_shadow_factory(
+    settings: Settings,
+) -> Callable[[EventBus], SectorShadowRuntime] | None:
+    """Build the passive sector shadow-runtime factory, or ``None`` when the flag is off.
+
+    The SECTOR-2 membership dataset is loaded from local reference data (no network); the
+    resolver and un-calibrated shadow policy are shared across the runtime's lifetime.
+    """
+    if not settings.sector_shadow_enabled:
+        return None
+    resolver = MembershipResolver(load_sector_membership_dataset())
+    config = ShadowRuntimeConfig(interval_seconds=settings.sector_shadow_interval_seconds)
+
+    def factory(bus: EventBus) -> SectorShadowRuntime:
+        return SectorShadowRuntime(bus=bus, resolver=resolver, config=config)
+
+    return factory
+
+
 async def _safe_shutdown(coordinator: ProviderCoordinator) -> None:
     """Best-effort provider cleanup during fail-closed composition unwinding."""
     try:
@@ -462,7 +483,11 @@ async def compose_market_runtime(
     """
     if not settings.market_provider_enabled:
         runtime = LiveMarketRuntime(
-            settings=settings, error_threshold=error_threshold, clock=clock, sequence=sequence
+            settings=settings,
+            error_threshold=error_threshold,
+            clock=clock,
+            sequence=sequence,
+            sector_shadow_factory=_sector_shadow_factory(settings),
         )
         return RuntimeComposition(runtime=runtime, provider_coordinator=None)
 
@@ -524,6 +549,7 @@ async def compose_market_runtime(
         sequence=sequence,
         session_classifier=session_classifier,
         evidence_observer_factory=evidence_observer_factory,
+        sector_shadow_factory=_sector_shadow_factory(settings),
     )
     if sink is not None:
         # Runtime entry point tees to the TickEngine (always) and the evidence observer (if any).
