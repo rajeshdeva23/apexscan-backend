@@ -55,6 +55,7 @@ from app.services.cross_instrument_scanner import (
     ScannerRankingPolicyRegistry,
     ScannerSnapshot,
 )
+from app.services.sector_intelligence import SectorShadowRuntime
 from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_driver import (
     DrivenSessionStatisticsRefresh,
@@ -231,6 +232,7 @@ class LiveMarketRuntime:
         sequence: SequenceGenerator | None = None,
         session_classifier: MarketSessionClassifier | None = None,
         evidence_observer_factory: Callable[[EventBus], SessionOhlcEvidenceObserver] | None = None,
+        sector_shadow_factory: Callable[[EventBus], SectorShadowRuntime] | None = None,
     ) -> None:
         """Compose the shared runtime core (no provider I/O in the constructor).
 
@@ -279,6 +281,9 @@ class LiveMarketRuntime:
             evidence_observer_factory: Optional builder for the read-only Session-OHLC evidence
                 observer (ADR-015), called with the shared bus; ``None`` (default) wires no
                 observer, so there is zero evidence subscription, task, REST, or artifact.
+            sector_shadow_factory: Optional builder for the passive Sector Intelligence shadow
+                runtime (SECTOR-VIEW-1B), called with the shared bus; ``None`` (default) wires
+                no observer or evaluator task — zero behavioral difference.
 
         Raises:
             ValueError: If ``error_threshold`` is not positive (from the manager).
@@ -306,6 +311,10 @@ class LiveMarketRuntime:
             evidence_observer_factory(self._bus) if evidence_observer_factory is not None else None
         )
         self._evidence_observer_task: asyncio.Task[None] | None = None
+        self._sector_shadow = (
+            sector_shadow_factory(self._bus) if sector_shadow_factory is not None else None
+        )
+        self._sector_shadow_task: asyncio.Task[None] | None = None
         self._scanner = CrossInstrumentStrategyScanner(
             instruments=known,
             policies=ScannerRankingPolicyRegistry(scanner_ranking_policies),
@@ -397,6 +406,7 @@ class LiveMarketRuntime:
             self._evidence_observer.subscribe()  # read-only; installed before ingestion
             self._evidence_observer_task = asyncio.create_task(self._evidence_observer.run())
             self._evidence_observer_task.add_done_callback(self._on_evidence_observer_done)
+        self._start_sector_shadow()
         self._manager_subscribed = True
         self._state = RuntimeState.STARTED
         for strategy_id in self._autostart_strategy_ids:
@@ -541,12 +551,14 @@ class LiveMarketRuntime:
             self._refresh_driver_task,  # 2. stop refresh driver
             self._calendar_monitor_task,  # 3. stop calendar monitor
             self._evidence_observer_task,  # 3b. stop evidence observer driver
+            self._sector_shadow_task,  # 3c. stop sector shadow evaluator
         ):
             try:
                 await self._cancel_task(task)
             except Exception as error:  # noqa: BLE001 - clean up every owned resource
                 errors.append(error)
         self._teardown_evidence_observer(errors)
+        self._teardown_sector_shadow(errors)
         for detach in (self._scanner.unsubscribe, self._manager.unsubscribe):
             try:
                 detach()  # 4. detach scanner aggregator, 5. unsubscribe manager
@@ -650,6 +662,42 @@ class LiveMarketRuntime:
             self._evidence_observer.finalize_session()
         except Exception as error:  # noqa: BLE001 - evidence never blocks shutdown
             errors.append(error)
+
+    def _start_sector_shadow(self) -> None:
+        """Subscribe and launch the passive sector shadow runtime, if composed (read-only)."""
+        if self._sector_shadow is None:
+            return
+        self._sector_shadow.subscribe()  # read-only; installed before ingestion
+        self._sector_shadow_task = asyncio.create_task(self._sector_shadow.run())
+        self._sector_shadow_task.add_done_callback(self._on_sector_shadow_done)
+
+    def _teardown_sector_shadow(self, errors: list[BaseException]) -> None:
+        """Unsubscribe the sector shadow observer during shutdown (never blocks it)."""
+        if self._sector_shadow is None:
+            return
+        try:
+            self._sector_shadow.unsubscribe()
+        except Exception as error:  # noqa: BLE001 - shadow never blocks shutdown
+            errors.append(error)
+
+    def _on_sector_shadow_done(self, task: asyncio.Task[None]) -> None:
+        """Observe sector-shadow evaluator completion. Cancellation is the normal shutdown path.
+
+        The shadow runtime is subordinate: a non-cancel end is logged, never made fatal to the
+        runtime (it must not affect ingestion, authority, strategies, or trading).
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        logger.warning(
+            "sector shadow evaluator ended (%s); shadow stopped, ingestion intact",
+            "returned" if error is None else type(error).__name__,
+        )
+
+    @property
+    def sector_shadow(self) -> SectorShadowRuntime | None:
+        """The passive sector shadow runtime, or ``None`` when disabled."""
+        return self._sector_shadow
 
     def _on_evidence_observer_done(self, task: asyncio.Task[None]) -> None:
         """Observe evidence-observer driver completion. Cancellation is the normal shutdown path.

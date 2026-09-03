@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     # the observer is not constructed, so there is zero subscription, REST, artifact, or
     # behavioral difference.
     session_ohlc_evidence_observer_enabled: bool = Field(default=False)
+    # Passive live Sector Intelligence shadow runtime (SECTOR-VIEW-1B). Default OFF: when false
+    # no observer is subscribed and no evaluator task runs — zero behavioral difference. Read-only
+    # shadow; never affects the provider, engine, strategies, or trading.
+    sector_shadow_enabled: bool = Field(default=False)
+    # Shadow evaluation cadence (operational observation only — NOT a trading, calibration, or
+    # signal threshold). Bounded to a sane operational range.
+    sector_shadow_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
     # Running image tag, injected at deploy for evidence provenance (ADR-015 D10); None when the
     # runtime cannot derive it (recorded as unknown, never fabricated).
     apexscan_image_tag: str | None = Field(default=None)
