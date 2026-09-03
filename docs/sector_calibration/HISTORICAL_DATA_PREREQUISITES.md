@@ -240,6 +240,53 @@ restart-policy off, graceful stop, ≥30-min quiet before the single controlled 
 restore policy after health, post-recovery soak). Sample-date selection is deterministic:
 the latest trading day strictly before the R3.2 execution date per the authoritative calendar.
 
+## R3.2 — corrected controlled execution (2026-09-03, market-closed, one research auth)
+
+Executed the corrected probe in a MARKET_CLOSED window (classifier `market_closed`,
+trading_date 2026-09-03; last prior token gen 23:38:41 IST → ~4h40m quiet). Backend restart
+policy set to `no`, backend stopped, isolated probe run via compose (creds via `dhan.env`).
+**One research token generation** (succeeded). `load_instruments()` returned **198,224**
+instruments; **RELIANCE resolved** (NSE/EQUITY/CASH) — the R3 defect is fixed.
+
+**Empirical facts (RAW provider):**
+- **P1 — 1-minute retrieval: PASS.** Genuine 1m bars returned for 2026-08-04, 2026-06-05,
+  2026-03-06, and **2025-09-03** (each: 14 consecutive bars for a 09:15–09:30 IST request).
+- **P2 — depth: PASS to ≥365 calendar days** (2025-09-03 returned data; documented "~5yr" NOT
+  empirically confirmed beyond this).
+- **Recency limitation:** the T-1 full session (2026-09-02, 09:15–15:30) returned **0 bars** —
+  recent-session 1m appears **not available same-night**. (RAW FACT.)
+- **P3 — bar-label semantics: PARTIAL (AMBIGUOUS).** For a request `[09:15:00, 09:30:00) IST`,
+  all four dates returned **exactly 14 bars: 09:16, 09:17, …, 09:29** (raw start epochs;
+  independently converted). First bar is **09:16, not 09:15**; last is 09:29. This is
+  consistent with **either** right-label (timestamp=end: `09:16 = [09:15,09:16)`) **or**
+  left-label with the 09:15 open-minute absent. **Not disambiguated** — the session-close
+  bars (15:29 vs 15:30) that would settle it were unavailable (REQ1 empty), and Dhan docs are
+  silent on start/end (R3.1). Per §20/§23 this is NOT resolved by the adapter's assumption.
+- **P4 — anti-lookahead: PARTIAL** (depends on P3; the `end ≤ T` rule is proven correct
+  offline (R3.1) but the canonical 09:30 cutoff cannot be asserted until P3 is PASS).
+- **P5 — session quality: UNRESOLVED** (no full session retrieved; the 4 depth windows were
+  each 14 consecutive, monotonic, valid-OHLC bars with no gaps/dups within the window).
+- **Data-API rate limit:** the 6th request (daily history) returned `ProviderRateLimitError`
+  — rapid sequential data requests hit the Data-API throttle (distinct from token-gen). Daily
+  history / previous-close was therefore **not obtained**. Future runs must space data calls.
+- **P10 — governed single-account closed-market historical access: PASS.** Safe stop → one
+  research auth → historical reads succeeded → no forbidden calls → ≥30-min quiet → one
+  controlled recovery at 01:18:34 IST (`Application startup complete`, provider healthy, no
+  rate-limit) → policy restored → soak stable. (Not concurrent-token; single-account governed.)
+
+Raw artifacts (start-epochs + OHLC, no secrets) under host `~/r32evidence/`, SHA-256:
+`depth_30d_2026-08-04` c750c741…, `depth_90d_2026-06-05` 89afe97f…,
+`depth_180d_2026-03-06` a416b9db…, `depth_365d_2025-09-03` 8432d5e7… (not committed to Git).
+
+**Verdicts after R3.2:** P1 **PASS**, P2 **PASS (≥365d)**, P3 **PARTIAL**, P4 **PARTIAL**,
+P5 **UNRESOLVED**, P6 PARTIAL, P7 UNRESOLVED, P8 PARTIAL, P9 PASS, P10 **PASS**. The 5B hard
+gate (P3∧P4 PASS) is **not met** → SECTOR-5B remains not authorized.
+
+**R3.3 need (one future window):** fetch a **full older session that has data** (e.g. one of
+the depth dates) to capture 09:29/09:30 **and** 15:29/15:30 boundaries → disambiguate P3 (→P4)
+and characterize P5; **space** Data-API requests to avoid the throttle; take daily/prev-close
+as a separate spaced call. No adapter change indicated.
+
 ## Sources
 
 - [DhanHQ v2 Historical Data API](https://dhanhq.co/docs/v2/historical-data/)
