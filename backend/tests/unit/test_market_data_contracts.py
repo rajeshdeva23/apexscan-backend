@@ -177,3 +177,28 @@ def test_capability_contracts_share_explicit_instrument_and_time_semantics() -> 
             instruments=(instrument,),
             data_types=frozenset({"unsupported-market-data-kind"}),
         )
+
+
+def test_market_reference_is_immutable_broker_neutral_and_positive() -> None:
+    """A session reference carries a provider-independent, strictly-positive previous close."""
+    contracts = _contracts()
+    instrument = _instrument()
+
+    reference = contracts.MarketReference(instrument=instrument, previous_close=Decimal("100.50"))
+    assert reference.instrument == instrument
+    assert reference.previous_close == Decimal("100.50")
+    assert contracts.MarketReference in contracts.MarketData.__args__
+
+    with pytest.raises(ValidationError):
+        reference.previous_close = Decimal("101")  # type: ignore[misc]
+
+    with pytest.raises(ValidationError):
+        contracts.MarketReference(instrument=instrument, previous_close=Decimal("0"))
+
+    with pytest.raises(ValidationError):
+        contracts.MarketReference(instrument=instrument, previous_close=Decimal("-1"))
+
+    with pytest.raises(ValidationError):
+        contracts.MarketReference(
+            instrument=instrument, previous_close=Decimal("100"), open_interest=1
+        )

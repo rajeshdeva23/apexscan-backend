@@ -378,4 +378,17 @@ class FeedContinuityEvent(_CanonicalModel):
     _validate_observed_at = field_validator("observed_at")(_require_aware_timestamp)
 
 
-MarketData = Tick | Quote | DepthSnapshot | Candle
+class MarketReference(_CanonicalModel):
+    """A provider-independent session reference price for one instrument.
+
+    Currently carries the previous trading session's close. It is not a timed market
+    *event* (the provider reference packet carries no trade timestamp); the engine stamps
+    its own time on accept. A missing/invalid provider value is never fabricated — the
+    adapter emits nothing in that case.
+    """
+
+    instrument: Instrument
+    previous_close: Decimal = Field(gt=0)
+
+
+MarketData = Tick | Quote | DepthSnapshot | Candle | MarketReference

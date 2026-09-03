@@ -29,6 +29,7 @@ from app.schemas.market_data import (
     FeedContinuity,
     Instrument,
     MarketDataKind,
+    MarketReference,
     Quote,
     SubscriptionRequest,
     Tick,
@@ -234,8 +235,8 @@ def test_full_packet_normalizes_quote_and_five_level_depth_when_requested() -> N
     assert depth.asks[4].price == 200.25
 
 
-def test_previous_close_packet_is_validated_then_ignored() -> None:
-    """Forwarding a non-canonical previous-close packet would invent a live event type."""
+def test_previous_close_packet_normalizes_to_a_canonical_market_reference() -> None:
+    """The decoded previous close must reach consumers as a provider-independent reference."""
     dhan = _dhan()
     references = dhan.normalize_instrument_master(
         _text("instrument_master_production_universe.csv")
@@ -246,6 +247,26 @@ def test_previous_close_packet_is_validated_then_ignored() -> None:
         _packet("live_previous_close_packet.hex"),
         live_universe.cash_references,
     )
+
+    assert len(events) == 1
+    reference = events[0]
+    assert isinstance(reference, MarketReference)
+    assert reference.instrument.symbol == "360ONE"
+    assert str(reference.previous_close) == "100.0"
+
+
+def test_previous_close_of_zero_emits_nothing_rather_than_fabricating_a_reference() -> None:
+    """Dhan's absent-value sentinel (0.0) must never become a canonical previous close."""
+    dhan = _dhan()
+    references = dhan.normalize_instrument_master(
+        _text("instrument_master_production_universe.csv")
+    )
+    live_universe = dhan.resolve_nse_cash_equity_live_universe(references)
+    template = _packet("live_previous_close_packet.hex")
+    header = struct.Struct("<B h B i").size
+    zeroed = template[:header] + struct.pack("<f i", 0.0, 0) + template[header + 8 :]
+
+    events = dhan.decode_standard_live_packet(zeroed, live_universe.cash_references)
 
     assert events == ()
 
