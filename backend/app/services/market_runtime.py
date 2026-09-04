@@ -19,9 +19,10 @@ that attach to the read-only composition seams exposed here.
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
+import random
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -30,6 +31,7 @@ from app.core.config import Settings
 from app.events.bus import EventBus
 from app.market_engine.candle_engine import CandleEngine
 from app.market_engine.clock import Clock, SystemClock
+from app.market_engine.context import MarketState
 from app.market_engine.historical.requirements import HistoricalRequirementRegistry
 from app.market_engine.sequence import MonotonicSequence, SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule, TradingCalendar
@@ -137,6 +139,84 @@ class RuntimeLifecycleError(RuntimeError):
     """Raised on an invalid live-market runtime lifecycle transition."""
 
 
+class IngestionState(StrEnum):
+    """The supervised live-ingestion lifecycle phase (MARKET-INGESTION-RESILIENCE-1).
+
+    ``STOPPED`` before start / after the supervisor exits; ``STARTING`` once the supervisor
+    task is created; ``RUNNING`` while a single stream is being consumed; ``RECOVERING`` during
+    the bounded backoff before a retry; ``WAITING_FOR_SESSION`` while deferring recovery until
+    the authoritative classifier reports a session that expects live ingestion.
+    """
+
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    RECOVERING = "recovering"
+    WAITING_FOR_SESSION = "waiting_for_session"
+
+
+# Session phases during which a live provider connection is expected, so recovery retries
+# promptly. Outside these (MARKET_CLOSED / HOLIDAY / EMERGENCY_HALT / CALENDAR_UNAVAILABLE) the
+# supervisor waits at a calm cadence instead of burning reconnects/tokens overnight.
+_INGESTION_ACTIVE_STATES: frozenset[MarketState] = frozenset(
+    {
+        MarketState.PRE_OPEN,
+        MarketState.OPENING_AUCTION,
+        MarketState.LIVE_SESSION,
+        MarketState.CLOSING_SESSION,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRecoveryPolicy:
+    """Bounded, session-aware recovery timing for supervised live ingestion.
+
+    Backoff grows only across *consecutive* failed runs (a run that received at least one
+    event resets it), is capped, and is jittered — never a tight loop or reconnect storm.
+    """
+
+    initial_delay_seconds: float = 1.0
+    maximum_delay_seconds: float = 30.0
+    jitter_ratio: float = 0.2
+    session_poll_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        """Validate the bounds (fail fast on a nonsensical policy)."""
+        if (
+            self.initial_delay_seconds < 0
+            or self.maximum_delay_seconds < self.initial_delay_seconds
+        ):
+            raise ValueError("recovery delays must be non-negative and ordered")
+        if not 0 <= self.jitter_ratio <= 1:
+            raise ValueError("recovery jitter ratio must be between zero and one")
+        if self.session_poll_seconds <= 0:
+            raise ValueError("session poll interval must be positive")
+
+    def delay_for_failure(self, consecutive_failures: int, random_value: float) -> float:
+        """Return the jittered exponential backoff for the Nth consecutive failure (>=1)."""
+        exponent = max(0, consecutive_failures - 1)
+        base = min(self.maximum_delay_seconds, self.initial_delay_seconds * (2**exponent))
+        return float(base * (1 - self.jitter_ratio + self.jitter_ratio * random_value))
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionDiagnostics:
+    """An immutable, non-sensitive snapshot of the live-ingestion supervisor state."""
+
+    state: IngestionState
+    ingestion_task_running: bool
+    recovery_task_running: bool
+    last_rx_timestamp: datetime | None
+    last_failure_timestamp: datetime | None
+    last_failure_type: str | None
+    recovery_attempts: int
+    successful_recoveries: int
+    consecutive_failures: int
+    last_recovery_attempt_timestamp: datetime | None
+    next_recovery_not_before: datetime | None
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeStatus:
     """An immutable, non-sensitive snapshot of the runtime's composed state.
@@ -233,6 +313,9 @@ class LiveMarketRuntime:
         session_classifier: MarketSessionClassifier | None = None,
         evidence_observer_factory: Callable[[EventBus], SessionOhlcEvidenceObserver] | None = None,
         sector_shadow_factory: Callable[[EventBus], SectorShadowRuntime] | None = None,
+        ingestion_recovery_policy: IngestionRecoveryPolicy | None = None,
+        ingestion_sleep: Callable[[float], Awaitable[None]] | None = None,
+        ingestion_random: Callable[[], float] | None = None,
     ) -> None:
         """Compose the shared runtime core (no provider I/O in the constructor).
 
@@ -284,6 +367,13 @@ class LiveMarketRuntime:
             sector_shadow_factory: Optional builder for the passive Sector Intelligence shadow
                 runtime (SECTOR-VIEW-1B), called with the shared bus; ``None`` (default) wires
                 no observer or evaluator task — zero behavioral difference.
+            ingestion_recovery_policy: Bounded, session-aware backoff policy for supervised
+                live-ingestion recovery (MARKET-INGESTION-RESILIENCE-1). Defaults to
+                :class:`IngestionRecoveryPolicy`.
+            ingestion_sleep: Injected async sleeper for recovery backoff (defaults to
+                ``asyncio.sleep``); overridden in tests for determinism.
+            ingestion_random: Injected ``[0, 1)`` source for backoff jitter (defaults to
+                ``random.random``); overridden in tests for determinism.
 
         Raises:
             ValueError: If ``error_threshold`` is not positive (from the manager).
@@ -294,6 +384,19 @@ class LiveMarketRuntime:
         self._ingestion_task: asyncio.Task[None] | None = None
         self._ingestion_error: BaseException | None = None
         self._ingestion_failed = False
+        self._recovery_policy = ingestion_recovery_policy or IngestionRecoveryPolicy()
+        self._ingestion_sleep: Callable[[float], Awaitable[None]] = ingestion_sleep or asyncio.sleep
+        self._ingestion_random: Callable[[], float] = ingestion_random or random.random
+        self._ingestion_state = IngestionState.STOPPED
+        self._last_rx_at: datetime | None = None
+        self._rx_since_start = False
+        self._last_failure_at: datetime | None = None
+        self._last_failure_type: str | None = None
+        self._recovery_attempts = 0
+        self._successful_recoveries = 0
+        self._consecutive_failures = 0
+        self._last_recovery_attempt_at: datetime | None = None
+        self._next_recovery_not_before: datetime | None = None
         self._refresh_poll_seconds = session_statistics_refresh_poll_seconds
         self._refresh_driver_task: asyncio.Task[None] | None = None
         self._refresh_driver_failed = False
@@ -412,7 +515,8 @@ class LiveMarketRuntime:
         for strategy_id in self._autostart_strategy_ids:
             await self._start_strategy(strategy_id)  # warm requirements before ingestion (D10)
         if self._live_market_data is not None and self._instruments:
-            self._ingestion_task = asyncio.create_task(self._run_ingestion())
+            self._ingestion_state = IngestionState.STARTING  # visible before the task first runs
+            self._ingestion_task = asyncio.create_task(self._supervise_ingestion())
             self._ingestion_task.add_done_callback(self._on_ingestion_done)
         if self._session_statistics_refresh is not None and self._session is not None:
             driver = SessionStatisticsRefreshDriver(
@@ -446,13 +550,83 @@ class LiveMarketRuntime:
         except Exception:
             logger.exception("enabled strategy %s failed to start; skipped", strategy_id)
 
+    async def _supervise_ingestion(self) -> None:
+        """Own the live-ingestion lifecycle: run it, and self-heal a terminal failure.
+
+        The adapter owns *within-stream* reconnect (ADR-006). This supervisor sits above it:
+        when a stream terminates unexpectedly (e.g. ``ProviderUnavailableError`` after the
+        adapter exhausts its bounded reconnect), it schedules a bounded, session-aware retry
+        rather than leaving ingestion permanently dead (MARKET-INGESTION-RESILIENCE-1).
+
+        Exactly one stream is consumed at a time (the loop awaits each run inline — never
+        a second concurrent task). Recovery reuses the existing provider/adapter, so its cached
+        access token is reused; no provider is rebuilt and no token is regenerated per attempt.
+        Outside a session that expects live data, recovery waits at a calm cadence instead of
+        burning reconnects/tokens. Cancellation (shutdown) propagates cleanly.
+        """
+        first = True
+        try:
+            while True:
+                if not first:
+                    await self._wait_before_recovery()
+                first = False
+                self._ingestion_state = IngestionState.RUNNING
+                self._rx_since_start = False
+                try:
+                    await self._run_ingestion()
+                    self._record_ingestion_end(None)  # a live stream returning is abnormal
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - any terminal stream error self-heals
+                    self._record_ingestion_end(error)
+        finally:
+            self._ingestion_state = IngestionState.STOPPED
+
+    async def _wait_before_recovery(self) -> None:
+        """Defer recovery until a session expects live data, then apply bounded backoff."""
+        while not self._session_expects_ingestion():
+            self._ingestion_state = IngestionState.WAITING_FOR_SESSION
+            await self._ingestion_sleep(self._recovery_policy.session_poll_seconds)
+        self._ingestion_state = IngestionState.RECOVERING
+        delay = self._recovery_policy.delay_for_failure(
+            self._consecutive_failures, self._ingestion_random()
+        )
+        now = self._clock.now()
+        self._recovery_attempts += 1
+        self._last_recovery_attempt_at = now
+        self._next_recovery_not_before = now + timedelta(seconds=delay)
+        await self._ingestion_sleep(delay)
+
+    def _session_expects_ingestion(self) -> bool:
+        """Whether the authoritative classifier reports a live-data session phase."""
+        if self._session is None:
+            return True  # no classifier wired: always attempt (never block recovery)
+        return self._session.classify(self._clock.now()).market_state in _INGESTION_ACTIVE_STATES
+
+    def _record_ingestion_end(self, error: BaseException | None) -> None:
+        """Record one terminal ingestion run; reset backoff if it had received events."""
+        self._ingestion_error = error
+        self._last_failure_at = self._clock.now()
+        self._last_failure_type = "returned" if error is None else type(error).__name__
+        if self._rx_since_start:
+            self._successful_recoveries += 1
+            self._consecutive_failures = 0  # it worked then dropped: treat as fresh transient
+        else:
+            self._consecutive_failures += 1
+        logger.warning(
+            "live ingestion ended (%s); scheduling session-aware recovery (consecutive=%d)",
+            self._last_failure_type,
+            self._consecutive_failures,
+        )
+
     async def _run_ingestion(self) -> None:
         """Consume the live stream sequentially into the TickEngine (the one owned task).
 
         One ``async for`` over the provider stream dispatches each datum synchronously
         before requesting the next — preserving per-instrument ordering, the monotonic
         sequence, and one-datum-one-version semantics (ADR-010 D8/D10). Reconnect is the
-        adapter's responsibility (ADR-006); this loop adds none.
+        adapter's responsibility (ADR-006); this loop adds none. Terminal failure is handled
+        by :meth:`_supervise_ingestion`.
         """
         assert self._live_market_data is not None
         request = SubscriptionRequest(instruments=self._instruments, data_types=_LIVE_DATA_TYPES)
@@ -461,6 +635,8 @@ class LiveMarketRuntime:
 
     def _dispatch(self, datum: MarketData) -> None:
         """Route one canonical datum to the TickEngine, fail-closed on an unsupported type."""
+        self._last_rx_at = self._clock.now()
+        self._rx_since_start = True
         if isinstance(datum, (Tick, Quote, MarketReference)):
             self._tick_engine.process(datum)
             return
@@ -469,19 +645,19 @@ class LiveMarketRuntime:
         )
 
     def _on_ingestion_done(self, task: asyncio.Task[None]) -> None:
-        """Observe ingestion-task completion so a failure/exhaustion is never lost.
+        """Observe the ingestion **supervisor** task completing.
 
-        Cancellation is the normal shutdown path and is not a fault. Any other terminal
-        state — an exception, or a normal return from the never-completing stream — is a
-        fatal ingestion condition (the stream is a ``while True`` live feed).
+        The supervisor self-heals stream failures, so it only ends on cancellation (normal
+        shutdown) or an unexpected supervisor-level fault. Cancellation is not a fault; any
+        other termination is fatal (the supervisor should run for the process lifetime).
         """
         if task.cancelled():
             return
         self._ingestion_error = task.exception()
         self._ingestion_failed = True
         logger.error(
-            "live ingestion task ended unexpectedly (%s)",
-            "exhausted" if self._ingestion_error is None else type(self._ingestion_error).__name__,
+            "live ingestion supervisor ended unexpectedly (%s)",
+            "returned" if self._ingestion_error is None else type(self._ingestion_error).__name__,
         )
 
     def _on_refresh_driver_done(self, task: asyncio.Task[None]) -> None:
@@ -581,7 +757,11 @@ class LiveMarketRuntime:
             staged_observation_verified=self._authority.staged_observation_verified,
             tick_aggregate_verified=self._authority.tick_aggregate_verified,
             ingestion_configured=self._live_market_data is not None,
-            ingestion_running=ingestion is not None and not ingestion.done(),
+            ingestion_running=(
+                ingestion is not None
+                and not ingestion.done()
+                and self._ingestion_state in (IngestionState.STARTING, IngestionState.RUNNING)
+            ),
             fatal_ingestion_error=self._ingestion_failed,
             refresh_driver_configured=self._session_statistics_refresh is not None,
             refresh_driver_running=driver is not None and not driver.done(),
@@ -589,6 +769,25 @@ class LiveMarketRuntime:
             calendar_monitor_configured=self._calendar_monitor is not None,
             calendar_monitor_running=monitor is not None and not monitor.done(),
             fatal_calendar_monitor_error=self._calendar_monitor_failed,
+        )
+
+    def ingestion_diagnostics(self) -> IngestionDiagnostics:
+        """Return an immutable snapshot of the live-ingestion supervisor state (bounded)."""
+        alive = self._ingestion_task is not None and not self._ingestion_task.done()
+        return IngestionDiagnostics(
+            state=self._ingestion_state,
+            ingestion_task_running=alive and self._ingestion_state == IngestionState.RUNNING,
+            recovery_task_running=alive
+            and self._ingestion_state
+            in (IngestionState.RECOVERING, IngestionState.WAITING_FOR_SESSION),
+            last_rx_timestamp=self._last_rx_at,
+            last_failure_timestamp=self._last_failure_at,
+            last_failure_type=self._last_failure_type,
+            recovery_attempts=self._recovery_attempts,
+            successful_recoveries=self._successful_recoveries,
+            consecutive_failures=self._consecutive_failures,
+            last_recovery_attempt_timestamp=self._last_recovery_attempt_at,
+            next_recovery_not_before=self._next_recovery_not_before,
         )
 
     # ----------------------------------------------------------------------- #
