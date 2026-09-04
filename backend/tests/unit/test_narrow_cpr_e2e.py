@@ -508,9 +508,11 @@ async def test_clean_shutdown_stops_ingestion_and_disconnects_provider() -> None
 
 
 # --------------------------------------------------------------------------- #
-# Proof 16 — the runtime owns exactly five managed asyncio tasks (ingestion, refresh
-# driver, calendar monitor, the ADR-015 evidence-observer driver, and the SECTOR-VIEW-1B
+# Proof 16 — the runtime owns exactly five managed asyncio tasks (the ingestion supervisor,
+# refresh driver, calendar monitor, the ADR-015 evidence-observer driver, and the SECTOR-VIEW-1B
 # sector-shadow evaluator — the last two gated by their default-OFF flags); the E2E adds none.
+# The ingestion supervisor (MARKET-INGESTION-RESILIENCE-1) runs its single stream inline, so it
+# is still exactly one managed task, not two.
 # --------------------------------------------------------------------------- #
 def test_market_runtime_creates_exactly_five_tasks() -> None:
     source = Path(market_runtime_module.__file__).read_text()

@@ -89,7 +89,17 @@ class _FakeLive:
         await self._gate.wait()  # a live feed never completes normally — block until cancelled
 
 
-def _runtime(*, instruments: tuple[Instrument, ...], live: _FakeLive | None) -> LiveMarketRuntime:
+async def _instant_sleep(_seconds: float) -> None:
+    """Deterministic near-instant sleeper: yields to the loop but adds no real delay."""
+    await asyncio.sleep(0)
+
+
+def _runtime(
+    *,
+    instruments: tuple[Instrument, ...],
+    live: _FakeLive | None,
+    ingestion_sleep: Callable[[float], object] | None = None,
+) -> LiveMarketRuntime:
     return LiveMarketRuntime(
         settings=_settings(),
         error_threshold=_ERROR_THRESHOLD,
@@ -97,6 +107,7 @@ def _runtime(*, instruments: tuple[Instrument, ...], live: _FakeLive | None) -> 
         live_market_data=live,
         clock=ManualClock(_CLOCK),
         sequence=MonotonicSequence(),
+        ingestion_sleep=ingestion_sleep,  # type: ignore[arg-type]
     )
 
 
@@ -248,25 +259,29 @@ async def test_shutdown_order_stops_ingestion_before_manager_unsubscribe() -> No
 # --------------------------------------------------------------------------- #
 # Fatal conditions: stream failure / exhaustion
 # --------------------------------------------------------------------------- #
-async def test_stream_failure_is_recorded_and_not_restarted() -> None:
+async def test_stream_failure_triggers_bounded_recovery_not_permanent_death() -> None:
+    # MARKET-INGESTION-RESILIENCE-1: a terminal stream failure during a live session must be
+    # recovered by the supervisor (re-consuming the stream), never left permanently dead.
     instrument = _instrument("RELIANCE")
     live = _FakeLive(events=(_tick("RELIANCE"),), fail=True)
-    runtime = _runtime(instruments=(instrument,), live=live)
-    recorded = _recorder(runtime.bus)
+    runtime = _runtime(instruments=(instrument,), live=live, ingestion_sleep=_instant_sleep)
     await runtime.start()
-    await _wait_until(lambda: runtime.status().fatal_ingestion_error)
-    assert len(recorded) == 1  # datum A was processed before the failure
-    assert live.stream_calls == 1  # no auto-restart of the stream
-    assert runtime.status().ingestion_running is False
-    await runtime.shutdown()  # still safe
+    await _wait_until(lambda: live.stream_calls >= 2)  # supervisor restarted the stream
+    diagnostics = runtime.ingestion_diagnostics()
+    assert diagnostics.recovery_attempts >= 1
+    assert runtime.status().fatal_ingestion_error is False  # not a permanent fatal condition
+    await runtime.shutdown()
 
 
-async def test_stream_exhaustion_is_treated_as_fatal() -> None:
+async def test_stream_exhaustion_triggers_recovery() -> None:
+    # A live stream returning (exhaustion) is abnormal and must also trigger recovery.
     live = _FakeLive(complete=True)
-    runtime = _runtime(instruments=(_instrument("RELIANCE"),), live=live)
+    runtime = _runtime(
+        instruments=(_instrument("RELIANCE"),), live=live, ingestion_sleep=_instant_sleep
+    )
     await runtime.start()
-    await _wait_until(lambda: runtime.status().fatal_ingestion_error)
-    assert runtime.status().ingestion_running is False
+    await _wait_until(lambda: live.stream_calls >= 2)  # re-attempted, not left dead
+    assert runtime.status().fatal_ingestion_error is False
     await runtime.shutdown()
 
 
