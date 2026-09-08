@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import health, scanners, version
+from app.api.v1.endpoints import diagnostics, health, scanners, version
 
 api_router = APIRouter()
 
 # Register endpoint routers. Add future feature routers below.
+api_router.include_router(diagnostics.router)
 api_router.include_router(health.router)
 api_router.include_router(scanners.router)
 api_router.include_router(version.router)

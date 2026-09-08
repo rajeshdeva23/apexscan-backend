@@ -35,12 +35,14 @@ from app.adapters.base.errors import (
     UnknownProviderReferenceError,
     UnsupportedProviderRequestError,
 )
+from app.adapters.base.live_feed_diagnostics import LiveFeedDecodeDiagnostics
 from app.adapters.dhan.auth import (
     DhanAccessTokenProvider,
     DhanAuthManager,
     DhanStaticAccessTokenProvider,
 )
 from app.adapters.dhan.live import (
+    DhanLiveDecodeCounters,
     DhanLiveReconnectPolicy,
     DhanLiveSocket,
     DhanLiveSubscriptionBatch,
@@ -96,6 +98,13 @@ _UNSUPPORTED_REQUEST_ERROR_CODES = frozenset({"DH-905", "DH-907", "811", "812", 
 _TRANSIENT_ERROR_CODES = frozenset({"DH-908", "DH-909", "800"})
 
 logger = logging.getLogger(__name__)
+
+# Maps a live-decode boundary error to its bounded diagnostic cause label (SECTOR-VIEW-1D).
+_DECODE_FAILURE_KINDS: dict[type[Exception], str] = {
+    NormalizationError: "normalization",
+    UnsupportedProviderRequestError: "unsupported_code",
+    UnknownProviderReferenceError: "unknown_reference",
+}
 
 
 @dataclass(slots=True)
@@ -221,6 +230,7 @@ class DhanRestAdapter(
         self._websocket_transport = websocket_transport or WebsocketsDhanLiveTransport()
         self._live_socket: DhanLiveSocket | None = None
         self._desired_live_requests: dict[SubscriptionRequest, int] = {}
+        self._decode_counters = DhanLiveDecodeCounters()
         self._live_consumers: dict[int, _LiveConsumer] = {}
         self._live_consumer_sequence = 0
         self._live_cash_references: tuple[DhanInstrumentReference, ...] = ()
@@ -345,6 +355,10 @@ class DhanRestAdapter(
             return ProviderHealth(status=self._live_status, observed_at=datetime.now(UTC))
         await self._request_api_json("GET", "/profile")
         return ProviderHealth(status=ProviderStatus.HEALTHY, observed_at=datetime.now(UTC))
+
+    def live_feed_decode_diagnostics(self) -> LiveFeedDecodeDiagnostics:
+        """Return the bounded live-frame decode-diagnostics snapshot (read-only, no payloads)."""
+        return self._decode_counters.snapshot()
 
     async def load_instruments(self) -> tuple[Instrument, ...]:
         """Fetch the documented detailed Dhan master and retain private request references."""
@@ -484,6 +498,29 @@ class DhanRestAdapter(
         )
         self._suspect_stale_logged = True
 
+    def _decode_live_frame(self, packet: bytes | str) -> tuple[MarketData, ...] | None:
+        """Decode one frame, recording bounded diagnostics; ``None`` if discarded.
+
+        Malformed, unsupported, or unresolvable frames are counted (by cause and response
+        code) and dropped so the stream keeps processing later valid frames (05 §12.2).
+        """
+        if not isinstance(packet, bytes):
+            self._decode_counters.record_non_binary()
+            logger.warning("Discarded a non-binary Dhan live frame")
+            return None
+        try:
+            events = decode_standard_live_packet(packet, self._live_cash_references)
+        except (
+            NormalizationError,
+            UnsupportedProviderRequestError,
+            UnknownProviderReferenceError,
+        ) as error:
+            self._decode_counters.record(packet, kind=_DECODE_FAILURE_KINDS[type(error)])
+            logger.warning("Discarded a malformed Dhan live frame")
+            return None
+        self._decode_counters.record(packet, kind="decoded")
+        return events
+
     def _distribute_live_packet(self, packet: bytes | str) -> None:
         """Decode one frame and buffer its events per consumer, discarding bad frames.
 
@@ -491,17 +528,8 @@ class DhanRestAdapter(
         the stream keeps processing later valid frames (05 §12.2). A feed
         disconnect surfaces as a ``ConnectionError`` for the caller to reconnect.
         """
-        if not isinstance(packet, bytes):
-            logger.warning("Discarded a non-binary Dhan live frame")
-            return
-        try:
-            events = decode_standard_live_packet(packet, self._live_cash_references)
-        except (
-            NormalizationError,
-            UnsupportedProviderRequestError,
-            UnknownProviderReferenceError,
-        ):
-            logger.warning("Discarded a malformed Dhan live frame")
+        events = self._decode_live_frame(packet)
+        if events is None:
             return
         if events:
             # A frame that decodes to >=1 canonical event is a valid market tick; reset the

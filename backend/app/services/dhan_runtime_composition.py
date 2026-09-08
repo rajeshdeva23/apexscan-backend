@@ -31,6 +31,7 @@ from app.adapters.base.broker_adapter import (
     LiveMarketDataAdapter,
     SessionStatisticsSource,
 )
+from app.adapters.base.live_feed_diagnostics import LiveFeedDecodeDiagnostics
 from app.adapters.base.provider_coordinator import ProviderCoordinator
 from app.adapters.dhan.adapter import DhanRestAdapter
 from app.adapters.dhan.calendar_monitor_parser import DhanMarketHolidayParser
@@ -66,7 +67,12 @@ from app.services.market_runtime import (
     _parse_time,
     _schedule_and_calendar,
 )
-from app.services.sector_intelligence import SectorShadowRuntime, ShadowRuntimeConfig
+from app.services.sector_intelligence import (
+    SectorShadowRuntime,
+    SectorShadowSnapshot,
+    ShadowDiagnosticsView,
+    ShadowRuntimeConfig,
+)
 from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_activation import SessionStatisticsRefreshCoordinator
 from app.services.session_statistics_refresh import SessionStatisticsRefreshService
@@ -675,3 +681,30 @@ class LiveMarketRuntimeDependency:
         if composition is None:
             return None
         return composition.runtime.scanner_snapshot(strategy_id)
+
+    # ----------------------------------------------------------------------- #
+    # SectorShadowDiagnosticsSource read seam (SECTOR-VIEW-1D) — read-only, no I/O
+    # ----------------------------------------------------------------------- #
+    def sector_shadow_read_available(self) -> bool:
+        """Return whether a shadow-diagnostics read is safe: composed and STARTED."""
+        composition = self._composition
+        if composition is None:
+            return False
+        return composition.runtime.status().state is RuntimeState.STARTED
+
+    def sector_shadow_snapshot(self) -> SectorShadowSnapshot | None:
+        """Return the shadow runtime's latest-good snapshot, or ``None``."""
+        composition = self._composition
+        return composition.runtime.sector_shadow_snapshot() if composition is not None else None
+
+    def sector_shadow_diagnostics(self) -> ShadowDiagnosticsView | None:
+        """Return the shadow runtime's bounded diagnostics, or ``None``."""
+        composition = self._composition
+        return composition.runtime.sector_shadow_diagnostics() if composition is not None else None
+
+    def live_feed_decode_diagnostics(self) -> LiveFeedDecodeDiagnostics | None:
+        """Return the provider's bounded live-frame decode diagnostics, or ``None``."""
+        composition = self._composition
+        return (
+            composition.runtime.live_feed_decode_diagnostics() if composition is not None else None
+        )

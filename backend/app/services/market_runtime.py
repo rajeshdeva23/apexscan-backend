@@ -27,6 +27,10 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from app.adapters.base.broker_adapter import LiveMarketDataAdapter
+from app.adapters.base.live_feed_diagnostics import (
+    LiveFeedDecodeDiagnostics,
+    LiveFeedDiagnosticsSource,
+)
 from app.core.config import Settings
 from app.events.bus import EventBus
 from app.market_engine.candle_engine import CandleEngine
@@ -57,7 +61,11 @@ from app.services.cross_instrument_scanner import (
     ScannerRankingPolicyRegistry,
     ScannerSnapshot,
 )
-from app.services.sector_intelligence import SectorShadowRuntime
+from app.services.sector_intelligence import (
+    SectorShadowRuntime,
+    SectorShadowSnapshot,
+    ShadowDiagnosticsView,
+)
 from app.services.session_ohlc_evidence_observer import SessionOhlcEvidenceObserver
 from app.services.session_statistics_driver import (
     DrivenSessionStatisticsRefresh,
@@ -897,6 +905,21 @@ class LiveMarketRuntime:
     def sector_shadow(self) -> SectorShadowRuntime | None:
         """The passive sector shadow runtime, or ``None`` when disabled."""
         return self._sector_shadow
+
+    def sector_shadow_snapshot(self) -> SectorShadowSnapshot | None:
+        """Return the shadow runtime's latest-good snapshot (read-only; never recomputes)."""
+        return self._sector_shadow.latest_snapshot() if self._sector_shadow is not None else None
+
+    def sector_shadow_diagnostics(self) -> ShadowDiagnosticsView | None:
+        """Return the shadow runtime's bounded diagnostics, or ``None`` when disabled."""
+        return self._sector_shadow.diagnostics() if self._sector_shadow is not None else None
+
+    def live_feed_decode_diagnostics(self) -> LiveFeedDecodeDiagnostics | None:
+        """Return the provider's bounded live-frame decode diagnostics, if it exposes them."""
+        source = self._live_market_data
+        if isinstance(source, LiveFeedDiagnosticsSource):
+            return source.live_feed_decode_diagnostics()
+        return None
 
     def _on_evidence_observer_done(self, task: asyncio.Task[None]) -> None:
         """Observe evidence-observer driver completion. Cancellation is the normal shutdown path.

@@ -21,6 +21,7 @@ from app.adapters.base.errors import (
     UnknownProviderReferenceError,
     UnsupportedProviderRequestError,
 )
+from app.adapters.base.live_feed_diagnostics import LiveFeedDecodeDiagnostics
 from app.adapters.dhan.models import DhanInstrumentReference
 from app.schemas.market_data import (
     DepthLevel,
@@ -538,3 +539,85 @@ def _reference_sort_key(reference: DhanInstrumentReference) -> tuple[str, str, s
     """Order provider requests independently of consumer request ordering."""
     instrument = reference.instrument
     return (instrument.exchange, instrument.symbol, reference.security_id)
+
+
+# Bounded, read-only decode diagnostics (SECTOR-VIEW-1D). Attributes each discarded frame to
+# a cause and a response code so "malformed" frames can be root-caused without logging binary
+# payloads. Cardinality is bounded: response codes are one byte; length labels are capped.
+_DECODE_MAX_LENGTH_KEYS = 32
+
+
+class DhanLiveDecodeCounters:
+    """Mutable, bounded counters over live-frame decode outcomes (no payloads retained)."""
+
+    def __init__(self) -> None:
+        self._frames_total = 0
+        self._decoded_total = 0
+        self._non_binary = 0
+        self._prev_close_seen = 0
+        self._prev_close_failed = 0
+        self._by_rc: dict[int, int] = {}
+        self._fail_by_rc: dict[int, int] = {}
+        self._fail_by_len: dict[str, int] = {}
+        self._failure_kinds: dict[str, int] = {
+            "normalization": 0,
+            "unsupported_code": 0,
+            "unknown_reference": 0,
+        }
+
+    @staticmethod
+    def _peek(packet: bytes) -> tuple[int | None, int]:
+        """Cheaply read the response code (header byte 0) and length; no full decode."""
+        length = len(packet)
+        if length < _HEADER.size:
+            return None, length
+        return packet[0], length
+
+    def _bump(self, table: dict[int, int], key: int) -> None:
+        table[key] = table.get(key, 0) + 1
+
+    def record_non_binary(self) -> None:
+        """Count a non-binary frame (never a valid market frame)."""
+        self._frames_total += 1
+        self._non_binary += 1
+
+    def record(self, packet: bytes, *, kind: str) -> None:
+        """Count one decode outcome (decoded / normalization / unsupported_code / unknown_ref)."""
+        response_code, length = self._peek(packet)
+        self._frames_total += 1
+        if response_code is not None:
+            self._bump(self._by_rc, response_code)
+            if response_code == _PREVIOUS_CLOSE_RESPONSE_CODE:
+                self._prev_close_seen += 1
+        if kind == "decoded":
+            self._decoded_total += 1
+            return
+        self._failure_kinds[kind] = self._failure_kinds.get(kind, 0) + 1
+        if response_code is not None:
+            self._bump(self._fail_by_rc, response_code)
+            if response_code == _PREVIOUS_CLOSE_RESPONSE_CODE:
+                self._prev_close_failed += 1
+        self._record_length(length)
+
+    def _record_length(self, length: int) -> None:
+        label = str(length)
+        if label not in self._fail_by_len and len(self._fail_by_len) >= _DECODE_MAX_LENGTH_KEYS:
+            label = "other"
+        self._fail_by_len[label] = self._fail_by_len.get(label, 0) + 1
+
+    def snapshot(self) -> LiveFeedDecodeDiagnostics:
+        """Return an immutable copy of the current counters."""
+        return LiveFeedDecodeDiagnostics(
+            frames_total=self._frames_total,
+            decoded_total=self._decoded_total,
+            failures_total=sum(self._failure_kinds.values()) + self._non_binary,
+            normalization_failures=self._failure_kinds["normalization"],
+            unsupported_code_failures=self._failure_kinds["unsupported_code"],
+            unknown_reference_failures=self._failure_kinds["unknown_reference"],
+            non_binary_frames=self._non_binary,
+            previous_close_frames_seen=self._prev_close_seen,
+            previous_close_frames_failed=self._prev_close_failed,
+            frames_by_response_code=dict(self._by_rc),
+            failures_by_response_code=dict(self._fail_by_rc),
+            failures_by_length_bucket=dict(self._fail_by_len),
+        )
