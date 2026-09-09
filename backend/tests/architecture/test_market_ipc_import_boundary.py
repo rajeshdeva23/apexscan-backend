@@ -75,3 +75,19 @@ def test_domain_layers_do_not_import_ipc() -> None:
             if hits:
                 offenders[str(path)] = sorted(set(hits))
     assert offenders == {}, f"IPC leaked into an IPC-unaware domain layer: {offenders}"
+
+
+def test_shadow_consumer_is_not_constructed_by_composition() -> None:
+    """Phase C is shadow-only: no production module (outside market_ipc) may build the consumer.
+
+    The Redis consumer must be reachable only through explicit test/offline composition — never
+    wired into backend startup — so merging Phase C activates no consumer and does not begin the
+    (forbidden) Redis -> backend -> TickEngine cutover.
+    """
+    constructors: list[str] = []
+    for path in sorted(_APP_ROOT.rglob("*.py")):
+        if path.is_relative_to(_APP_ROOT / "market_ipc"):
+            continue
+        if "MarketEventConsumer(" in path.read_text(encoding="utf-8"):
+            constructors.append(str(path))
+    assert constructors == [], f"shadow consumer constructed in composition: {constructors}"

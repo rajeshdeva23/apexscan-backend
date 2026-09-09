@@ -10,6 +10,13 @@ the existing in-process ingestion path remains the sole authority.
 from __future__ import annotations
 
 from app.market_ipc.config import MarketIpcConfig
+from app.market_ipc.consumer import (
+    ConsumerDiagnostics,
+    MarketEventConsumer,
+    MessageOutcome,
+    RecordingShadowSink,
+    ShadowMarketEventSink,
+)
 from app.market_ipc.dedup import BoundedDeduplicator
 from app.market_ipc.envelope import (
     FEED_WIDE_IDENTITY,
@@ -66,6 +73,7 @@ __all__ = [
     "BoundedDeduplicator",
     "CompactedReferenceState",
     "CompactedReferenceStore",
+    "ConsumerDiagnostics",
     "EpochAllocator",
     "EventKind",
     "EventPriority",
@@ -73,16 +81,20 @@ __all__ = [
     "InMemoryCompactedReferenceStore",
     "InMemoryMarketEventStream",
     "IpcPayload",
+    "MarketEventConsumer",
     "MarketEventEnvelope",
     "MarketEventPublisher",
     "MarketEventStream",
     "MarketIpcConfig",
+    "MessageOutcome",
     "ProducerEventIdentity",
     "PublishOutcome",
     "PublisherDiagnostics",
+    "RecordingShadowSink",
     "RedisEpochAllocator",
     "RedisMarketEventStream",
     "RedisPublishError",
+    "ShadowMarketEventSink",
     "StaticUniverseVersion",
     "TradingDateSource",
     "UniverseVersionComparison",

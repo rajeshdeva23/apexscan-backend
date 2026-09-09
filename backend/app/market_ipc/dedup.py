@@ -36,6 +36,22 @@ class BoundedDeduplicator:
             self._seen.popitem(last=False)
         return False
 
+    def contains(self, identity: ProducerEventIdentity) -> bool:
+        """Read-only membership test — does NOT record (used before shadow application).
+
+        The consumer must not mark an identity seen until its shadow application succeeds;
+        otherwise a redelivery after a failed apply would be discarded (silent loss). Pair
+        this with :meth:`record` committed only after successful terminal handling.
+        """
+        return identity in self._seen
+
+    def record(self, identity: ProducerEventIdentity) -> None:
+        """Commit ``identity`` as seen (after successful application), evicting the oldest."""
+        self._seen[identity] = None
+        self._seen.move_to_end(identity)
+        if len(self._seen) > self._max_entries:
+            self._seen.popitem(last=False)
+
     def seen_envelope(self, envelope: MarketEventEnvelope) -> bool:
         """Convenience: dedup directly from an envelope's identity."""
         return self.is_duplicate(ProducerEventIdentity.from_envelope(envelope))
