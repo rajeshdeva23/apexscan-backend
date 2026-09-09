@@ -21,6 +21,8 @@ class LiveFeedDecodeDiagnostics:
     fixed set of length labels. No instrument-level or unbounded history is retained.
     """
 
+    websocket_messages_total: int = 0
+    framing_failures: int = 0
     frames_total: int = 0
     decoded_total: int = 0
     failures_total: int = 0

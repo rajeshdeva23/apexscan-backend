@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -298,6 +299,34 @@ def decode_standard_live_packet(
     raise UnsupportedProviderRequestError()
 
 
+def iter_standard_live_packets(message: bytes) -> Iterator[bytes]:
+    """Split one WebSocket binary message into its stacked provider packets by header length.
+
+    Dhan stacks multiple provider packets in a single WebSocket message ("stacked one after
+    another ... break down the packet on the basis of length" — DhanHQ v2 live-market-feed
+    docs). Each packet's header carries its own total ``message_length`` (8-byte header +
+    payload); this walks the buffer packet by packet using that length.
+
+    Yields each packet slice in wire order. Raises :class:`NormalizationError` at a framing
+    boundary that cannot be delimited (a trailing run shorter than a header, a length below the
+    header size, or a packet extending past the buffer) — the caller keeps any packets already
+    yielded and drops only the undelimitable remainder.
+    """
+    offset = 0
+    total = len(message)
+    while offset < total:
+        if total - offset < _HEADER.size:
+            raise NormalizationError()
+        message_length = _HEADER.unpack_from(message, offset)[1]
+        if message_length < _HEADER.size:
+            raise NormalizationError()
+        end = offset + message_length
+        if end > total:
+            raise NormalizationError()
+        yield message[offset:end]
+        offset = end
+
+
 def _decode_quote_packet(
     packet: bytes,
     reference: DhanInstrumentReference,
@@ -551,7 +580,9 @@ class DhanLiveDecodeCounters:
     """Mutable, bounded counters over live-frame decode outcomes (no payloads retained)."""
 
     def __init__(self) -> None:
-        self._frames_total = 0
+        self._messages_total = 0  # WebSocket binary messages (each may stack N packets)
+        self._framing_failures = 0  # messages with an undelimitable trailing remainder
+        self._frames_total = 0  # provider packets (post-framing)
         self._decoded_total = 0
         self._non_binary = 0
         self._prev_close_seen = 0
@@ -565,6 +596,14 @@ class DhanLiveDecodeCounters:
             "unknown_reference": 0,
         }
 
+    def record_message(self) -> None:
+        """Count one received WebSocket binary message (before framing)."""
+        self._messages_total += 1
+
+    def record_framing_failure(self) -> None:
+        """Count one message whose trailing bytes could not be delimited into a packet."""
+        self._framing_failures += 1
+
     @staticmethod
     def _peek(packet: bytes) -> tuple[int | None, int]:
         """Cheaply read the response code (header byte 0) and length; no full decode."""
@@ -577,8 +616,7 @@ class DhanLiveDecodeCounters:
         table[key] = table.get(key, 0) + 1
 
     def record_non_binary(self) -> None:
-        """Count a non-binary frame (never a valid market frame)."""
-        self._frames_total += 1
+        """Count a non-binary WebSocket message (never a valid market frame)."""
         self._non_binary += 1
 
     def record(self, packet: bytes, *, kind: str) -> None:
@@ -608,6 +646,8 @@ class DhanLiveDecodeCounters:
     def snapshot(self) -> LiveFeedDecodeDiagnostics:
         """Return an immutable copy of the current counters."""
         return LiveFeedDecodeDiagnostics(
+            websocket_messages_total=self._messages_total,
+            framing_failures=self._framing_failures,
             frames_total=self._frames_total,
             decoded_total=self._decoded_total,
             failures_total=sum(self._failure_kinds.values()) + self._non_binary,

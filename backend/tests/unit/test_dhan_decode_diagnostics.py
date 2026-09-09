@@ -61,7 +61,7 @@ def test_non_binary_frame_counted() -> None:
     snap = counters.snapshot()
     assert snap.non_binary_frames == 1
     assert snap.failures_total == 1
-    assert snap.frames_total == 1
+    assert snap.frames_total == 0  # provider-packet count; a non-binary message has no packets
 
 
 def test_length_buckets_are_bounded() -> None:
