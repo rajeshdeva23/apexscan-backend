@@ -38,6 +38,12 @@ class CompactedReferenceState(BaseModel):
 
     Every price field is optional and is set only once its canonical value has arrived; this
     model never derives, infers, or substitutes a value (notably ``session_open``).
+
+    Carries producer provenance ``(producer_id, producer_epoch, producer_sequence)`` and
+    ``universe_version`` (Phase D): compaction is monotonic by ``(producer_epoch,
+    producer_sequence)`` so a stale/replayed update never overwrites newer state, and recovery
+    can gate on universe version. Provenance records where in producer ordering the state came
+    from — it is never a fabricated price.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, str_strip_whitespace=True)
@@ -45,6 +51,10 @@ class CompactedReferenceState(BaseModel):
     instrument_identity: str = Field(min_length=1, max_length=128)
     trading_date: date
     updated_at: datetime
+    universe_version: int = Field(ge=0)
+    producer_id: str = Field(min_length=1, max_length=128)
+    producer_epoch: int = Field(ge=0)
+    producer_sequence: int = Field(ge=0)
     previous_close: Decimal | None = Field(default=None, gt=0)
     session_open: Decimal | None = Field(default=None, gt=0)
     session_high: Decimal | None = Field(default=None, gt=0)
@@ -52,6 +62,11 @@ class CompactedReferenceState(BaseModel):
     session_close: Decimal | None = Field(default=None, gt=0)
 
     _validate_updated_at = field_validator("updated_at")(_require_aware)
+
+    @property
+    def ordering(self) -> tuple[int, int]:
+        """Monotonic compaction key within a producer lineage (epoch, then sequence)."""
+        return (self.producer_epoch, self.producer_sequence)
 
 
 def reference_key(prefix: str, trading_date: date) -> str:
