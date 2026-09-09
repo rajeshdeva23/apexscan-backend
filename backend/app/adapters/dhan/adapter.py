@@ -53,6 +53,7 @@ from app.adapters.dhan.live import (
     decode_standard_live_packet,
     encode_live_disconnect_request,
     encode_live_request,
+    iter_standard_live_packets,
     plan_live_subscription_batches,
 )
 from app.adapters.dhan.models import (
@@ -498,16 +499,31 @@ class DhanRestAdapter(
         )
         self._suspect_stale_logged = True
 
-    def _decode_live_frame(self, packet: bytes | str) -> tuple[MarketData, ...] | None:
-        """Decode one frame, recording bounded diagnostics; ``None`` if discarded.
+    def _decode_live_frame(self, message: bytes | str) -> tuple[MarketData, ...] | None:
+        """Split one WebSocket message into its stacked packets and decode each.
 
-        Malformed, unsupported, or unresolvable frames are counted (by cause and response
-        code) and dropped so the stream keeps processing later valid frames (05 §12.2).
+        Dhan stacks multiple provider packets per WebSocket message (DhanHQ v2 live-market-feed:
+        "break down the packet on the basis of length"). This frames the message by header length
+        and decodes each packet independently, so a later malformed/unsupported/unresolvable
+        packet never discards the earlier valid packets in the same message (05 §12.2). Returns
+        the collected canonical events (possibly empty); ``None`` only for a non-binary message.
         """
-        if not isinstance(packet, bytes):
+        self._decode_counters.record_message()
+        if not isinstance(message, bytes):
             self._decode_counters.record_non_binary()
             logger.warning("Discarded a non-binary Dhan live frame")
             return None
+        events: list[MarketData] = []
+        try:
+            for packet in iter_standard_live_packets(message):
+                events.extend(self._decode_one_packet(packet))
+        except NormalizationError:
+            self._decode_counters.record_framing_failure()
+            logger.warning("Discarded an undelimitable Dhan live message tail")
+        return tuple(events)
+
+    def _decode_one_packet(self, packet: bytes) -> tuple[MarketData, ...]:
+        """Decode a single framed provider packet, counting its outcome by cause + response code."""
         try:
             events = decode_standard_live_packet(packet, self._live_cash_references)
         except (
@@ -516,8 +532,8 @@ class DhanRestAdapter(
             UnknownProviderReferenceError,
         ) as error:
             self._decode_counters.record(packet, kind=_DECODE_FAILURE_KINDS[type(error)])
-            logger.warning("Discarded a malformed Dhan live frame")
-            return None
+            logger.warning("Discarded a malformed Dhan live packet")
+            return ()
         self._decode_counters.record(packet, kind="decoded")
         return events
 

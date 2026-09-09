@@ -173,6 +173,9 @@ def _live_feed_dump(live_feed: LiveFeedDecodeDiagnostics | None) -> dict[str, An
     if live_feed is None:
         return None
     return {
+        "websocket_messages_total": live_feed.websocket_messages_total,
+        "framing_failures": live_feed.framing_failures,
+        "provider_packets_total": live_feed.frames_total,
         "frames_total": live_feed.frames_total,
         "decoded_total": live_feed.decoded_total,
         "failures_total": live_feed.failures_total,
