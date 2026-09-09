@@ -105,8 +105,12 @@ class RedisMarketEventStream:
         )
 
     async def claim_stale(self) -> list[DeliveredEvent]:
-        """XAUTOCLAIM events idle past the configured threshold (redelivery)."""
-        _cursor, messages, _deleted = await self._redis.xautoclaim(
+        """XAUTOCLAIM events idle past the configured threshold (redelivery).
+
+        XAUTOCLAIM returns ``(cursor, messages)`` on Redis 6.2 and ``(cursor, messages,
+        deleted)`` on Redis >= 7.0; index the messages positionally to support both.
+        """
+        response = await self._redis.xautoclaim(
             self._config.stream_name,
             self._config.consumer_group,
             self._config.consumer_name,
@@ -114,6 +118,7 @@ class RedisMarketEventStream:
             start_id="0-0",
             count=self._config.read_count,
         )
+        messages = response[1]
         return [_decode_entry(message_id, fields) for message_id, fields in messages]
 
 

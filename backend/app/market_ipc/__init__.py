@@ -25,6 +25,7 @@ from app.market_ipc.envelope import (
     identity_string_for,
     is_stale_trading_date,
 )
+from app.market_ipc.epoch import EPOCH_KEY_PREFIX, EpochAllocator, RedisEpochAllocator
 from app.market_ipc.events import (
     EventKind,
     EventPriority,
@@ -33,6 +34,14 @@ from app.market_ipc.events import (
     encode_payload,
     event_kind_for,
     priority_for,
+)
+from app.market_ipc.publisher import (
+    MarketEventPublisher,
+    PublisherDiagnostics,
+    PublishOutcome,
+    StaticUniverseVersion,
+    TradingDateSource,
+    UniverseVersionSource,
 )
 from app.market_ipc.state import (
     CompactedReferenceState,
@@ -50,12 +59,14 @@ from app.market_ipc.transport import (
 )
 
 __all__ = [
+    "EPOCH_KEY_PREFIX",
     "FEED_WIDE_IDENTITY",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "BoundedDeduplicator",
     "CompactedReferenceState",
     "CompactedReferenceStore",
+    "EpochAllocator",
     "EventKind",
     "EventPriority",
     "IngestionHealthState",
@@ -63,12 +74,19 @@ __all__ = [
     "InMemoryMarketEventStream",
     "IpcPayload",
     "MarketEventEnvelope",
+    "MarketEventPublisher",
     "MarketEventStream",
     "MarketIpcConfig",
     "ProducerEventIdentity",
+    "PublishOutcome",
+    "PublisherDiagnostics",
+    "RedisEpochAllocator",
     "RedisMarketEventStream",
     "RedisPublishError",
+    "StaticUniverseVersion",
+    "TradingDateSource",
     "UniverseVersionComparison",
+    "UniverseVersionSource",
     "build_envelope",
     "compare_universe_version",
     "decode_envelope",
