@@ -14,15 +14,20 @@ new version). ``active_for`` selects by effective trading date, never "latest cr
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from pydantic import ValidationError
+
 from app.market_universe.resolver import ResolutionResult, validate_promotable
 from app.market_universe.snapshot import UniverseSnapshot
 
 _MAX_ALLOCATION_RETRIES = 64  # bounded retries under concurrent version allocation
+
+logger = logging.getLogger(__name__)
 
 
 class SnapshotNotFoundError(LookupError):
@@ -146,17 +151,32 @@ class FileUniverseSnapshotStore:
         return tuple(sorted(self._existing_versions()))
 
     def _existing_versions(self) -> list[int]:
-        return [int(path.stem) for path in self._versions_dir.glob("*.json")]
+        versions: list[int] = []
+        for path in self._versions_dir.glob("*.json"):
+            if path.stem.isdigit():  # ignore non-version files so allocation never crashes
+                versions.append(int(path.stem))
+        return versions
 
     def _next_version(self) -> int:
         versions = self._existing_versions()
         return max(versions) + 1 if versions else 1
 
     def _iter_promoted(self) -> list[UniverseSnapshot]:
-        return [
-            UniverseSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
-            for path in self._versions_dir.glob("*.json")
-        ]
+        """Load all parseable promoted snapshots; skip (and log) any corrupt version file.
+
+        A single corrupt/tampered artifact must not crash every ``active_for`` lookup forever —
+        scans return the best valid snapshot rather than raising. An explicit ``get_by_version``
+        still surfaces a corrupt file loudly.
+        """
+        snapshots: list[UniverseSnapshot] = []
+        for path in self._versions_dir.glob("*.json"):
+            try:
+                snapshots.append(
+                    UniverseSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
+                )
+            except (ValidationError, OSError):
+                logger.warning("skipping unreadable universe snapshot artifact: %s", path.name)
+        return snapshots
 
     def _find_by_content(self, content_sha256: str) -> UniverseSnapshot | None:
         for snapshot in self._iter_promoted():

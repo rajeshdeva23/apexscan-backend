@@ -221,3 +221,18 @@ def test_promote_empty_universe_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(EmptyUniverseError):
         store.promote(empty, effective_at=_EFFECTIVE_AT)
     assert store.list_versions() == ()
+
+
+def test_corrupt_artifact_does_not_break_active_lookup(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.promote(_resolve(["A"], trading_date=date(2026, 9, 9)), effective_at=_EFFECTIVE_AT)
+    # a corrupt/tampered artifact (incl. a non-version filename) must not crash lookups/allocation
+    (tmp_path / "universe" / "versions" / "corrupt.json").write_text("not-json")
+    (tmp_path / "universe" / "versions" / "3.json").write_text("also-not-json")
+    active = store.active_for(date(2026, 9, 9))
+    assert active is not None and active.universe_version == 1  # best valid snapshot still resolves
+    # a new promotion still succeeds; numeric corrupt slot (3) not reused, non-numeric ignored
+    promoted = store.promote(
+        _resolve(["A", "B"], trading_date=date(2026, 9, 10)), effective_at=_EFFECTIVE_AT
+    )
+    assert promoted.universe_version == 4  # max(valid 1, corrupt 3) + 1; corrupt slot never reused
