@@ -44,6 +44,7 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.14",
     "pip-audit>=2.9,<3",
+    "redislite>=6.2",  # disposable real redis-server for IPC transport integration tests
 ]
 
 [tool.ruff]

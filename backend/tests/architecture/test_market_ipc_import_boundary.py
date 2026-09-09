@@ -55,12 +55,23 @@ def test_canonical_domain_does_not_depend_on_transport() -> None:
     assert not any(_matches(m, "app.market_ipc") for m in modules)
 
 
-def test_application_composition_does_not_activate_ipc() -> None:
-    activators: dict[str, list[str]] = {}
-    for path in sorted(_APP_ROOT.rglob("*.py")):
-        if path.is_relative_to(_APP_ROOT / "market_ipc"):
-            continue
-        hits = [m for m in _modules(path) if _matches(m, "app.market_ipc")]
-        if hits:
-            activators[str(path)] = sorted(set(hits))
-    assert activators == {}, f"Phase A must not be wired into composition, but: {activators}"
+# Only the runtime/composition seam may reference market_ipc (Phase B wires the shadow
+# publisher into the LiveMarketRuntime). The domain layers below must stay IPC-unaware so a
+# future transport/provider swap never reaches sector/strategy/scanner/adapter code.
+_IPC_UNAWARE_LAYERS = (
+    _APP_ROOT / "adapters",
+    _APP_ROOT / "market_intelligence" / "sector",
+    _APP_ROOT / "strategies",
+    _APP_ROOT / "strategy_manager",
+    _APP_ROOT / "market_engine",
+)
+
+
+def test_domain_layers_do_not_import_ipc() -> None:
+    offenders: dict[str, list[str]] = {}
+    for layer in _IPC_UNAWARE_LAYERS:
+        for path in sorted(layer.rglob("*.py")):
+            hits = [m for m in _modules(path) if _matches(m, "app.market_ipc")]
+            if hits:
+                offenders[str(path)] = sorted(set(hits))
+    assert offenders == {}, f"IPC leaked into an IPC-unaware domain layer: {offenders}"

@@ -42,6 +42,7 @@ from app.market_engine.session import MarketSessionClassifier, SessionSchedule, 
 from app.market_engine.session_statistics import SessionStatisticsAuthority
 from app.market_engine.state import InstrumentStateRegistry
 from app.market_engine.tick_engine import TickEngine
+from app.market_ipc import MarketEventPublisher
 from app.schemas.market_data import (
     FeedContinuityEvent,
     Instrument,
@@ -324,6 +325,7 @@ class LiveMarketRuntime:
         ingestion_recovery_policy: IngestionRecoveryPolicy | None = None,
         ingestion_sleep: Callable[[float], Awaitable[None]] | None = None,
         ingestion_random: Callable[[], float] | None = None,
+        market_event_publisher: MarketEventPublisher | None = None,
     ) -> None:
         """Compose the shared runtime core (no provider I/O in the constructor).
 
@@ -382,6 +384,10 @@ class LiveMarketRuntime:
                 ``asyncio.sleep``); overridden in tests for determinism.
             ingestion_random: Injected ``[0, 1)`` source for backoff jitter (defaults to
                 ``random.random``); overridden in tests for determinism.
+            market_event_publisher: Optional non-authoritative shadow IPC publisher (PHASE B).
+                ``None`` (default) keeps the runtime byte-for-byte unchanged; when present, each
+                canonical datum is additionally published to the IPC stream after authoritative
+                dispatch, and a publisher failure never disrupts the in-process pipeline.
 
         Raises:
             ValueError: If ``error_threshold`` is not positive (from the manager).
@@ -395,6 +401,7 @@ class LiveMarketRuntime:
         self._recovery_policy = ingestion_recovery_policy or IngestionRecoveryPolicy()
         self._ingestion_sleep: Callable[[float], Awaitable[None]] = ingestion_sleep or asyncio.sleep
         self._ingestion_random: Callable[[], float] = ingestion_random or random.random
+        self._market_event_publisher = market_event_publisher  # off by default; shadow-only
         self._ingestion_state = IngestionState.STOPPED
         self._last_rx_at: datetime | None = None
         self._rx_since_start = False
@@ -522,6 +529,7 @@ class LiveMarketRuntime:
         self._state = RuntimeState.STARTED
         for strategy_id in self._autostart_strategy_ids:
             await self._start_strategy(strategy_id)  # warm requirements before ingestion (D10)
+        await self._start_market_event_publisher()
         if self._live_market_data is not None and self._instruments:
             self._ingestion_state = IngestionState.STARTING  # visible before the task first runs
             self._ingestion_task = asyncio.create_task(self._supervise_ingestion())
@@ -640,6 +648,8 @@ class LiveMarketRuntime:
         request = SubscriptionRequest(instruments=self._instruments, data_types=_LIVE_DATA_TYPES)
         async for datum in self._live_market_data.stream_market_data(request):
             self._dispatch(datum)
+            if self._market_event_publisher is not None:
+                await self._publish_shadow(datum)
 
     def _dispatch(self, datum: MarketData) -> None:
         """Route one canonical datum to the TickEngine, fail-closed on an unsupported type."""
@@ -651,6 +661,35 @@ class LiveMarketRuntime:
         raise UnsupportedLiveDatumError(
             f"live stream yielded an unprocessable datum: {type(datum).__name__}"
         )
+
+    async def _start_market_event_publisher(self) -> None:
+        """Activate the shadow IPC publisher if composed; degrade safely on failure.
+
+        The publisher is non-authoritative. If epoch allocation or stream setup fails (e.g. Redis
+        down), the publisher is disabled and the authoritative in-process path continues — a
+        shadow publisher must never fabricate/reuse an epoch nor block ingestion.
+        """
+        if self._market_event_publisher is None:
+            return
+        try:
+            await self._market_event_publisher.start()
+        except Exception:
+            logger.exception("shadow IPC publisher failed to start; disabling shadow publishing")
+            self._market_event_publisher = None
+
+    async def _publish_shadow(self, datum: MarketData) -> None:
+        """Publish a non-authoritative shadow copy; isolate any failure from the live path.
+
+        ``publish`` is no-raise by contract; this guard is defence-in-depth so an unexpected
+        publisher fault can never disrupt the authoritative TickEngine/EventBus pipeline.
+        """
+        publisher = self._market_event_publisher
+        if publisher is None:
+            return
+        try:
+            await publisher.publish(datum)
+        except Exception:  # noqa: BLE001 - shadow publishing never disrupts the live path
+            logger.exception("shadow IPC publish raised unexpectedly; ignoring (non-authoritative)")
 
     def _on_ingestion_done(self, task: asyncio.Task[None]) -> None:
         """Observe the ingestion **supervisor** task completing.
