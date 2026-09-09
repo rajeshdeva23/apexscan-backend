@@ -308,7 +308,14 @@ def test_config_defaults_and_bounds() -> None:
 # --------------------------------------------------------------------------- #
 def _ref_state(td: date = _TD, **fields) -> CompactedReferenceState:
     return CompactedReferenceState(
-        instrument_identity="NSE:TCS", trading_date=td, updated_at=_TS, **fields
+        instrument_identity="NSE:TCS",
+        trading_date=td,
+        updated_at=_TS,
+        universe_version=7,
+        producer_id="market-ingestion",
+        producer_epoch=1,
+        producer_sequence=1,
+        **fields,
     )
 
 

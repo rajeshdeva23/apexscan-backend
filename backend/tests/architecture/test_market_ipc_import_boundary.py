@@ -91,3 +91,21 @@ def test_shadow_consumer_is_not_constructed_by_composition() -> None:
         if "MarketEventConsumer(" in path.read_text(encoding="utf-8"):
             constructors.append(str(path))
     assert constructors == [], f"shadow consumer constructed in composition: {constructors}"
+
+
+def test_reference_recovery_is_not_constructed_by_composition() -> None:
+    """Phase D is inert: no production module builds the reference writer/loader/store.
+
+    Compacted reference recovery must be reachable only through explicit test/offline
+    composition, so merging Phase D activates no Redis writes or loads.
+    """
+    inert = ("ReferenceStateWriter(", "ReferenceStateLoader(", "RedisCompactedReferenceStore(")
+    constructors: dict[str, list[str]] = {}
+    for path in sorted(_APP_ROOT.rglob("*.py")):
+        if path.is_relative_to(_APP_ROOT / "market_ipc"):
+            continue
+        text = path.read_text(encoding="utf-8")
+        hits = [name for name in inert if name in text]
+        if hits:
+            constructors[str(path)] = hits
+    assert constructors == {}, f"reference recovery constructed in composition: {constructors}"

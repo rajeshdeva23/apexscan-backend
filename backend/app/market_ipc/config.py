@@ -27,6 +27,7 @@ class MarketIpcConfig(BaseModel):
     claim_idle_ms: int = Field(default=30_000, ge=1_000, le=600_000)
     dedup_max_entries: int = Field(default=100_000, ge=1_000, le=10_000_000)
     max_payload_bytes: int = Field(default=65_536, ge=256, le=262_144)
+    reference_ttl_seconds: int = Field(default=604_800, ge=3_600, le=2_592_000)  # 7d; 1h..30d
 
     @field_validator(
         "stream_name",
