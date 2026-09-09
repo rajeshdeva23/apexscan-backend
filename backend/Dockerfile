@@ -23,6 +23,13 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 # Copy application source.
 COPY . .
 
+# Immutable build identity: the deploy pipeline passes the exact Git SHA
+# (`--build-arg BUILD_SHA=<sha>`); the app reports it at GET /version so the
+# running artifact is traceable to a commit. Defaults to "unknown" for local
+# builds. No git metadata is required inside the container.
+ARG BUILD_SHA=unknown
+ENV BUILD_SHA=${BUILD_SHA}
+
 EXPOSE 8000
 
 # Start the ASGI server. Reload is enabled via compose override in dev.

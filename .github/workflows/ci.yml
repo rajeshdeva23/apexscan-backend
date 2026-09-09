@@ -35,7 +35,7 @@ jobs:
         run: python -m ruff check .
 
       - name: Type-check
-        run: python -m mypy app
+        run: python -m mypy app deploy
 
       - name: Test
         run: python -m pytest

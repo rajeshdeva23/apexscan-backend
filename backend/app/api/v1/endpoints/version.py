@@ -21,10 +21,13 @@ async def version(settings: SettingsDep) -> dict[str, str]:
         settings: Injected application settings.
 
     Returns:
-        Mapping of application name, semantic version, and environment.
+        Mapping of application name, semantic version, environment, and the
+        immutable build SHA of the running artifact (``unknown`` outside the
+        deployment pipeline).
     """
     return {
         "name": settings.app_name,
         "version": settings.app_version,
         "environment": settings.app_env,
+        "build_sha": settings.build_sha,
     }

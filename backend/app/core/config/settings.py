@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development")
     app_debug: bool = Field(default=True)
     app_version: str = Field(default="0.1.0")
+    # Immutable Git commit the running artifact was built from (env ``BUILD_SHA``,
+    # injected at image build time). ``unknown`` when built outside the pipeline;
+    # the deploy pipeline verifies this matches the promoted SHA after rollout.
+    build_sha: str = Field(default="unknown")
     api_v1_prefix: str = Field(default="/api/v1")
     log_level: str = Field(default="INFO")
 

@@ -82,6 +82,9 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Make the repo-local ``deploy`` tooling package importable in tests without
+# packaging it into the app wheel (see [tool.setuptools.packages.find]).
+pythonpath = ["."]
 markers = [
     "integration: requires real PostgreSQL and Redis with APEXSCAN_RUN_INTEGRATION=1",
     "live_dhan: requires explicit Dhan credentials and APEXSCAN_DHAN_LIVE_SMOKE=1",

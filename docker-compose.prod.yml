@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# ApexScan — production overlay (DEPLOY-1).
+#
+# Applied ON TOP of docker-compose.yml on the production host:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     pull backend
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     up -d --no-build backend
+#
+# It makes the backend consume an IMMUTABLE, pre-built, SHA/digest-pinned image
+# from the registry instead of building source on the host. It never builds and
+# never bind-mounts source — `docker compose up --build` is a developer-only
+# path (docker-compose.yml) and must never run against production (§19).
+#
+# APEXSCAN_IMAGE must be a digest-pinned reference, e.g.
+#   ghcr.io/rajeshdeva23/apexscan-backend@sha256:<digest>
+# The deploy pipeline resolves the digest for the promoted Git SHA and exports
+# it; there is no ":latest" production identity (§5).
+#
+# Requires Docker Compose v2.24+ for the `!reset` tag used to drop the
+# developer bind-mount and build stanza inherited from the base file.
+# ---------------------------------------------------------------------------
+
+services:
+  backend:
+    # Immutable, digest-pinned artifact. Fail closed if unset (no accidental
+    # build/latest). The deploy pipeline always provides it.
+    image: ${APEXSCAN_IMAGE:?APEXSCAN_IMAGE must be a digest-pinned registry reference}
+    # Drop the base file's local build — production never builds from source.
+    build: !reset null
+    # Drop the base file's `./backend:/app` developer bind-mount so the image's
+    # own baked source (and its BUILD_SHA) is authoritative in production.
+    volumes: !reset []
+    pull_policy: always
+    restart: unless-stopped
