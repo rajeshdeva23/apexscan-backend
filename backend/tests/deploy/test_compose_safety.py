@@ -1,15 +1,13 @@
-"""Compose safety: dev builds from source, production consumes immutable images.
+"""Compose safety: dev builds from source; production consumes immutable images.
 
-Guards §19 — the developer ``docker compose up --build`` primitive can never be
-the production path, and the production overlay never builds or bind-mounts
-source.
+Guards §19/§20 — the developer ``docker compose up --build`` primitive can never
+be the production path, and the production authority
+(``docker-compose.production.yml``) never builds or bind-mounts source.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-
-import yaml
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -24,34 +22,22 @@ def _directives(rel: str) -> str:
     return "\n".join(line for line in lines if line.strip() and not line.strip().startswith("#"))
 
 
-def test_base_compose_is_developer_build() -> None:
-    base = yaml.safe_load(_text("docker-compose.yml"))
-    backend = base["services"]["backend"]
-    assert "build" in backend  # dev builds from local source
-    assert "./backend:/app" in backend["volumes"]  # dev source bind-mount
+def test_legacy_prod_overlay_is_retired() -> None:
+    assert not (_ROOT / "docker-compose.prod.yml").exists()
 
 
-def test_prod_overlay_consumes_immutable_image_only() -> None:
-    # The overlay uses Compose's !reset tag (not valid for safe_load), so assert
-    # on its text contract.
-    overlay = _directives("docker-compose.prod.yml")
-    assert "image: ${APEXSCAN_IMAGE" in overlay
-    assert "build: !reset null" in overlay  # base build dropped
-    assert "volumes: !reset []" in overlay  # base source bind-mount dropped
-    assert "context:" not in overlay  # never builds from source
-    assert "--build" not in overlay
-
-
-def test_dev_script_never_uses_production_overlay() -> None:
+def test_dev_script_never_uses_production_authority() -> None:
     dev = _text("scripts/dev.sh")
     assert "docker compose up --build" in dev
-    assert "docker-compose.prod.yml" not in dev  # dev never touches the prod overlay
+    assert "docker-compose.production.yml" not in dev  # dev never touches production
+    assert "docker-compose.prod.yml" not in dev
 
 
 def test_remote_update_pulls_immutable_and_never_builds() -> None:
     script = _directives("scripts/deploy/remote_update.sh")
-    assert "docker-compose.prod.yml" in script
-    assert "--no-build" in script
+    assert "docker-compose.production.yml" in script
+    assert "-p apexscan" in script  # project identity pinned
+    assert "--no-deps" in script and "--no-build" in script
     assert "--build" not in script.replace("--no-build", "")  # only --no-build, never --build
     assert "alembic" not in script  # no migrations in the deploy path
     assert "APEXSCAN_IMAGE" in script

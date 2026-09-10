@@ -86,3 +86,19 @@ jobs:
           echo "Built ${IMAGE_NAME}:${GITHUB_SHA}"
           echo "Digest: ${{ steps.build.outputs.digest }}"
           echo "image=${IMAGE_NAME}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Package the production Compose authority (docker-compose.production.yml)
+      # bound to this exact SHA. Contains no secrets; installed to a versioned
+      # release dir by a later provisioning step (never during build).
+      - name: Build deployment bundle
+        working-directory: backend
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: python -m deploy.bundle create --source-sha "$SOURCE_SHA" --root .. --out "../bundle.tar.gz"
+
+      - name: Upload deployment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-bundle-${{ github.sha }}
+          path: bundle.tar.gz
+          retention-days: 90

@@ -113,6 +113,9 @@ class DeployConfig:
     # com.docker.compose.project label). Pinned so the deploy attaches to the
     # SAME project/volumes/networks instead of the deploy-dir-derived default.
     project_name: str = "apexscan"
+    # The single production-authority Compose file (DEPLOY-3B). Self-contained;
+    # not the developer base + overlay. Resolved inside ``deploy_path``.
+    compose_file: str = "docker-compose.production.yml"
 
 
 def _priv(cfg: DeployConfig, *args: str) -> list[str]:
@@ -138,9 +141,7 @@ def _compose(cfg: DeployConfig, *, image: str | None = None) -> list[str]:
         "-p",
         cfg.project_name,
         "-f",
-        f"{cfg.deploy_path}/docker-compose.yml",
-        "-f",
-        f"{cfg.deploy_path}/docker-compose.prod.yml",
+        f"{cfg.deploy_path}/{cfg.compose_file}",
         "--project-directory",
         cfg.deploy_path,
     )
