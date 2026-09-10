@@ -125,7 +125,7 @@ def _get_json(url: str, timeout: float) -> dict[str, object] | None:
     return body if isinstance(body, dict) else None
 
 
-def _http_probe(base_url: str, timeout: float) -> ProbeResult:
+def probe_endpoints(base_url: str, timeout: float) -> ProbeResult:
     """Read the real probes from a running app (used by the CLI)."""
     startup = _get_json(f"{base_url}/api/v1/health/startup", timeout)
     health = _get_json(f"{base_url}/api/v1/health", timeout)
@@ -151,7 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     result = verify_release(
-        lambda: _http_probe(args.base_url.rstrip("/"), args.timeout),
+        lambda: probe_endpoints(args.base_url.rstrip("/"), args.timeout),
         expected_sha=args.expected_sha,
         max_attempts=args.attempts,
         sleep=lambda: time.sleep(args.interval),

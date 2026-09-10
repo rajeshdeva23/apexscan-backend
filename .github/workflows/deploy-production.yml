@@ -108,6 +108,8 @@ jobs:
       SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
       SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
       SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
       PUBLIC_BASE_URL: ${{ secrets.PRODUCTION_BASE_URL }}
     steps:
       - name: Check out source
@@ -118,45 +120,55 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install deploy dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "."
+
       - name: Transport preflight (fail closed if unprovisioned)
         run: |
           missing=()
           [ -n "$SSH_HOST" ] || missing+=("PRODUCTION_SSH_HOST")
           [ -n "$SSH_USER" ] || missing+=("PRODUCTION_SSH_USER")
           [ -n "$SSH_KEY" ] || missing+=("PRODUCTION_SSH_KEY")
+          [ -n "$SSH_KNOWN_HOSTS" ] || missing+=("PRODUCTION_SSH_KNOWN_HOSTS")
+          [ -n "$DEPLOY_PATH" ] || missing+=("PRODUCTION_DEPLOY_PATH")
           [ -n "$PUBLIC_BASE_URL" ] || missing+=("PRODUCTION_BASE_URL")
           if [ ${#missing[@]} -ne 0 ]; then
             echo "PRODUCTION_TRANSPORT_NOT_CONFIGURED: missing ${missing[*]}." >&2
-            echo "DEPLOY-1 provisions the pipeline but not the transport; supply these" >&2
-            echo "production environment secrets before a real promotion." >&2
+            echo "Transport is implemented (deploy.transport) but not provisioned; supply" >&2
+            echo "these production environment secrets before a real promotion." >&2
             exit 1
           fi
           echo "Promoting ${APEXSCAN_IMAGE}"
 
-      # The steps below run only once the transport is provisioned (never in
-      # DEPLOY-1). They: capture the current running build_sha as the immutable
-      # rollback target, run the minimum host update, verify health/readiness/
-      # version with bounded retries, and roll back to the previous artifact on
-      # failure. No source build, no migrations, no Dhan retry loop.
-      - name: Capture rollback target (current running artifact)
+      - name: Set up pinned SSH material (never echoed)
         run: |
-          echo "TRANSPORT REQUIRED: read $PUBLIC_BASE_URL/api/v1/version over the" \
-               "provisioned transport and record build_sha as the immutable rollback target."
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/prod_key
+          chmod 600 ~/.ssh/prod_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/prod_known_hosts
+          chmod 600 ~/.ssh/prod_known_hosts
 
-      - name: Deploy immutable artifact
-        run: |
-          echo "TRANSPORT REQUIRED: run scripts/deploy/remote_update.sh on the host with" \
-               "APEXSCAN_IMAGE=$APEXSCAN_IMAGE (pull + up -d --no-build; no build, no migrations)."
-
-      - name: Verify release (bounded health/readiness/version)
+      # Runs the full transport: remote preflight, immutable rollback-target
+      # capture, digest pull, backend-only update, bounded health/version
+      # verification, and immutable rollback on failure. Dhan restart safety was
+      # already confirmed in the authorize job, so it is asserted here.
+      - name: Promote over SSH transport
         working-directory: backend
         env:
           TARGET_SHA: ${{ inputs.target_sha }}
-        run: python -m deploy.health_check --base-url "$PUBLIC_BASE_URL" --expected-sha "$TARGET_SHA"
-
-      - name: Rollback on failure
-        if: failure()
+          RUN_ID: ${{ github.run_id }}
         run: |
-          echo "TRANSPORT REQUIRED: re-promote the previous immutable artifact recorded above." \
-               "If the rollback restart is not Dhan-safe, stop with" \
-               "ROLLBACK_REQUIRES_OPERATOR_INTERVENTION instead of retrying."
+          python -m deploy.transport \
+            --host "$SSH_HOST" --user "$SSH_USER" \
+            --key-file "$HOME/.ssh/prod_key" \
+            --known-hosts "$HOME/.ssh/prod_known_hosts" \
+            --image "$APEXSCAN_IMAGE" --target-sha "$TARGET_SHA" \
+            --deploy-path "$DEPLOY_PATH" --base-url "$PUBLIC_BASE_URL" \
+            --dhan-restart-safe --run-id "$RUN_ID"
+
+      - name: Remove SSH material
+        if: always()
+        run: rm -f ~/.ssh/prod_key ~/.ssh/prod_known_hosts
