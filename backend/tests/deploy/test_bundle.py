@@ -5,15 +5,26 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+from pathlib import Path
 
 import pytest
 
-from deploy.bundle import BUNDLE_SCHEMA, BundleError, create_bundle, verify_bundle
+from deploy.bundle import (
+    BUNDLE_SCHEMA,
+    PRODUCTION_COMPOSE_FILE,
+    BundleError,
+    create_bundle,
+    production_bundle,
+    verify_bundle,
+)
+
+_ROOT = Path(__file__).resolve().parents[3]
 
 _SHA = "6" * 40
+# Neutral fixtures for the generic bundle machinery (not real repo files).
 _FILES = {
-    "docker-compose.yml": b"services:\n  backend: {}\n",
-    "docker-compose.prod.yml": b"services:\n  backend: {image: x}\n",
+    "alpha.yml": b"services:\n  backend: {}\n",
+    "beta.yml": b"services:\n  backend: {image: x}\n",
 }
 
 
@@ -52,7 +63,7 @@ def _tamper(archive: bytes, name: str, data: bytes, *, keep_manifest: bool = Tru
 
 
 def test_tampered_file_rejected() -> None:
-    bad = _tamper(create_bundle(_SHA, _FILES), "docker-compose.yml", b"evil: true\n")
+    bad = _tamper(create_bundle(_SHA, _FILES), "alpha.yml", b"evil: true\n")
     with pytest.raises(BundleError, match="hash mismatch"):
         verify_bundle(bad, expected_sha=_SHA)
 
@@ -120,6 +131,15 @@ def test_manifest_schema_enforced() -> None:
         tar.addfile(info, io.BytesIO(manifest))
     with pytest.raises(BundleError, match="schema"):
         verify_bundle(out.getvalue(), expected_sha=_SHA)
+
+
+def test_production_bundle_contains_only_production_compose() -> None:
+    files = verify_bundle(production_bundle(_SHA, _ROOT), expected_sha=_SHA)
+    assert set(files) == {PRODUCTION_COMPOSE_FILE}
+    content = files[PRODUCTION_COMPOSE_FILE]
+    assert b"APEXSCAN_IMAGE" in content  # digest-pinned image variable
+    # No secrets or dev source bind mount carried in the bundle.
+    assert b"password" not in content.lower() and b"./backend:/app" not in content
 
 
 def test_bundle_schema_is_versioned() -> None:

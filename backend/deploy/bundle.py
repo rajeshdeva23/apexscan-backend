@@ -17,9 +17,13 @@ import json
 import re
 import tarfile
 from collections.abc import Mapping
+from pathlib import Path
 
 BUNDLE_SCHEMA = "apexscan-deploy-bundle/1"
 MANIFEST_NAME = "manifest.json"
+# The only deployment file a production bundle carries: the production Compose
+# authority. Secrets and durable state stay external (never bundled).
+PRODUCTION_COMPOSE_FILE = "docker-compose.production.yml"
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")  # flat names only; no directories
 
@@ -117,3 +121,41 @@ def verify_bundle(archive: bytes, *, expected_sha: str) -> dict[str, bytes]:
         if _sha256(data) != declared[name]:
             raise BundleError(f"file hash mismatch for {name!r}")
     return files
+
+
+def production_bundle(source_sha: str, root: Path) -> bytes:
+    """Build a production deployment bundle from the reviewed repo tree.
+
+    Contains only the production Compose authority (``docker-compose.production.yml``)
+    and the manifest binding it to ``source_sha``. No secrets, no source tree.
+    """
+    data = (root / PRODUCTION_COMPOSE_FILE).read_bytes()
+    return create_bundle(source_sha, {PRODUCTION_COMPOSE_FILE: data})
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: build a production bundle (create) or check one (verify)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build/verify an ApexScan deployment bundle.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    create = sub.add_parser("create")
+    create.add_argument("--source-sha", required=True)
+    create.add_argument("--root", default=".", help="Repo root holding the production compose.")
+    create.add_argument("--out", required=True, help="Output .tar.gz path.")
+    check = sub.add_parser("verify")
+    check.add_argument("--archive", required=True)
+    check.add_argument("--expected-sha", required=True)
+    args = parser.parse_args(argv)
+
+    if args.command == "create":
+        Path(args.out).write_bytes(production_bundle(args.source_sha, Path(args.root)))
+        print(f"wrote {args.out} for {args.source_sha}")
+        return 0
+    files = verify_bundle(Path(args.archive).read_bytes(), expected_sha=args.expected_sha)
+    print(f"verified bundle for {args.expected_sha}: {sorted(files)}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - thin CLI wrapper
+    raise SystemExit(main())

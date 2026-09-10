@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# ApexScan — PRODUCTION Compose authority (DEPLOY-3B).
+#
+# This file is the single, self-contained definition of the production stack. It
+# models the existing production topology on the ApexScan host (Compose project
+# `apexscan`, explicit named volumes/network, external secret env files under
+# /etc/apexscan, loopback-only backend behind the host reverse proxy) and differs
+# from the running legacy stack in exactly ONE deploy-relevant way: the backend
+# image is the immutable, digest-pinned ${APEXSCAN_IMAGE} instead of a locally
+# built tag.
+#
+# It is NOT the developer stack (docker-compose.yml) and must never be used by
+# `scripts/dev.sh`. The deploy pipeline runs it as the production authority:
+#
+#   docker compose -p apexscan -f docker-compose.production.yml config
+#   docker compose -p apexscan -f docker-compose.production.yml \
+#     up -d --no-deps --no-build backend
+#
+# Secrets and durable state stay OUT of Git and out of this file: only external
+# absolute paths (/etc/apexscan/*.env) and named volumes are referenced. Because
+# every host resource is an ABSOLUTE path or a named volume/network, this file is
+# release-directory independent (it resolves identically from any
+# /opt/apexscan/releases/<sha>/ location).
+# ---------------------------------------------------------------------------
+name: apexscan
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: apexscan-postgres
+    restart: unless-stopped
+    env_file:
+      - /etc/apexscan/postgres.env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apexscan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - apexscan-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: apexscan-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - apexscan-net
+
+  backend:
+    # Immutable, digest-pinned artifact resolved by the deploy pipeline. Fail
+    # closed if unset — production never builds from source or uses a mutable tag.
+    image: ${APEXSCAN_IMAGE:?APEXSCAN_IMAGE must be a digest-pinned registry reference}
+    container_name: apexscan-backend
+    restart: unless-stopped
+    environment:
+      - SESSION_OHLC_EVIDENCE_OBSERVER_ENABLED=true
+      - SECTOR_SHADOW_ENABLED=true
+    env_file:
+      - /etc/apexscan/apexscan-infra.env
+      - /etc/apexscan/backend.env
+      - /etc/apexscan/dhan.env
+    volumes:
+      - /opt/apexscan/artifacts:/app/artifacts
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - apexscan-net
+
+networks:
+  apexscan-net:
+    name: apexscan-net
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: apexscan_postgres_data
+  redis_data:
+    name: apexscan_redis_data

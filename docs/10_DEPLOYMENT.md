@@ -863,15 +863,34 @@ invariants.
   a stored password). The Compose invocation now pins `-p apexscan` so the deploy
   attaches to the existing project's volumes/networks instead of a
   deploy-dir-derived new project (which would create empty parallel volumes).
-- **B3 — Deployment bundle** (`deploy/bundle.py`) — *MECHANISM IMPLEMENTED,
-  WIRING BLOCKED*. A versioned `.tar.gz` carries only the Compose files + a
-  manifest binding them to the exact reviewed Git SHA and each file's SHA-256;
-  `verify_bundle` fails closed on path traversal, symlinks, non-regular members,
-  SHA mismatch, or a wrong source SHA. **Blocked on `PRODUCTION_COMPOSE_ARCHITECTURE_MISMATCH`:**
-  the repo base Compose (`env_file: .env`, dev `./backend:/app` mount) does not
-  represent production (external `/etc/apexscan/{apexscan-infra,backend,dhan}.env`,
-  artifacts bind mount). Reconciling the production overlay/base is an explicit
-  architecture decision and is not done casually here.
+- **B3 — Deployment bundle** (`deploy/bundle.py`) — *IMPLEMENTED + WIRED (DEPLOY-3B)*.
+  A versioned `.tar.gz` carries only the production Compose file + a manifest
+  binding it to the exact reviewed Git SHA and each file's SHA-256; `verify_bundle`
+  fails closed on path traversal, symlinks, hardlinks, non-regular/duplicate
+  members, SHA mismatch, or a wrong source SHA. Stage A builds the bundle
+  (`python -m deploy.bundle create`) and uploads it as `deployment-bundle-<sha>`.
+
+**Development vs production Compose authority (DEPLOY-3B).** The previous
+`PRODUCTION_COMPOSE_ARCHITECTURE_MISMATCH` is resolved by modelling the *actual*
+production topology in code rather than forcing production onto the dev shape:
+
+- `docker-compose.yml` — **developer authority** (builds from source, `.env`,
+  `./backend:/app` hot-reload mount). Used by `scripts/dev.sh` only.
+- `docker-compose.production.yml` — **single production authority**. Self-contained
+  (not a base + overlay). Models the verified host topology exactly: project
+  `apexscan`; named volumes `apexscan_postgres_data` / `apexscan_redis_data`;
+  network `apexscan-net`; external secret env files under `/etc/apexscan/`;
+  artifacts bind `/opt/apexscan/artifacts:/app/artifacts`; loopback-only backend
+  `127.0.0.1:8000`; Postgres/Redis with no public ports. It differs from the
+  running legacy stack in exactly one deploy-relevant way — the backend image is
+  the immutable `${APEXSCAN_IMAGE}` instead of a locally-built tag. Secrets and
+  durable state stay external (never in Git); every host path is absolute or a
+  named volume, so the file is **release-directory independent**. The retired
+  DEPLOY-1 `docker-compose.prod.yml` overlay is removed (superseded).
+
+  Exact production command: `docker compose -p apexscan -f docker-compose.production.yml <cmd>`
+  (backend update: `up -d --no-deps --no-build backend`). This is consistent with
+  the immutable-deployment governance in §17; no new ADR is required.
 
 ---
 
