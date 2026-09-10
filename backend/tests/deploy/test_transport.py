@@ -85,9 +85,9 @@ def test_success_backend_only_and_ordered() -> None:
     flat = _flat(ex)
     # ordering: config (preflight) < ps (capture) < pull < up (mutation)
     assert flat.index("config") < flat.index("ps ") < flat.index("pull") < flat.index("up -d")
-    # backend-only, no-build
+    # backend-only, no-build, and no dependency recreation (backend depends_on pg/redis)
     up = next(c for c in ex.calls if "up" in c)
-    assert up[-1] == "backend" and "--no-build" in up
+    assert up[-1] == "backend" and "--no-build" in up and "--no-deps" in up
 
 
 def test_no_destructive_or_migration_commands() -> None:
@@ -115,6 +115,14 @@ def test_mutable_target_image_rejected_without_contact() -> None:
         _cfg(target_image="ghcr.io/o/apexscan-backend:latest"),
         _verify_const(VerifyOutcome.SUCCESS),
     )
+    assert audit.outcome is TransportOutcome.TARGET_IMAGE_INVALID
+    assert ex.calls == []
+
+
+def test_unrelated_repository_digest_rejected() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    evil = "evil.io/attacker/malware@sha256:" + "c" * 64
+    audit = _run(ex, _cfg(target_image=evil), _verify_const(VerifyOutcome.SUCCESS))
     assert audit.outcome is TransportOutcome.TARGET_IMAGE_INVALID
     assert ex.calls == []
 

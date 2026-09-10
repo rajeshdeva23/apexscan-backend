@@ -20,7 +20,10 @@ from deploy.executor import ExecResult, RemoteExecutor
 from deploy.health_check import VerifyOutcome, VerifyResult
 from deploy.rollback import RollbackDecision, is_immutable_ref, plan_rollback
 
-_DIGEST_REF = re.compile(r"^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$")
+# Digest-pinned reference bound to the ApexScan backend image name (the repo
+# component must be ``apexscan-backend``): a syntactically valid digest from an
+# unrelated image must not be promotable.
+_DIGEST_REF = re.compile(r"^([a-z0-9][a-z0-9./_-]*/)?apexscan-backend@sha256:[0-9a-f]{64}$")
 _REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MIN_COMPOSE = (2, 24)
@@ -164,7 +167,12 @@ def _pull(executor: RemoteExecutor, image: str) -> bool:
 
 
 def _update_backend(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> bool:
-    """Backend-only, no-build Compose update to ``image`` (no other service touched)."""
+    """Backend-only, no-build Compose update to ``image``.
+
+    ``--no-deps`` is required: the backend ``depends_on`` postgres and redis, so a
+    plain ``up backend`` would (re)create those data services. ``--no-deps`` keeps
+    the mutation strictly to the backend and never touches Postgres/Redis/volumes.
+    """
     return executor.run(
         [
             "env",
@@ -172,6 +180,7 @@ def _update_backend(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> 
             *_compose(cfg.deploy_path),
             "up",
             "-d",
+            "--no-deps",
             "--no-build",
             _BACKEND,
         ]
