@@ -109,8 +109,16 @@ jobs:
       SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
       SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
       SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
-      DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+      # Stable release ROOT; the transport appends the exact target SHA to form
+      # /opt/apexscan/releases/<sha>/ (path resolution lives in reviewed code).
+      DEPLOY_ROOT: ${{ secrets.PRODUCTION_DEPLOY_ROOT }}
       PUBLIC_BASE_URL: ${{ secrets.PRODUCTION_BASE_URL }}
+      # First-deploy legacy rollback artifact (non-secret; GitHub environment
+      # variables). Empty until provisioned; a first legacy deploy fails closed
+      # (LEGACY_ROLLBACK_ARTIFACT_REQUIRED) without them.
+      LEGACY_DIGEST: ${{ vars.PRODUCTION_LEGACY_ROLLBACK_DIGEST }}
+      LEGACY_IMAGE_ID: ${{ vars.PRODUCTION_LEGACY_RUNNING_IMAGE_ID }}
+      LEGACY_SOURCE_SHA: ${{ vars.PRODUCTION_LEGACY_SOURCE_SHA }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -133,7 +141,7 @@ jobs:
           [ -n "$SSH_USER" ] || missing+=("PRODUCTION_SSH_USER")
           [ -n "$SSH_KEY" ] || missing+=("PRODUCTION_SSH_KEY")
           [ -n "$SSH_KNOWN_HOSTS" ] || missing+=("PRODUCTION_SSH_KNOWN_HOSTS")
-          [ -n "$DEPLOY_PATH" ] || missing+=("PRODUCTION_DEPLOY_PATH")
+          [ -n "$DEPLOY_ROOT" ] || missing+=("PRODUCTION_DEPLOY_ROOT")
           [ -n "$PUBLIC_BASE_URL" ] || missing+=("PRODUCTION_BASE_URL")
           if [ ${#missing[@]} -ne 0 ]; then
             echo "PRODUCTION_TRANSPORT_NOT_CONFIGURED: missing ${missing[*]}." >&2
@@ -166,8 +174,10 @@ jobs:
             --key-file "$HOME/.ssh/prod_key" \
             --known-hosts "$HOME/.ssh/prod_known_hosts" \
             --image "$APEXSCAN_IMAGE" --target-sha "$TARGET_SHA" \
-            --deploy-path "$DEPLOY_PATH" --base-url "$PUBLIC_BASE_URL" \
+            --deploy-root "$DEPLOY_ROOT" --base-url "$PUBLIC_BASE_URL" \
             --docker-privilege sudo_non_interactive --project-name apexscan \
+            --legacy-digest "$LEGACY_DIGEST" --legacy-image-id "$LEGACY_IMAGE_ID" \
+            --legacy-source-sha "$LEGACY_SOURCE_SHA" \
             --dhan-restart-safe --run-id "$RUN_ID"
 
       - name: Remove SSH material

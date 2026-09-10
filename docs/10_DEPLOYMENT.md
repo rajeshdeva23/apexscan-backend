@@ -803,7 +803,7 @@ outcome (e.g. `ssh_host_verification_failed`, `compose_version_unsupported`,
 before mutation (`docker compose version --short` ≥ 2.24 and `docker compose config -q`).
 *Provisioning (separate):* create the `production` environment secrets `PRODUCTION_SSH_HOST`,
 `PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_SSH_KNOWN_HOSTS`,
-`PRODUCTION_DEPLOY_PATH`, `PRODUCTION_BASE_URL` — including the pre-verified host key.
+`PRODUCTION_DEPLOY_ROOT`, `PRODUCTION_BASE_URL` — including the pre-verified host key.
 
 **Immutable artifact identity** — the running SHA is observable at `GET /version` as `build_sha`,
 injected at image build via `--build-arg BUILD_SHA` (Dockerfile `ARG`/`ENV`); no git is needed inside
@@ -830,7 +830,7 @@ the deploy does not proceed.
 body is now implemented (DEPLOY-2); what remains is provisioning. Create the `production` GitHub
 Environment with required reviewers; obtain the host's real key and set the environment secrets
 `PRODUCTION_SSH_HOST`, `PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_SSH_KNOWN_HOSTS`,
-`PRODUCTION_DEPLOY_PATH`, `PRODUCTION_BASE_URL`; validate the `!reset` overlay on the host
+`PRODUCTION_DEPLOY_ROOT`, `PRODUCTION_BASE_URL`; validate the `!reset` overlay on the host
 (`docker compose config`); and define the production migration policy separately (neither DEPLOY-1
 nor DEPLOY-2 introduces migrations — the transport fails closed if migrations are flagged). Secrets
 live only in the GitHub environment — never in source, images, or logs.
@@ -891,6 +891,38 @@ production topology in code rather than forcing production onto the dev shape:
   Exact production command: `docker compose -p apexscan -f docker-compose.production.yml <cmd>`
   (backend update: `up -d --no-deps --no-build backend`). This is consistent with
   the immutable-deployment governance in §17; no new ADR is required.
+
+### 14.11 Versioned deploy path + first-deploy legacy rollback (DEPLOY-3C-R2)
+
+**Deploy path.** Production config supplies a stable `PRODUCTION_DEPLOY_ROOT`
+(e.g. `/opt/apexscan/releases`); the transport resolves the exact release
+directory in reviewed code — `resolve_release_path(deploy_root, target_sha)` →
+`<root>/<full-sha>` — validating the root is absolute/traversal-free and the SHA
+a full 40-char hex (no short SHA, tag, `..`, or path escape). The same target
+SHA binds CI eligibility, the GHCR image, the deployment bundle + manifest, the
+release directory, and the `/version.build_sha` check. Target deploy and rollback
+use the **same** `docker-compose.production.yml` in that release dir with
+`-p apexscan --no-deps --no-build backend` — rollback never reverts to the legacy
+host Compose file.
+
+**First SHA-pinned deployment (legacy rollback).** Current production predates
+`build_sha`, so its rollback target is provided explicitly as a
+`LegacyRollbackArtifact` (the immutable GHCR digest of the *preserved* running
+image, plus provenance-only source-SHA evidence). Selection is fail-closed:
+`/version` with a `build_sha` → **normal** rollback (digest + SHA + health); a
+`/version` that responds *without* `build_sha` → **legacy** rollback **only** if a
+valid artifact is configured, verified by exact digest + health/startup/readiness
+(never SHA) and reported as `legacy_rolled_back`; a broken/unreachable/malformed
+`/version` → **fails closed** (never legacy). Once production runs a DEPLOY-1+
+image, the legacy artifact is ignored and normal semantics are mandatory. If the
+first deploy has no valid artifact, Stage B fails **before mutation** with
+`legacy_rollback_artifact_required`.
+
+*Provisioning to configure later (non-secret GitHub environment variables):*
+`PRODUCTION_LEGACY_ROLLBACK_DIGEST`, `PRODUCTION_LEGACY_RUNNING_IMAGE_ID`,
+`PRODUCTION_LEGACY_SOURCE_SHA` (a digest is not a secret). The exact legacy image
+must be published to GHCR first (docker save → push from a trusted
+registry-authenticated environment; the host stays pull-only).
 
 ---
 

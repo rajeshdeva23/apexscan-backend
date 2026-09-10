@@ -140,6 +140,21 @@ def probe_endpoints(base_url: str, timeout: float) -> ProbeResult:
     )
 
 
+def probe_version(base_url: str, timeout: float) -> tuple[bool, str | None]:
+    """Read ``/version`` as ``(responded, build_sha)``.
+
+    ``responded`` is False on any transport/HTTP/JSON failure (fail closed), True
+    when ``/version`` returned a valid object — with ``build_sha`` when present
+    (a modern image) or None when absent (a legacy image). This lets the caller
+    distinguish a genuine legacy backend from a broken endpoint.
+    """
+    body = _get_json(f"{base_url.rstrip('/')}/api/v1/version", timeout)
+    if body is None:
+        return False, None
+    sha = body.get("build_sha")
+    return True, sha if isinstance(sha, str) else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: verify a deployed release; exit non-zero unless the outcome is SUCCESS."""
     parser = argparse.ArgumentParser(description="Verify a deployed ApexScan release.")
