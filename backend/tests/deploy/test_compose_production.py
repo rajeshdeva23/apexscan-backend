@@ -34,7 +34,8 @@ def test_network_identity_preserved() -> None:
 
 def test_backend_uses_immutable_image_variable_and_no_build() -> None:
     backend = _SERVICES["backend"]
-    assert backend["image"].startswith("${APEXSCAN_IMAGE")
+    # ${APEXSCAN_IMAGE:?...} fails closed at compose time when unset/empty.
+    assert backend["image"].startswith("${APEXSCAN_IMAGE:?")
     assert "build" not in backend  # never builds from source
     assert ":latest" not in backend["image"] and ":edge" not in backend["image"]
 

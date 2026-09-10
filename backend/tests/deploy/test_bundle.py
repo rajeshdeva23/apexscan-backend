@@ -21,9 +21,10 @@ from deploy.bundle import (
 _ROOT = Path(__file__).resolve().parents[3]
 
 _SHA = "6" * 40
+# Neutral fixtures for the generic bundle machinery (not real repo files).
 _FILES = {
-    "docker-compose.yml": b"services:\n  backend: {}\n",
-    "docker-compose.prod.yml": b"services:\n  backend: {image: x}\n",
+    "alpha.yml": b"services:\n  backend: {}\n",
+    "beta.yml": b"services:\n  backend: {image: x}\n",
 }
 
 
@@ -62,7 +63,7 @@ def _tamper(archive: bytes, name: str, data: bytes, *, keep_manifest: bool = Tru
 
 
 def test_tampered_file_rejected() -> None:
-    bad = _tamper(create_bundle(_SHA, _FILES), "docker-compose.yml", b"evil: true\n")
+    bad = _tamper(create_bundle(_SHA, _FILES), "alpha.yml", b"evil: true\n")
     with pytest.raises(BundleError, match="hash mismatch"):
         verify_bundle(bad, expected_sha=_SHA)
 

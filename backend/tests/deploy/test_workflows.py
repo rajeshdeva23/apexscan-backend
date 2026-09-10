@@ -85,6 +85,15 @@ def test_build_publishes_sha_pinned_image_and_does_not_deploy() -> None:
     assert "PRODUCTION_SSH" not in text and "remote_update.sh" not in text
 
 
+def test_stage_a_builds_sha_bound_bundle_without_deploying() -> None:
+    text = _text("build-image.yml")
+    assert "deploy.bundle create" in text  # bundle built in Stage A
+    assert "deployment-bundle-${{ github.sha }}" in text  # artifact bound to exact SHA
+    # source SHA passed via env, not interpolated into the run shell.
+    assert "SOURCE_SHA: ${{ github.sha }}" in text
+    assert "remote_update.sh" not in text and "PRODUCTION_SSH" not in text  # never deploys
+
+
 def test_no_workflow_enables_ipc() -> None:
     forbidden = ("publisher_enabled", "consumer_enabled", "dual_path", "cutover", "market_stream")
     for name in ("build-image.yml", "deploy-production.yml", "ci.yml"):
