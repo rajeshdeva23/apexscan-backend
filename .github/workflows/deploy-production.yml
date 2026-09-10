@@ -64,7 +64,10 @@ jobs:
         working-directory: backend
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m deploy.eligibility --sha "${{ inputs.target_sha }}" --repo "${{ github.repository }}"
+          # Passed via env, never interpolated into the shell, to avoid script injection.
+          TARGET_SHA: ${{ inputs.target_sha }}
+          REPO: ${{ github.repository }}
+        run: python -m deploy.eligibility --sha "$TARGET_SHA" --repo "$REPO"
 
       - name: Confirm Dhan restart safety
         if: ${{ inputs.dhan_restart_safety_confirmed != true }}
@@ -83,8 +86,10 @@ jobs:
 
       - name: Resolve immutable image digest
         id: digest
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
         run: |
-          ref="${IMAGE_NAME}:${{ inputs.target_sha }}"
+          ref="${IMAGE_NAME}:${TARGET_SHA}"
           if ! digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
             echo "ARTIFACT_NOT_FOUND: no published image for ${ref}. Build Stage A first." >&2
             exit 1
@@ -145,7 +150,9 @@ jobs:
 
       - name: Verify release (bounded health/readiness/version)
         working-directory: backend
-        run: python -m deploy.health_check --base-url "$PUBLIC_BASE_URL" --expected-sha "${{ inputs.target_sha }}"
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: python -m deploy.health_check --base-url "$PUBLIC_BASE_URL" --expected-sha "$TARGET_SHA"
 
       - name: Rollback on failure
         if: failure()

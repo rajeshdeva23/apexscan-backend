@@ -106,6 +106,18 @@ def test_ci_typechecks_deploy_tooling() -> None:
     assert "mypy app deploy" in _text("ci.yml")
 
 
+def test_no_dispatch_input_interpolated_into_run() -> None:
+    # ${{ inputs.* }} / ${{ github.event.* }} must reach run: via env vars, never
+    # be interpolated into the shell (script-injection guard).
+    for name in ("build-image.yml", "deploy-production.yml"):
+        for job in _load(name)["jobs"].values():
+            for step in job.get("steps", []):
+                run = step.get("run")
+                if run:
+                    assert "${{ inputs." not in run, f"{name}:{step.get('name')} interpolates input"
+                    assert "${{ github.event" not in run
+
+
 def test_env_secrets_are_gitignored() -> None:
     gitignore = (_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     ignored = {line.strip() for line in gitignore}
