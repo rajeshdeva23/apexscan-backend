@@ -94,10 +94,12 @@ def test_no_workflow_enables_ipc() -> None:
 
 
 def test_no_workflow_echoes_secrets() -> None:
+    # Flag only writes to the log (stdout); writing a secret to a controlled file
+    # (`printf ... > ~/.ssh/key`) is how SSH material is provisioned, not a leak.
     for name in ("build-image.yml", "deploy-production.yml", "ci.yml"):
         for line in _text(name).splitlines():
             stripped = line.strip()
-            if stripped.startswith("echo") or stripped.startswith("print"):
+            if stripped.startswith(("echo", "printf", "print")) and ">" not in stripped:
                 assert "secrets." not in stripped
                 assert "SSH_KEY" not in stripped
 
@@ -116,6 +118,14 @@ def test_no_dispatch_input_interpolated_into_run() -> None:
                 if run:
                     assert "${{ inputs." not in run, f"{name}:{step.get('name')} interpolates input"
                     assert "${{ github.event" not in run
+
+
+def test_promote_uses_ssh_transport_with_pinned_host_and_cleanup() -> None:
+    text = _text("deploy-production.yml")
+    assert "python -m deploy.transport" in text  # real transport, not a placeholder
+    assert "prod_known_hosts" in text  # host-key pinning material is written
+    assert "Remove SSH material" in text and "rm -f ~/.ssh/prod_key" in text  # cleanup
+    assert "StrictHostKeyChecking=no" not in text  # host authenticity never disabled
 
 
 def test_env_secrets_are_gitignored() -> None:

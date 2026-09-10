@@ -783,8 +783,27 @@ Manual only (`workflow_dispatch`), guarded by the `production` protected environ
 single-flight `apexscan-production` concurrency group. The operator supplies the target SHA and must
 tick `dhan_restart_safety_confirmed`. Gates (fail closed): SHA is reachable from `origin/main` and its
 CI is green (`deploy/eligibility.py`); the immutable image digest exists in GHCR; Dhan restart safety
-is confirmed; then the **transport preflight**. Because no production transport is provisioned, the
+is confirmed; then the **transport preflight**. If the production transport secrets are absent the
 preflight stops with `PRODUCTION_TRANSPORT_NOT_CONFIGURED`.
+
+**Production transport** (`deploy/transport.py` + `deploy/executor.py`, DEPLOY-2) —
+*TRANSPORT_IMPLEMENTED / NOT_PROVISIONED*. The promote job writes the pinned SSH key and
+`known_hosts` from environment secrets to `~/.ssh` (mode 600, never echoed, removed by an
+`if: always()` cleanup step) and runs `python -m deploy.transport` over a hardened
+`SSHExecutor` (`BatchMode=yes`, `StrictHostKeyChecking=yes` against the pinned `known_hosts`,
+`IdentitiesOnly=yes`, bounded `ConnectTimeout`, `shlex`-quoted remote commands — host
+authenticity is never disabled). The transport enforces the ordering **remote preflight →
+capture immutable rollback target → pull digest → backend-only `up -d --no-build` → bounded
+health/version verify**, and on any post-mutation failure performs a single immutable rollback
+to the captured previous digest. It never runs `--build`, migrations, or destructive Compose
+commands, never authenticates Dhan, and returns a bounded secret-free audit with an explicit
+outcome (e.g. `ssh_host_verification_failed`, `compose_version_unsupported`,
+`rollback_target_unavailable`, `wrong_build_sha`, `rolled_back`,
+`rollback_requires_operator_intervention`). Compose `!reset` compatibility is checked remotely
+before mutation (`docker compose version --short` ≥ 2.24 and `docker compose config -q`).
+*Provisioning (separate):* create the `production` environment secrets `PRODUCTION_SSH_HOST`,
+`PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_SSH_KNOWN_HOSTS`,
+`PRODUCTION_DEPLOY_PATH`, `PRODUCTION_BASE_URL` — including the pre-verified host key.
 
 **Immutable artifact identity** — the running SHA is observable at `GET /version` as `build_sha`,
 injected at image build via `--build-arg BUILD_SHA` (Dockerfile `ARG`/`ENV`); no git is needed inside
@@ -807,11 +826,14 @@ promoted SHA (outcomes: success / wrong_sha / startup/health/readiness failure /
 the previous immutable artifact (captured before mutation) is re-promoted; if it cannot be established,
 the deploy does not proceed.
 
-**Operator provisioning still required (IMPLEMENTED_NOT_PROVISIONED):** create the `production` GitHub
-Environment with required reviewers; set the environment secrets `PRODUCTION_SSH_HOST`,
-`PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_BASE_URL`; implement the SSH transport body
-inside the preflight-gated steps; and define the production migration policy separately (DEPLOY-1
-introduces none). Secrets live only in the GitHub environment — never in source, images, or logs.
+**Operator provisioning still required (TRANSPORT_IMPLEMENTED / NOT_PROVISIONED):** the SSH transport
+body is now implemented (DEPLOY-2); what remains is provisioning. Create the `production` GitHub
+Environment with required reviewers; obtain the host's real key and set the environment secrets
+`PRODUCTION_SSH_HOST`, `PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_SSH_KNOWN_HOSTS`,
+`PRODUCTION_DEPLOY_PATH`, `PRODUCTION_BASE_URL`; validate the `!reset` overlay on the host
+(`docker compose config`); and define the production migration policy separately (neither DEPLOY-1
+nor DEPLOY-2 introduces migrations — the transport fails closed if migrations are flagged). Secrets
+live only in the GitHub environment — never in source, images, or logs.
 
 ---
 
