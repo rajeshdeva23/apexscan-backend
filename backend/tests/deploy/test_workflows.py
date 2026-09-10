@@ -96,7 +96,12 @@ def test_stage_a_builds_sha_bound_bundle_without_deploying() -> None:
 
 def test_no_workflow_enables_ipc() -> None:
     forbidden = ("publisher_enabled", "consumer_enabled", "dual_path", "cutover", "market_stream")
-    for name in ("build-image.yml", "deploy-production.yml", "ci.yml"):
+    for name in (
+        "build-image.yml",
+        "deploy-production.yml",
+        "ci.yml",
+        "publish-legacy-rollback.yml",
+    ):
         lowered = _text(name).lower()
         for token in forbidden:
             assert token not in lowered, f"{name} references {token}"
@@ -105,7 +110,12 @@ def test_no_workflow_enables_ipc() -> None:
 def test_no_workflow_echoes_secrets() -> None:
     # Flag only writes to the log (stdout); writing a secret to a controlled file
     # (`printf ... > ~/.ssh/key`) is how SSH material is provisioned, not a leak.
-    for name in ("build-image.yml", "deploy-production.yml", "ci.yml"):
+    for name in (
+        "build-image.yml",
+        "deploy-production.yml",
+        "ci.yml",
+        "publish-legacy-rollback.yml",
+    ):
         for line in _text(name).splitlines():
             stripped = line.strip()
             if stripped.startswith(("echo", "printf", "print")) and ">" not in stripped:
@@ -120,7 +130,7 @@ def test_ci_typechecks_deploy_tooling() -> None:
 def test_no_dispatch_input_interpolated_into_run() -> None:
     # ${{ inputs.* }} / ${{ github.event.* }} must reach run: via env vars, never
     # be interpolated into the shell (script-injection guard).
-    for name in ("build-image.yml", "deploy-production.yml"):
+    for name in ("build-image.yml", "deploy-production.yml", "publish-legacy-rollback.yml"):
         for job in _load(name)["jobs"].values():
             for step in job.get("steps", []):
                 run = step.get("run")
@@ -144,6 +154,18 @@ def test_promote_uses_deploy_root_and_legacy_passthrough() -> None:
     # legacy rollback artifact passed through (non-secret vars), not interpolated in run:
     assert "--legacy-digest" in text
     assert "vars.PRODUCTION_LEGACY_ROLLBACK_DIGEST" in text
+
+
+def test_publish_legacy_workflow_is_scoped_and_manual() -> None:
+    on = _on(_load("publish-legacy-rollback.yml"))
+    assert set(on) == {"workflow_dispatch"}
+    doc = _load("publish-legacy-rollback.yml")
+    assert doc["permissions"] == {"contents": "read", "packages": "write"}
+    assert doc["jobs"]["publish"]["environment"] == "production"
+    text = _text("publish-legacy-rollback.yml")
+    assert "StrictHostKeyChecking=yes" in text and "StrictHostKeyChecking=no" not in text
+    assert "sha256sum -c" in text  # archive integrity verified
+    assert "docker build" not in text and "up -d" not in text  # never builds or deploys
 
 
 def test_env_secrets_are_gitignored() -> None:
