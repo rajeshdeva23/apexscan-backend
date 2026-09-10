@@ -762,6 +762,57 @@ Traffic shifts to the healthy new version; connections drain gracefully from the
 Rollback is triggered by a failed health check (automatically) or by degraded post-deploy signals
 (operator decision), and returns the system to the last known-good version quickly and deterministically.
 
+### 14.9 Implemented Pipeline (DEPLOY-1)
+
+This subsection describes what is **implemented in the repository today**, versus what still requires
+operator provisioning. It realizes the two-stage model above; §§14.1–14.8 remain the design intent.
+
+Status legend: **IMPLEMENTED_NOT_PROVISIONED** (code merged, needs operator setup) ·
+**PROVISIONED_NOT_VALIDATED** (setup done, not yet run against production) · **VALIDATED** (proven in a
+real deploy).
+
+**Stage A — Build & publish** (`.github/workflows/build-image.yml`) — *IMPLEMENTED_NOT_PROVISIONED*.
+On push to `main` (and via `workflow_dispatch`) it runs the quality gates, then builds the backend
+image and pushes it to GHCR tagged with the exact commit SHA. The immutable `…@sha256:<digest>` is
+authoritative; a moving `edge` tag is a convenience only. Stage A never contacts production and never
+authenticates Dhan. *Provisioning:* GHCR publishing uses the built-in `GITHUB_TOKEN` with
+`packages: write`; no owner action is required beyond allowing the package on first publish.
+
+**Stage B — Promote** (`.github/workflows/deploy-production.yml`) — *IMPLEMENTED_NOT_PROVISIONED*.
+Manual only (`workflow_dispatch`), guarded by the `production` protected environment and a
+single-flight `apexscan-production` concurrency group. The operator supplies the target SHA and must
+tick `dhan_restart_safety_confirmed`. Gates (fail closed): SHA is reachable from `origin/main` and its
+CI is green (`deploy/eligibility.py`); the immutable image digest exists in GHCR; Dhan restart safety
+is confirmed; then the **transport preflight**. Because no production transport is provisioned, the
+preflight stops with `PRODUCTION_TRANSPORT_NOT_CONFIGURED`.
+
+**Immutable artifact identity** — the running SHA is observable at `GET /version` as `build_sha`,
+injected at image build via `--build-arg BUILD_SHA` (Dockerfile `ARG`/`ENV`); no git is needed inside
+the container.
+
+**Production runtime** (`docker-compose.prod.yml` + `scripts/deploy/remote_update.sh`) — the host runs
+the base compose plus the prod overlay, which replaces the developer build/bind-mount with the
+digest-pinned image. The host update is the minimum operation — `pull` then `up -d --no-build backend`
+— never `--build`, never `alembic` migrations, never touching Postgres/Redis or their volumes.
+
+**Dhan restart hazard** — the promote and any rollback restart the backend, and startup authenticates
+Dhan when `market_provider_enabled=true`; an unnecessary recreate can trip the Dhan token
+rate-limit/crash-loop. The pipeline therefore requires explicit `dhan_restart_safety_confirmed` before
+mutation and never retries Dhan auth. If a rollback restart is not Dhan-safe, the pipeline surfaces
+`ROLLBACK_REQUIRES_OPERATOR_INTERVENTION` rather than looping.
+
+**Health & rollback** — after deploy, `deploy/health_check.py` polls `/health/startup`, `/health`,
+`/health/ready`, and `/version` with bounded retries and confirms the running `build_sha` equals the
+promoted SHA (outcomes: success / wrong_sha / startup/health/readiness failure / timeout). On failure
+the previous immutable artifact (captured before mutation) is re-promoted; if it cannot be established,
+the deploy does not proceed.
+
+**Operator provisioning still required (IMPLEMENTED_NOT_PROVISIONED):** create the `production` GitHub
+Environment with required reviewers; set the environment secrets `PRODUCTION_SSH_HOST`,
+`PRODUCTION_SSH_USER`, `PRODUCTION_SSH_KEY`, `PRODUCTION_BASE_URL`; implement the SSH transport body
+inside the preflight-gated steps; and define the production migration policy separately (DEPLOY-1
+introduces none). Secrets live only in the GitHub environment — never in source, images, or logs.
+
 ---
 
 ## 15. Disaster Recovery

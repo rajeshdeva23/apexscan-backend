@@ -1,0 +1,14 @@
+# Keep the production image lean and free of non-runtime material.
+# Deployment tooling and tests are never needed inside the running container;
+# excluding them also keeps deploy logic out of the shipped artifact.
+deploy/
+tests/
+alembic/versions/__pycache__/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv-review/
+*.egg-info/

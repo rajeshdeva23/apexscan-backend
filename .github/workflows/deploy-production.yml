@@ -1,0 +1,162 @@
+name: Deploy backend to production
+
+# STAGE B (DEPLOY-1): manual, SHA-pinned promotion of an already-built immutable
+# artifact to production. There is NO automatic production deploy: this runs only
+# via workflow_dispatch and the 'production' protected environment requires human
+# approval. It consumes a prebuilt image by digest (never builds from source),
+# fails closed at every gate, and — because a backend restart re-authenticates
+# Dhan — requires explicit operator confirmation of Dhan restart safety.
+#
+# In DEPLOY-1 no production transport is provisioned, so the promote job stops at
+# the transport preflight with PRODUCTION_TRANSPORT_NOT_CONFIGURED. Host/user/key
+# details are referenced by secret name only and are never fabricated here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full 40-char commit SHA to promote (must be on main, CI green).
+        required: true
+        type: string
+      dhan_restart_safety_confirmed:
+        description: Confirm a backend restart will not trip the Dhan token rate-limit hazard.
+        required: true
+        default: false
+        type: boolean
+      deploy_reason:
+        description: Short reason for this promotion (audit).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+# Only one production promotion at a time; never cancel an in-flight deploy.
+concurrency:
+  group: apexscan-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/apexscan-backend
+
+jobs:
+  authorize:
+    name: Verify promotion eligibility
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.digest.outputs.image }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch main for ancestry check
+        run: git fetch --no-tags origin main
+
+      - name: Verify SHA eligibility (reachable from main + CI green)
+        working-directory: backend
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed via env, never interpolated into the shell, to avoid script injection.
+          TARGET_SHA: ${{ inputs.target_sha }}
+          REPO: ${{ github.repository }}
+        run: python -m deploy.eligibility --sha "$TARGET_SHA" --repo "$REPO"
+
+      - name: Confirm Dhan restart safety
+        if: ${{ inputs.dhan_restart_safety_confirmed != true }}
+        run: |
+          echo "DHAN_RESTART_SAFETY_NOT_CONFIRMED: promotion restarts the backend," \
+               "which re-authenticates Dhan. Re-run with the confirmation checked only" \
+               "after verifying the Dhan token rate-limit hazard is mitigated." >&2
+          exit 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve immutable image digest
+        id: digest
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          ref="${IMAGE_NAME}:${TARGET_SHA}"
+          if ! digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+            echo "ARTIFACT_NOT_FOUND: no published image for ${ref}. Build Stage A first." >&2
+            exit 1
+          fi
+          echo "image=${IMAGE_NAME}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${ref} -> ${IMAGE_NAME}@${digest}"
+
+  promote:
+    name: Promote to production
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APEXSCAN_IMAGE: ${{ needs.authorize.outputs.image }}
+      # Referenced by name only; unset until an operator provisions them.
+      SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+      SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+      SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+      PUBLIC_BASE_URL: ${{ secrets.PRODUCTION_BASE_URL }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Transport preflight (fail closed if unprovisioned)
+        run: |
+          missing=()
+          [ -n "$SSH_HOST" ] || missing+=("PRODUCTION_SSH_HOST")
+          [ -n "$SSH_USER" ] || missing+=("PRODUCTION_SSH_USER")
+          [ -n "$SSH_KEY" ] || missing+=("PRODUCTION_SSH_KEY")
+          [ -n "$PUBLIC_BASE_URL" ] || missing+=("PRODUCTION_BASE_URL")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "PRODUCTION_TRANSPORT_NOT_CONFIGURED: missing ${missing[*]}." >&2
+            echo "DEPLOY-1 provisions the pipeline but not the transport; supply these" >&2
+            echo "production environment secrets before a real promotion." >&2
+            exit 1
+          fi
+          echo "Promoting ${APEXSCAN_IMAGE}"
+
+      # The steps below run only once the transport is provisioned (never in
+      # DEPLOY-1). They: capture the current running build_sha as the immutable
+      # rollback target, run the minimum host update, verify health/readiness/
+      # version with bounded retries, and roll back to the previous artifact on
+      # failure. No source build, no migrations, no Dhan retry loop.
+      - name: Capture rollback target (current running artifact)
+        run: |
+          echo "TRANSPORT REQUIRED: read $PUBLIC_BASE_URL/api/v1/version over the" \
+               "provisioned transport and record build_sha as the immutable rollback target."
+
+      - name: Deploy immutable artifact
+        run: |
+          echo "TRANSPORT REQUIRED: run scripts/deploy/remote_update.sh on the host with" \
+               "APEXSCAN_IMAGE=$APEXSCAN_IMAGE (pull + up -d --no-build; no build, no migrations)."
+
+      - name: Verify release (bounded health/readiness/version)
+        working-directory: backend
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: python -m deploy.health_check --base-url "$PUBLIC_BASE_URL" --expected-sha "$TARGET_SHA"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "TRANSPORT REQUIRED: re-promote the previous immutable artifact recorded above." \
+               "If the rollback restart is not Dhan-safe, stop with" \
+               "ROLLBACK_REQUIRES_OPERATOR_INTERVENTION instead of retrying."

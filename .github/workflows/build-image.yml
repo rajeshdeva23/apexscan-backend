@@ -1,0 +1,88 @@
+name: Build and publish backend image
+
+# STAGE A (DEPLOY-1): build an immutable, SHA-pinned backend image and publish it
+# to GHCR. This NEVER deploys, never contacts the production host, and never
+# authenticates Dhan. Promotion to production is a separate, manual workflow
+# (deploy-production.yml). Quality gates run before any artifact is published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/apexscan-backend
+
+jobs:
+  build:
+    name: Quality gates, build, publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Check formatting
+        working-directory: backend
+        run: python -m ruff format --check .
+
+      - name: Lint
+        working-directory: backend
+        run: python -m ruff check .
+
+      - name: Type-check
+        working-directory: backend
+        run: python -m mypy app deploy
+
+      - name: Test
+        working-directory: backend
+        run: python -m pytest
+
+      - name: Audit Python dependencies
+        working-directory: backend
+        run: python -m pip_audit
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable SHA-pinned image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          # The immutable SHA tag is authoritative; a moving 'edge' tag is a
+          # convenience only and is never used as production identity.
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:edge
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+
+      - name: Record artifact identity
+        run: |
+          echo "Built ${IMAGE_NAME}:${GITHUB_SHA}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+          echo "image=${IMAGE_NAME}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
