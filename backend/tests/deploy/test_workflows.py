@@ -137,6 +137,15 @@ def test_promote_uses_ssh_transport_with_pinned_host_and_cleanup() -> None:
     assert "StrictHostKeyChecking=no" not in text  # host authenticity never disabled
 
 
+def test_promote_uses_deploy_root_and_legacy_passthrough() -> None:
+    text = _text("deploy-production.yml")
+    assert "--deploy-root" in text and "--deploy-path" not in text  # versioned release contract
+    assert "PRODUCTION_DEPLOY_ROOT" in text and "PRODUCTION_DEPLOY_PATH" not in text
+    # legacy rollback artifact passed through (non-secret vars), not interpolated in run:
+    assert "--legacy-digest" in text
+    assert "vars.PRODUCTION_LEGACY_ROLLBACK_DIGEST" in text
+
+
 def test_env_secrets_are_gitignored() -> None:
     gitignore = (_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     ignored = {line.strip() for line in gitignore}

@@ -11,6 +11,7 @@ the verifier are injected, so the whole flow is exercised offline with fakes.
 from __future__ import annotations
 
 import re
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -18,7 +19,15 @@ from enum import StrEnum
 
 from deploy.executor import ExecResult, RemoteExecutor
 from deploy.health_check import VerifyOutcome, VerifyResult
-from deploy.rollback import RollbackDecision, is_immutable_ref, plan_rollback
+from deploy.legacy import (
+    LegacyArtifactError,
+    LegacyRollbackArtifact,
+    RollbackTarget,
+    SourceShaEvidenceKind,
+    legacy_rollback_verified,
+    select_rollback_target,
+)
+from deploy.rollback import RollbackDecision, plan_rollback
 
 # Digest-pinned reference bound to the ApexScan backend image name (the repo
 # component must be ``apexscan-backend``): a syntactically valid digest from an
@@ -28,6 +37,31 @@ _REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MIN_COMPOSE = (2, 24)
 _BACKEND = "backend"
+
+
+class ReleasePathError(ValueError):
+    """Raised when a versioned release path cannot be safely resolved."""
+
+
+def resolve_release_path(deploy_root: str, target_sha: str) -> str:
+    """Resolve the versioned release directory ``<deploy_root>/<full-sha>`` (fail closed).
+
+    Path resolution lives in reviewed code, not workflow string concatenation: the
+    root must be absolute and traversal-free, the SHA a full 40-char hex commit
+    (no short SHA, tag, branch, slash, or ``..``), and the result must remain a
+    direct child of the root. Rejects anything that could escape the root.
+    """
+    if not deploy_root.startswith("/") or ".." in deploy_root.split("/"):
+        raise ReleasePathError("deploy_root must be an absolute, traversal-free path")
+    if not _REMOTE_PATH.match(deploy_root):
+        raise ReleasePathError("deploy_root has invalid characters")
+    if not _FULL_SHA.match(target_sha):
+        raise ReleasePathError("target_sha must be a full 40-char hex commit")
+    root = deploy_root.rstrip("/")
+    release = f"{root}/{target_sha}"
+    if not release.startswith(f"{root}/"):
+        raise ReleasePathError("resolved release path escaped the deploy root")
+    return release
 
 
 class TransportOutcome(StrEnum):
@@ -46,6 +80,8 @@ class TransportOutcome(StrEnum):
     COMPOSE_VERSION_UNSUPPORTED = "compose_version_unsupported"
     COMPOSE_CONFIG_INVALID = "compose_config_invalid"
     ROLLBACK_TARGET_UNAVAILABLE = "rollback_target_unavailable"
+    LEGACY_ROLLBACK_ARTIFACT_REQUIRED = "legacy_rollback_artifact_required"
+    RELEASE_PATH_INVALID = "release_path_invalid"
     TARGET_IMAGE_PULL_FAILED = "target_image_pull_failed"
     DEPLOYMENT_COMMAND_FAILED = "deployment_command_failed"
     HEALTH_FAILED = "health_failed"
@@ -53,6 +89,7 @@ class TransportOutcome(StrEnum):
     READINESS_FAILED = "readiness_failed"
     WRONG_BUILD_SHA = "wrong_build_sha"
     ROLLED_BACK = "rolled_back"
+    LEGACY_ROLLED_BACK = "legacy_rolled_back"
     ROLLBACK_FAILED = "rollback_failed"
     ROLLBACK_REQUIRES_OPERATOR_INTERVENTION = "rollback_requires_operator_intervention"
 
@@ -103,7 +140,7 @@ class DeployConfig:
 
     target_image: str
     target_sha: str
-    deploy_path: str
+    deploy_root: str
     base_url: str
     dhan_restart_safe: bool
     require_migrations: bool = False
@@ -114,8 +151,16 @@ class DeployConfig:
     # SAME project/volumes/networks instead of the deploy-dir-derived default.
     project_name: str = "apexscan"
     # The single production-authority Compose file (DEPLOY-3B). Self-contained;
-    # not the developer base + overlay. Resolved inside ``deploy_path``.
+    # not the developer base + overlay. Resolved inside the versioned release dir.
     compose_file: str = "docker-compose.production.yml"
+    # First-deploy legacy rollback artifact (DEPLOY-3C-R2). Consulted ONLY when the
+    # running backend reports no build_sha; ignored once a SHA-pinned image runs.
+    legacy_artifact: LegacyRollbackArtifact | None = None
+
+    @property
+    def release_path(self) -> str:
+        """The versioned release directory for this exact target SHA."""
+        return resolve_release_path(self.deploy_root, self.target_sha)
 
 
 def _priv(cfg: DeployConfig, *args: str) -> list[str]:
@@ -141,9 +186,9 @@ def _compose(cfg: DeployConfig, *, image: str | None = None) -> list[str]:
         "-p",
         cfg.project_name,
         "-f",
-        f"{cfg.deploy_path}/{cfg.compose_file}",
+        f"{cfg.release_path}/{cfg.compose_file}",
         "--project-directory",
-        cfg.deploy_path,
+        cfg.release_path,
     )
 
 
@@ -173,7 +218,7 @@ def _preflight(executor: RemoteExecutor, cfg: DeployConfig) -> TransportOutcome 
         and not executor.run(["sudo", "-n", "true"]).ok
     ):
         return TransportOutcome.DOCKER_PRIVILEGE_UNAVAILABLE
-    if not executor.run(_priv(cfg, "test", "-d", cfg.deploy_path)).ok:
+    if not executor.run(_priv(cfg, "test", "-d", cfg.release_path)).ok:
         return TransportOutcome.REMOTE_PATH_INVALID
     if not executor.run(_priv(cfg, "docker", "info")).ok:
         return TransportOutcome.DOCKER_UNAVAILABLE
@@ -188,18 +233,41 @@ def _preflight(executor: RemoteExecutor, cfg: DeployConfig) -> TransportOutcome 
     return None
 
 
-def _capture_previous(
-    executor: RemoteExecutor, cfg: DeployConfig, read_build_sha: Callable[[], str | None]
-) -> tuple[str, str] | None:
-    """Capture (previous_sha, previous_digest) for an immutable rollback, or None."""
-    previous_sha = read_build_sha()
-    if previous_sha is None or not _FULL_SHA.match(previous_sha):
-        return None
+def _running_digest(executor: RemoteExecutor, cfg: DeployConfig) -> str | None:
+    """The current backend image reference from Compose, or None if not a digest."""
     result = executor.run([*_compose(cfg), "ps", "--format", "{{.Image}}", _BACKEND])
     digest = result.stdout.strip().splitlines()[0] if result.ok and result.stdout.strip() else ""
-    if not is_immutable_ref(digest) or not _DIGEST_REF.match(digest):
-        return None
-    return previous_sha, digest
+    return digest if _DIGEST_REF.match(digest) else None
+
+
+def _resolve_rollback(
+    executor: RemoteExecutor,
+    cfg: DeployConfig,
+    probe_version: Callable[[], tuple[bool, str | None]],
+) -> tuple[TransportOutcome | None, RollbackTarget | None]:
+    """Resolve the rollback target before mutation (normal, legacy, or fail closed).
+
+    Reads ``/version`` (responded?, build_sha?) and the running image digest, then
+    delegates the selection to :func:`deploy.legacy.select_rollback_target`. A broken
+    ``/version`` fails closed; a modern build always uses normal semantics; a
+    build_sha-less (legacy) backend uses the explicit legacy artifact or, if absent,
+    demands one — never a silent no-rollback deploy.
+    """
+    responded, build_sha = probe_version()
+    if not responded:
+        return TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, None
+    running_digest = _running_digest(executor, cfg)
+    target = select_rollback_target(
+        runtime_build_sha=build_sha,
+        running_digest=running_digest,
+        legacy=cfg.legacy_artifact,
+        version_responded=True,
+    )
+    if target is not None:
+        return None, target
+    if build_sha is None and cfg.legacy_artifact is None:
+        return TransportOutcome.LEGACY_ROLLBACK_ARTIFACT_REQUIRED, None
+    return TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, None
 
 
 def _pull(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> bool:
@@ -227,22 +295,29 @@ def _validate(cfg: DeployConfig) -> TransportOutcome | None:
         return TransportOutcome.TARGET_IMAGE_INVALID
     if not _FULL_SHA.match(cfg.target_sha):
         return TransportOutcome.TARGET_IMAGE_INVALID
-    if ".." in cfg.deploy_path or not _REMOTE_PATH.match(cfg.deploy_path):
-        return TransportOutcome.REMOTE_PATH_INVALID
+    try:
+        resolve_release_path(cfg.deploy_root, cfg.target_sha)
+    except ReleasePathError:
+        return TransportOutcome.RELEASE_PATH_INVALID
     return None
 
 
 def _rollback(
     executor: RemoteExecutor,
     cfg: DeployConfig,
-    previous: tuple[str, str],
+    target: RollbackTarget,
     verify: Callable[[str], VerifyResult],
+    verify_legacy: Callable[[str], bool],
     build_audit: Callable[..., DeploymentAudit],
 ) -> DeploymentAudit:
-    """Attempt a single immutable rollback to the previous digest (no loop)."""
-    previous_sha, previous_digest = previous
+    """Attempt a single immutable rollback (no loop) to the same Compose authority.
+
+    Uses the exact captured previous digest, verifying normally (build_sha) or, for
+    a first-deploy legacy target, by exact digest + health/startup/readiness (never
+    SHA). Never switches to the legacy host Compose file.
+    """
     plan = plan_rollback(
-        previous_artifact=previous_digest,
+        previous_artifact=target.image_digest,
         restart_required=True,
         dhan_restart_safety_confirmed=cfg.dhan_restart_safe,
     )
@@ -252,24 +327,30 @@ def _rollback(
         )
     if plan.decision is RollbackDecision.UNAVAILABLE:
         return build_audit(TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, False, None)
-    if not _pull(executor, cfg, previous_digest):
+    if not _pull(executor, cfg, target.image_digest):
         return build_audit(TransportOutcome.ROLLBACK_FAILED, True, "pull_failed")
-    if not _update_backend(executor, cfg, previous_digest):
+    if not _update_backend(executor, cfg, target.image_digest):
         return build_audit(TransportOutcome.ROLLBACK_FAILED, True, "update_failed")
-    verified = verify(previous_sha)
+    if target.legacy:
+        if verify_legacy(target.image_digest):
+            return build_audit(TransportOutcome.LEGACY_ROLLED_BACK, True, "legacy_success")
+        return build_audit(TransportOutcome.ROLLBACK_FAILED, True, "legacy_verification_failed")
+    verified = verify(target.source_sha)
     if verified.outcome is VerifyOutcome.SUCCESS:
         return build_audit(TransportOutcome.ROLLED_BACK, True, "success")
     return build_audit(TransportOutcome.ROLLBACK_FAILED, True, verified.outcome.value)
 
 
 def _pre_mutation_gate(
-    executor: RemoteExecutor, cfg: DeployConfig, read_build_sha: Callable[[], str | None]
-) -> tuple[TransportOutcome | None, tuple[str, str] | None]:
-    """Run every pre-mutation gate in order; return (failure_or_None, previous_or_None).
+    executor: RemoteExecutor,
+    cfg: DeployConfig,
+    probe_version: Callable[[], tuple[bool, str | None]],
+) -> tuple[TransportOutcome | None, RollbackTarget | None]:
+    """Run every pre-mutation gate in order; return (failure_or_None, target_or_None).
 
-    Ordering: validate -> preflight -> capture rollback target -> pull. On the pull
-    failure the captured ``previous`` is still returned so the audit records it; no
-    mutation has occurred in any failing path.
+    Ordering: validate -> preflight -> resolve rollback target -> pull. Rollback
+    eligibility is proven BEFORE any mutation; on pull failure the resolved target
+    is still returned for the audit. No mutation occurs in any failing path.
     """
     invalid = _validate(cfg)
     if invalid is not None:
@@ -277,12 +358,12 @@ def _pre_mutation_gate(
     preflight_failure = _preflight(executor, cfg)
     if preflight_failure is not None:
         return preflight_failure, None
-    previous = _capture_previous(executor, cfg, read_build_sha)
-    if previous is None:
-        return TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, None
+    rollback_failure, target = _resolve_rollback(executor, cfg, probe_version)
+    if rollback_failure is not None:
+        return rollback_failure, None
     if not _pull(executor, cfg, cfg.target_image):
-        return TransportOutcome.TARGET_IMAGE_PULL_FAILED, previous
-    return None, previous
+        return TransportOutcome.TARGET_IMAGE_PULL_FAILED, target
+    return None, target
 
 
 def deploy(
@@ -290,17 +371,19 @@ def deploy(
     cfg: DeployConfig,
     *,
     verify: Callable[[str], VerifyResult],
-    read_build_sha: Callable[[], str | None],
+    verify_legacy: Callable[[str], bool],
+    probe_version: Callable[[], tuple[bool, str | None]],
     now: Callable[[], float] = time.time,
 ) -> DeploymentAudit:
     """Promote ``cfg.target_image`` to production, rolling back on any failure.
 
-    Enforces the ordering: validate -> preflight -> capture rollback target ->
-    pull -> mutate -> verify, and on post-mutation failure -> rollback -> verify.
-    No mutation occurs until every pre-mutation gate passes; fails closed.
+    Enforces the ordering: validate -> preflight -> resolve rollback target ->
+    pull -> mutate -> verify, and on post-mutation failure -> single rollback ->
+    verify. No mutation occurs until every pre-mutation gate passes (including
+    proving a rollback target exists); fails closed.
     """
     started = now()
-    failure, previous = _pre_mutation_gate(executor, cfg, read_build_sha)
+    failure, target = _pre_mutation_gate(executor, cfg, probe_version)
 
     def audit(
         outcome: TransportOutcome,
@@ -309,13 +392,12 @@ def deploy(
         rollback_attempted: bool = False,
         rollback_result: str | None = None,
     ) -> DeploymentAudit:
-        prev_sha, prev_digest = previous or (None, None)
         return DeploymentAudit(
             run_id=cfg.run_id,
             requested_sha=cfg.target_sha,
             target_digest=cfg.target_image,
-            previous_sha=prev_sha,
-            previous_digest=prev_digest,
+            previous_sha=target.source_sha if target else None,
+            previous_digest=target.image_digest if target else None,
             started_at=started,
             completed_at=now(),
             verification=verification,
@@ -326,57 +408,81 @@ def deploy(
 
     if failure is not None:
         return audit(failure)
-    assert previous is not None  # gate guarantees it on the success path
+    assert target is not None  # gate guarantees it on the success path
 
-    def rollback_audit(
-        outcome: TransportOutcome, attempted: bool, result: str | None, *, failure: str
-    ) -> DeploymentAudit:
-        return audit(
-            outcome, verification=failure, rollback_attempted=attempted, rollback_result=result
-        )
-
-    if not _update_backend(executor, cfg, cfg.target_image):
+    def do_rollback(failure_reason: str) -> DeploymentAudit:
         return _rollback(
             executor,
             cfg,
-            previous,
+            target,
             verify,
-            lambda o, a, r: rollback_audit(o, a, r, failure="deployment_command_failed"),
+            verify_legacy,
+            lambda o, a, r: audit(
+                o, verification=failure_reason, rollback_attempted=a, rollback_result=r
+            ),
         )
+
+    if not _update_backend(executor, cfg, cfg.target_image):
+        return do_rollback("deployment_command_failed")
     result = verify(cfg.target_sha)
     if result.outcome is VerifyOutcome.SUCCESS:
         return audit(TransportOutcome.SUCCESS, verification="success")
-    failure_reason = _VERIFY_TO_OUTCOME[result.outcome].value
-    return _rollback(
-        executor,
-        cfg,
-        previous,
-        verify,
-        lambda o, a, r: rollback_audit(o, a, r, failure=failure_reason),
-    )
+    return do_rollback(_VERIFY_TO_OUTCOME[result.outcome].value)
 
 
 def _build_verifier(
     base_url: str, *, attempts: int, interval: float, timeout: float
-) -> tuple[Callable[[str], VerifyResult], Callable[[], str | None]]:
-    """Wire the HTTP probe into a (verify, read_build_sha) pair for real deploys."""
-    from deploy.health_check import ProbeResult, probe_endpoints, verify_release
+) -> tuple[Callable[[str], VerifyResult], Callable[[], tuple[bool, str | None]]]:
+    """Wire the HTTP probes into a (verify, probe_version) pair for real deploys."""
+    from deploy.health_check import probe_endpoints, probe_version, verify_release
 
-    def probe() -> ProbeResult:
-        return probe_endpoints(base_url.rstrip("/"), timeout)
+    root = base_url.rstrip("/")
 
     def verify(expected_sha: str) -> VerifyResult:
         return verify_release(
-            probe,
+            lambda: probe_endpoints(root, timeout),
             expected_sha=expected_sha,
             max_attempts=attempts,
             sleep=lambda: time.sleep(interval),
         )
 
-    def read_build_sha() -> str | None:
-        return probe().version_sha
+    def version() -> tuple[bool, str | None]:
+        return probe_version(root, timeout)
 
-    return verify, read_build_sha
+    return verify, version
+
+
+def _build_legacy_verifier(
+    executor: RemoteExecutor, cfg: DeployConfig, *, timeout: float
+) -> Callable[[str], bool]:
+    """Legacy rollback verifier: exact running digest + health (never SHA)."""
+    from deploy.health_check import probe_endpoints
+
+    def verify_legacy(expected_digest: str) -> bool:
+        probe = probe_endpoints(cfg.base_url.rstrip("/"), timeout)
+        return legacy_rollback_verified(
+            running_digest=_running_digest(executor, cfg) or "",
+            expected_digest=expected_digest,
+            health_ok=probe.health_ok,
+            startup_ok=probe.startup_ok,
+            ready_ok=probe.ready_ok,
+        )
+
+    return verify_legacy
+
+
+def _legacy_artifact_from_args(args: object) -> LegacyRollbackArtifact | None:
+    """Build a LegacyRollbackArtifact from optional CLI args (fail closed on invalid)."""
+    digest = args.legacy_digest  # type: ignore[attr-defined]
+    if not digest:
+        return None
+    return LegacyRollbackArtifact(
+        image_digest=digest,
+        running_image_id=args.legacy_image_id,  # type: ignore[attr-defined]
+        source_sha_evidence=args.legacy_source_sha,  # type: ignore[attr-defined]
+        source_sha_evidence_kind=SourceShaEvidenceKind(args.legacy_evidence_kind),  # type: ignore[attr-defined]
+        provenance=args.legacy_provenance,  # type: ignore[attr-defined]
+    )
 
 
 def _parse_args(argv: Sequence[str] | None) -> object:
@@ -390,7 +496,7 @@ def _parse_args(argv: Sequence[str] | None) -> object:
     parser.add_argument("--known-hosts", required=True)
     parser.add_argument("--image", required=True, help="Digest-pinned target image reference.")
     parser.add_argument("--target-sha", required=True)
-    parser.add_argument("--deploy-path", required=True)
+    parser.add_argument("--deploy-root", required=True, help="Versioned release root dir.")
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--dhan-restart-safe", action="store_true")
     parser.add_argument("--require-migrations", action="store_true")
@@ -401,6 +507,15 @@ def _parse_args(argv: Sequence[str] | None) -> object:
         help="How Docker is invoked on the host (production ubuntu needs sudo_non_interactive).",
     )
     parser.add_argument("--project-name", default="apexscan", help="Existing Compose project name.")
+    parser.add_argument("--legacy-digest", default="", help="First-deploy legacy rollback digest.")
+    parser.add_argument("--legacy-image-id", default="", help="Legacy running image id evidence.")
+    parser.add_argument("--legacy-source-sha", default="", help="Legacy provenance SHA.")
+    parser.add_argument(
+        "--legacy-evidence-kind",
+        choices=[k.value for k in SourceShaEvidenceKind],
+        default=SourceShaEvidenceKind.IMAGE_TAG.value,
+    )
+    parser.add_argument("--legacy-provenance", default="operator-provisioned")
     parser.add_argument("--attempts", type=int, default=30)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=5.0)
@@ -419,24 +534,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         key_file=args.key_file,  # type: ignore[attr-defined]
         known_hosts_file=args.known_hosts,  # type: ignore[attr-defined]
     )
+    try:
+        legacy_artifact = _legacy_artifact_from_args(args)
+    except LegacyArtifactError as error:
+        print(f"outcome=legacy_rollback_artifact_required detail={error}", file=sys.stderr)
+        return 1
     cfg = DeployConfig(
         target_image=args.image,  # type: ignore[attr-defined]
         target_sha=args.target_sha,  # type: ignore[attr-defined]
-        deploy_path=args.deploy_path,  # type: ignore[attr-defined]
+        deploy_root=args.deploy_root,  # type: ignore[attr-defined]
         base_url=args.base_url,  # type: ignore[attr-defined]
         dhan_restart_safe=args.dhan_restart_safe,  # type: ignore[attr-defined]
         require_migrations=args.require_migrations,  # type: ignore[attr-defined]
         run_id=args.run_id,  # type: ignore[attr-defined]
         docker_privilege=DockerPrivilege(args.docker_privilege),  # type: ignore[attr-defined]
         project_name=args.project_name,  # type: ignore[attr-defined]
+        legacy_artifact=legacy_artifact,
     )
-    verify, read_build_sha = _build_verifier(
+    verify, probe_version = _build_verifier(
         cfg.base_url,
         attempts=args.attempts,  # type: ignore[attr-defined]
         interval=args.interval,  # type: ignore[attr-defined]
         timeout=args.timeout,  # type: ignore[attr-defined]
     )
-    audit = deploy(executor, cfg, verify=verify, read_build_sha=read_build_sha)
+    verify_legacy = _build_legacy_verifier(executor, cfg, timeout=args.timeout)  # type: ignore[attr-defined]
+    audit = deploy(
+        executor, cfg, verify=verify, verify_legacy=verify_legacy, probe_version=probe_version
+    )
     print(
         f"outcome={audit.outcome.value} verification={audit.verification} "
         f"rollback_attempted={audit.rollback_attempted} rollback_result={audit.rollback_result} "

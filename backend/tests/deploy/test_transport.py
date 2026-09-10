@@ -18,7 +18,8 @@ _PREV_SHA = "1" * 40
 _TARGET_SHA = "2" * 40
 _PREV_DIGEST = "ghcr.io/o/apexscan-backend@sha256:" + "a" * 64
 _TARGET_IMAGE = "ghcr.io/o/apexscan-backend@sha256:" + "b" * 64
-_DEPLOY_PATH = "/opt/apexscan"
+_DEPLOY_ROOT = "/opt/apexscan/releases"
+_RELEASE = f"{_DEPLOY_ROOT}/{_TARGET_SHA}"
 
 
 class FakeExecutor:
@@ -50,7 +51,7 @@ def _cfg(**over: object) -> DeployConfig:
     base = dict(
         target_image=_TARGET_IMAGE,
         target_sha=_TARGET_SHA,
-        deploy_path=_DEPLOY_PATH,
+        deploy_root=_DEPLOY_ROOT,
         base_url="https://apex.example",
         dhan_restart_safe=True,
     )
@@ -66,8 +67,23 @@ def _verify_by_sha(mapping: dict[str, VerifyOutcome]) -> Callable[[str], VerifyR
     return lambda sha: VerifyResult(mapping[sha], 1, None)
 
 
-def _run(executor: FakeExecutor, cfg: DeployConfig, verify, prev_sha=_PREV_SHA):
-    return deploy(executor, cfg, verify=verify, read_build_sha=lambda: prev_sha, now=lambda: 0.0)
+def _run(
+    executor: FakeExecutor,
+    cfg: DeployConfig,
+    verify,
+    *,
+    responded: bool = True,
+    prev_sha: str | None = _PREV_SHA,
+    verify_legacy: Callable[[str], bool] = lambda _d: True,
+):
+    return deploy(
+        executor,
+        cfg,
+        verify=verify,
+        verify_legacy=verify_legacy,
+        probe_version=lambda: (responded, prev_sha),
+        now=lambda: 0.0,
+    )
 
 
 def _flat(executor: FakeExecutor) -> str:
@@ -127,10 +143,10 @@ def test_unrelated_repository_digest_rejected() -> None:
     assert ex.calls == []
 
 
-def test_path_traversal_rejected_without_contact() -> None:
+def test_path_traversal_in_deploy_root_rejected_without_contact() -> None:
     ex = FakeExecutor(_healthy_handler)
-    audit = _run(ex, _cfg(deploy_path="/opt/../etc"), _verify_const(VerifyOutcome.SUCCESS))
-    assert audit.outcome is TransportOutcome.REMOTE_PATH_INVALID
+    audit = _run(ex, _cfg(deploy_root="/opt/../etc"), _verify_const(VerifyOutcome.SUCCESS))
+    assert audit.outcome is TransportOutcome.RELEASE_PATH_INVALID
     assert ex.calls == []
 
 
@@ -190,10 +206,11 @@ def test_compose_config_invalid() -> None:
 # --------------------------------------------------------------------------- #
 # rollback target + pull
 # --------------------------------------------------------------------------- #
-def test_rollback_target_unavailable_when_no_prev_sha() -> None:
+def test_legacy_artifact_required_when_no_build_sha_and_no_artifact() -> None:
+    # /version responds without build_sha (legacy) but no legacy artifact provided.
     ex = FakeExecutor(_healthy_handler)
     audit = _run(ex, _cfg(), _verify_const(VerifyOutcome.SUCCESS), prev_sha=None)
-    assert audit.outcome is TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE
+    assert audit.outcome is TransportOutcome.LEGACY_ROLLBACK_ARTIFACT_REQUIRED
     assert "up -d" not in _flat(ex)
 
 
@@ -326,3 +343,107 @@ def test_single_rollback_no_loop() -> None:
     _run(ex, _cfg(), verify)
     # exactly two 'up' mutations total: target + one rollback attempt (no loop)
     assert sum(1 for c in ex.calls if _has(c, "up", "-d")) == 2
+
+
+# --------------------------------------------------------------------------- #
+# B (DEPLOY-3C-R2) — versioned release path
+# --------------------------------------------------------------------------- #
+def test_release_path_resolves_under_root() -> None:
+    from deploy.transport import resolve_release_path
+
+    assert resolve_release_path(_DEPLOY_ROOT, _TARGET_SHA) == _RELEASE
+
+
+def test_release_path_rejects_short_and_nonhex_and_traversal() -> None:
+    import pytest
+
+    from deploy.transport import ReleasePathError, resolve_release_path
+
+    for root, sha in [
+        (_DEPLOY_ROOT, "2" * 12),  # short SHA
+        (_DEPLOY_ROOT, "g" * 40),  # non-hex
+        (_DEPLOY_ROOT, "2" * 39),  # wrong length
+        ("relative/root", _TARGET_SHA),  # non-absolute root
+        ("/opt/../etc", _TARGET_SHA),  # traversal in root
+    ]:
+        with pytest.raises(ReleasePathError):
+            resolve_release_path(root, sha)
+
+
+def test_target_and_rollback_use_same_versioned_release_authority() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    verify = _verify_by_sha(
+        {_TARGET_SHA: VerifyOutcome.HEALTH_FAILED, _PREV_SHA: VerifyOutcome.SUCCESS}
+    )
+    _run(ex, _cfg(), verify)
+    ups = [c for c in ex.calls if _has(c, "up", "-d")]
+    assert len(ups) == 2  # target + rollback
+    for c in ups:
+        joined = " ".join(c)
+        assert f"{_RELEASE}/docker-compose.production.yml" in joined
+        assert "-p apexscan" in joined and "--no-deps" in c and "--no-build" in c
+
+
+# --------------------------------------------------------------------------- #
+# B10-19 (DEPLOY-3C-R2) — first-deploy legacy rollback wiring
+# --------------------------------------------------------------------------- #
+_LEGACY_DIGEST = "ghcr.io/o/apexscan-backend@sha256:" + "c" * 64
+
+
+def _legacy():
+    from deploy.legacy import LegacyRollbackArtifact, SourceShaEvidenceKind
+
+    return LegacyRollbackArtifact(
+        image_digest=_LEGACY_DIGEST,
+        running_image_id="sha256:" + "d" * 64,
+        source_sha_evidence="7" * 40,
+        source_sha_evidence_kind=SourceShaEvidenceKind.IMAGE_TAG,
+        provenance="preserved",
+    )
+
+
+def test_broken_version_fails_closed_no_mutation() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    audit = _run(
+        ex, _cfg(legacy_artifact=_legacy()), _verify_const(VerifyOutcome.SUCCESS), responded=False
+    )
+    assert audit.outcome is TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE
+    assert "up -d" not in _flat(ex)  # never enters legacy on a broken /version
+
+
+def test_legacy_rollback_on_target_failure() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    # legacy backend (no build_sha) + valid artifact; target deploy fails health
+    audit = _run(
+        ex,
+        _cfg(legacy_artifact=_legacy()),
+        _verify_const(VerifyOutcome.HEALTH_FAILED),
+        prev_sha=None,
+    )
+    assert audit.outcome is TransportOutcome.LEGACY_ROLLED_BACK
+    assert audit.previous_digest == _LEGACY_DIGEST and audit.rollback_attempted
+    assert any(_has(c, "docker", "pull", _LEGACY_DIGEST) for c in ex.calls)
+
+
+def test_legacy_rollback_verification_failure() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    audit = _run(
+        ex,
+        _cfg(legacy_artifact=_legacy()),
+        _verify_const(VerifyOutcome.HEALTH_FAILED),
+        prev_sha=None,
+        verify_legacy=lambda _d: False,
+    )
+    assert audit.outcome is TransportOutcome.ROLLBACK_FAILED
+    assert audit.rollback_result == "legacy_verification_failed"
+
+
+def test_modern_deploy_ignores_legacy_artifact() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    # build_sha present -> normal rollback; legacy verify would fail if wrongly used.
+    verify = _verify_by_sha(
+        {_TARGET_SHA: VerifyOutcome.HEALTH_FAILED, _PREV_SHA: VerifyOutcome.SUCCESS}
+    )
+    audit = _run(ex, _cfg(legacy_artifact=_legacy()), verify, verify_legacy=lambda _d: False)
+    assert audit.outcome is TransportOutcome.ROLLED_BACK  # normal path used, not legacy
+    assert audit.previous_digest == _PREV_DIGEST  # running digest, not the legacy digest
