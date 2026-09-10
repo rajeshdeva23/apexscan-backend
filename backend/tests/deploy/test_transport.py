@@ -447,3 +447,41 @@ def test_modern_deploy_ignores_legacy_artifact() -> None:
     audit = _run(ex, _cfg(legacy_artifact=_legacy()), verify, verify_legacy=lambda _d: False)
     assert audit.outcome is TransportOutcome.ROLLED_BACK  # normal path used, not legacy
     assert audit.previous_digest == _PREV_DIGEST  # running digest, not the legacy digest
+
+
+def test_malformed_build_sha_fails_closed_not_legacy() -> None:
+    # A non-hex/"unknown" build_sha is neither a valid modern SHA nor legacy: it
+    # must fail closed (never downgrade to legacy), even with an artifact present.
+    ex = FakeExecutor(_healthy_handler)
+    audit = _run(
+        ex,
+        _cfg(legacy_artifact=_legacy()),
+        _verify_const(VerifyOutcome.SUCCESS),
+        prev_sha="unknown",
+    )
+    assert audit.outcome is TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE
+    assert "up -d" not in _flat(ex)
+
+
+def test_legacy_args_construction_contract() -> None:
+    import argparse
+
+    import pytest
+
+    from deploy.legacy import LegacyArtifactError
+    from deploy.transport import _legacy_artifact_from_args
+
+    def _args(**kw) -> argparse.Namespace:
+        base = dict(
+            legacy_digest="",
+            legacy_image_id="sha256:" + "d" * 64,
+            legacy_source_sha="7" * 40,
+            legacy_evidence_kind="image_tag",
+            legacy_provenance="p",
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    assert _legacy_artifact_from_args(_args()) is None  # no digest -> no artifact
+    with pytest.raises(LegacyArtifactError):  # malformed digest -> raises (main catches -> None)
+        _legacy_artifact_from_args(_args(legacy_digest="evil/malware@sha256:" + "a" * 64))

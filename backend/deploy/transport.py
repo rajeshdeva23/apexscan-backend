@@ -537,8 +537,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         legacy_artifact = _legacy_artifact_from_args(args)
     except LegacyArtifactError as error:
-        print(f"outcome=legacy_rollback_artifact_required detail={error}", file=sys.stderr)
-        return 1
+        # Do NOT fail the run here: malformed legacy config must not break a modern
+        # deployment (build_sha present ignores legacy). A first legacy deploy still
+        # fails closed with LEGACY_ROLLBACK_ARTIFACT_REQUIRED inside the gate.
+        print(f"note: ignoring invalid legacy artifact config ({error})", file=sys.stderr)
+        legacy_artifact = None
     cfg = DeployConfig(
         target_image=args.image,  # type: ignore[attr-defined]
         target_sha=args.target_sha,  # type: ignore[attr-defined]
