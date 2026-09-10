@@ -89,6 +89,28 @@ def test_symlink_member_rejected() -> None:
         verify_bundle(_malicious_tar("docker-compose.yml", symlink=True), expected_sha=_SHA)
 
 
+def test_hardlink_member_rejected() -> None:
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        info = tarfile.TarInfo("docker-compose.yml")
+        info.type = tarfile.LNKTYPE
+        info.linkname = "manifest.json"
+        tar.addfile(info)
+    with pytest.raises(BundleError, match="non-regular"):
+        verify_bundle(out.getvalue(), expected_sha=_SHA)
+
+
+def test_duplicate_member_rejected() -> None:
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        for data in (b"a", b"b"):
+            info = tarfile.TarInfo("docker-compose.yml")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    with pytest.raises(BundleError, match="duplicate"):
+        verify_bundle(out.getvalue(), expected_sha=_SHA)
+
+
 def test_manifest_schema_enforced() -> None:
     out = io.BytesIO()
     manifest = json.dumps({"schema": "wrong", "source_sha": _SHA, "files": {}}).encode()

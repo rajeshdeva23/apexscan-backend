@@ -85,6 +85,20 @@ def test_no_target_without_build_sha_or_legacy() -> None:
     assert select_rollback_target(runtime_build_sha=None, running_digest=None, legacy=None) is None
 
 
+def test_broken_version_fails_closed_never_legacy() -> None:
+    # A modern image whose /version is unreachable/malformed must NOT re-enter
+    # legacy mode even if a legacy artifact is provisioned.
+    assert (
+        select_rollback_target(
+            runtime_build_sha=None,
+            running_digest=None,
+            legacy=_artifact(),
+            version_responded=False,
+        )
+        is None
+    )
+
+
 def test_legacy_verification_requires_exact_digest_and_health() -> None:
     ok = legacy_rollback_verified(
         running_digest=_DIGEST,

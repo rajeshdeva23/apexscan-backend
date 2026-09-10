@@ -76,11 +76,13 @@ def _safe_members(tar: tarfile.TarFile) -> dict[str, bytes]:
     """Extract regular-file members with flat, traversal-free names into memory."""
     out: dict[str, bytes] = {}
     for member in tar.getmembers():
-        if not member.isreg():
+        if not member.isreg():  # rejects symlinks, hardlinks, dirs, devices, FIFOs
             raise BundleError(f"non-regular tar member rejected: {member.name!r}")
         name = member.name
         if name.startswith("/") or ".." in name.split("/") or not _SAFE_NAME.match(name):
             raise BundleError(f"unsafe tar member name rejected: {name!r}")
+        if name in out:
+            raise BundleError(f"duplicate tar member rejected: {name!r}")
         extracted = tar.extractfile(member)
         if extracted is None:
             raise BundleError(f"unreadable tar member: {name!r}")

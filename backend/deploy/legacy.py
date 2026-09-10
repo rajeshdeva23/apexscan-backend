@@ -85,22 +85,29 @@ def select_rollback_target(
     runtime_build_sha: str | None,
     running_digest: str | None,
     legacy: LegacyRollbackArtifact | None,
+    version_responded: bool = True,
 ) -> RollbackTarget | None:
     """Resolve the rollback target, enforcing the legacy-exception scope.
 
     Normal path (mandatory whenever the backend attests a ``build_sha``): the
     running image must itself be an immutable digest. The legacy artifact is
-    consulted ONLY when ``runtime_build_sha`` is None, so it can never be used
-    once a SHA-pinned image is running.
+    consulted ONLY when the version endpoint *responded* but carried no
+    ``build_sha`` (a genuine pre-DEPLOY-1 image). A broken/unreachable/malformed
+    ``/version`` (``version_responded=False``) fails closed and never re-enters
+    legacy mode, so a transient endpoint failure on a modern image cannot cause a
+    rollback to the ancient legacy image.
 
     Args:
         runtime_build_sha: ``/version.build_sha`` of the running backend, or None.
         running_digest: The running image's immutable digest, if any.
         legacy: A provisioned legacy artifact, or None.
+        version_responded: Whether ``/version`` returned a valid response at all.
 
     Returns:
         A :class:`RollbackTarget`, or None if no safe target exists.
     """
+    if not version_responded:
+        return None  # unreadable /version -> fail closed; legacy is never a fallback for errors
     if runtime_build_sha is not None:
         if not _FULL_SHA.match(runtime_build_sha):
             return None
