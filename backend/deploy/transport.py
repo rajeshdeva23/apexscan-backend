@@ -41,6 +41,7 @@ class TransportOutcome(StrEnum):
     SSH_HOST_VERIFICATION_FAILED = "ssh_host_verification_failed"
     SSH_CONNECTION_FAILED = "ssh_connection_failed"
     DOCKER_UNAVAILABLE = "docker_unavailable"
+    DOCKER_PRIVILEGE_UNAVAILABLE = "docker_privilege_unavailable"
     COMPOSE_UNAVAILABLE = "compose_unavailable"
     COMPOSE_VERSION_UNSUPPORTED = "compose_version_unsupported"
     COMPOSE_CONFIG_INVALID = "compose_config_invalid"
@@ -82,6 +83,20 @@ class DeploymentAudit:
     outcome: TransportOutcome
 
 
+class DockerPrivilege(StrEnum):
+    """How Docker is invoked on the host (closed set — never arbitrary shell)."""
+
+    DIRECT = "direct"  # `docker ...` (user is in the docker group / local tests)
+    SUDO_NON_INTERACTIVE = "sudo_non_interactive"  # `sudo -n docker ...` (prod ubuntu)
+
+
+# Fixed, closed command prefixes — no caller-supplied prefix strings are allowed.
+_PRIVILEGE_PREFIX: dict[DockerPrivilege, tuple[str, ...]] = {
+    DockerPrivilege.DIRECT: (),
+    DockerPrivilege.SUDO_NON_INTERACTIVE: ("sudo", "-n"),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class DeployConfig:
     """Inputs describing one promotion (no secrets; SSH lives in the executor)."""
@@ -93,20 +108,42 @@ class DeployConfig:
     dhan_restart_safe: bool
     require_migrations: bool = False
     run_id: str = "local"
+    docker_privilege: DockerPrivilege = DockerPrivilege.DIRECT
+    # Existing production Compose project (derived from the running container's
+    # com.docker.compose.project label). Pinned so the deploy attaches to the
+    # SAME project/volumes/networks instead of the deploy-dir-derived default.
+    project_name: str = "apexscan"
 
 
-def _compose(deploy_path: str) -> list[str]:
-    """Compose invocation prefix bound to the production overlay by absolute path."""
-    return [
+def _priv(cfg: DeployConfig, *args: str) -> list[str]:
+    """Prefix a host command with the configured (closed) privilege escalation."""
+    return [*_PRIVILEGE_PREFIX[cfg.docker_privilege], *args]
+
+
+def _compose(cfg: DeployConfig, *, image: str | None = None) -> list[str]:
+    """Compose invocation: privilege prefix, then optional in-command APEXSCAN_IMAGE.
+
+    The ``env APEXSCAN_IMAGE=…`` assignment is placed AFTER the privilege prefix so
+    it survives ``sudo`` (which resets the environment); ``sudo -n env VAR=… docker
+    compose`` sets the variable for the root-run compose, whereas ``env VAR=… sudo``
+    would be stripped. The project name is pinned so the deploy attaches to the
+    existing project's volumes/networks, never a deploy-dir-derived new project.
+    """
+    env_assignment = ["env", f"APEXSCAN_IMAGE={image}"] if image is not None else []
+    return _priv(
+        cfg,
+        *env_assignment,
         "docker",
         "compose",
+        "-p",
+        cfg.project_name,
         "-f",
-        f"{deploy_path}/docker-compose.yml",
+        f"{cfg.deploy_path}/docker-compose.yml",
         "-f",
-        f"{deploy_path}/docker-compose.prod.yml",
+        f"{cfg.deploy_path}/docker-compose.prod.yml",
         "--project-directory",
-        deploy_path,
-    ]
+        cfg.deploy_path,
+    )
 
 
 def _classify_ssh_failure(result: ExecResult) -> TransportOutcome:
@@ -130,18 +167,21 @@ def _preflight(executor: RemoteExecutor, cfg: DeployConfig) -> TransportOutcome 
     reachable = executor.run(["true"])
     if not reachable.ok:
         return _classify_ssh_failure(reachable)
-    if not executor.run(["test", "-d", cfg.deploy_path]).ok:
+    if (
+        cfg.docker_privilege is DockerPrivilege.SUDO_NON_INTERACTIVE
+        and not executor.run(["sudo", "-n", "true"]).ok
+    ):
+        return TransportOutcome.DOCKER_PRIVILEGE_UNAVAILABLE
+    if not executor.run(_priv(cfg, "test", "-d", cfg.deploy_path)).ok:
         return TransportOutcome.REMOTE_PATH_INVALID
-    if not executor.run(["docker", "info"]).ok:
+    if not executor.run(_priv(cfg, "docker", "info")).ok:
         return TransportOutcome.DOCKER_UNAVAILABLE
-    version = executor.run(["docker", "compose", "version", "--short"])
+    version = executor.run(_priv(cfg, "docker", "compose", "version", "--short"))
     if not version.ok:
         return TransportOutcome.COMPOSE_UNAVAILABLE
     if not _compose_version_ok(version.stdout):
         return TransportOutcome.COMPOSE_VERSION_UNSUPPORTED
-    config = executor.run(
-        ["env", f"APEXSCAN_IMAGE={cfg.target_image}", *_compose(cfg.deploy_path), "config", "-q"]
-    )
+    config = executor.run([*_compose(cfg, image=cfg.target_image), "config", "-q"])
     if not config.ok:
         return TransportOutcome.COMPOSE_CONFIG_INVALID
     return None
@@ -154,16 +194,16 @@ def _capture_previous(
     previous_sha = read_build_sha()
     if previous_sha is None or not _FULL_SHA.match(previous_sha):
         return None
-    result = executor.run([*_compose(cfg.deploy_path), "ps", "--format", "{{.Image}}", _BACKEND])
+    result = executor.run([*_compose(cfg), "ps", "--format", "{{.Image}}", _BACKEND])
     digest = result.stdout.strip().splitlines()[0] if result.ok and result.stdout.strip() else ""
     if not is_immutable_ref(digest) or not _DIGEST_REF.match(digest):
         return None
     return previous_sha, digest
 
 
-def _pull(executor: RemoteExecutor, image: str) -> bool:
+def _pull(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> bool:
     """Pull the immutable target image before any mutation."""
-    return executor.run(["docker", "pull", image]).ok
+    return executor.run(_priv(cfg, "docker", "pull", image)).ok
 
 
 def _update_backend(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> bool:
@@ -174,16 +214,7 @@ def _update_backend(executor: RemoteExecutor, cfg: DeployConfig, image: str) -> 
     the mutation strictly to the backend and never touches Postgres/Redis/volumes.
     """
     return executor.run(
-        [
-            "env",
-            f"APEXSCAN_IMAGE={image}",
-            *_compose(cfg.deploy_path),
-            "up",
-            "-d",
-            "--no-deps",
-            "--no-build",
-            _BACKEND,
-        ]
+        [*_compose(cfg, image=image), "up", "-d", "--no-deps", "--no-build", _BACKEND]
     ).ok
 
 
@@ -220,7 +251,7 @@ def _rollback(
         )
     if plan.decision is RollbackDecision.UNAVAILABLE:
         return build_audit(TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, False, None)
-    if not _pull(executor, previous_digest):
+    if not _pull(executor, cfg, previous_digest):
         return build_audit(TransportOutcome.ROLLBACK_FAILED, True, "pull_failed")
     if not _update_backend(executor, cfg, previous_digest):
         return build_audit(TransportOutcome.ROLLBACK_FAILED, True, "update_failed")
@@ -248,7 +279,7 @@ def _pre_mutation_gate(
     previous = _capture_previous(executor, cfg, read_build_sha)
     if previous is None:
         return TransportOutcome.ROLLBACK_TARGET_UNAVAILABLE, None
-    if not _pull(executor, cfg.target_image):
+    if not _pull(executor, cfg, cfg.target_image):
         return TransportOutcome.TARGET_IMAGE_PULL_FAILED, previous
     return None, previous
 
@@ -362,6 +393,13 @@ def _parse_args(argv: Sequence[str] | None) -> object:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--dhan-restart-safe", action="store_true")
     parser.add_argument("--require-migrations", action="store_true")
+    parser.add_argument(
+        "--docker-privilege",
+        choices=[p.value for p in DockerPrivilege],
+        default=DockerPrivilege.DIRECT.value,
+        help="How Docker is invoked on the host (production ubuntu needs sudo_non_interactive).",
+    )
+    parser.add_argument("--project-name", default="apexscan", help="Existing Compose project name.")
     parser.add_argument("--attempts", type=int, default=30)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=5.0)
@@ -388,6 +426,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dhan_restart_safe=args.dhan_restart_safe,  # type: ignore[attr-defined]
         require_migrations=args.require_migrations,  # type: ignore[attr-defined]
         run_id=args.run_id,  # type: ignore[attr-defined]
+        docker_privilege=DockerPrivilege(args.docker_privilege),  # type: ignore[attr-defined]
+        project_name=args.project_name,  # type: ignore[attr-defined]
     )
     verify, read_build_sha = _build_verifier(
         cfg.base_url,

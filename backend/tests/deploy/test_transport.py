@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 
 from deploy.executor import ExecResult
 from deploy.health_check import VerifyOutcome, VerifyResult
-from deploy.transport import DeployConfig, TransportOutcome, deploy
+from deploy.transport import DeployConfig, DockerPrivilege, TransportOutcome, deploy
 
 _PREV_SHA = "1" * 40
 _TARGET_SHA = "2" * 40
@@ -274,6 +274,48 @@ def test_dhan_unsafe_rollback_requires_operator_no_restart() -> None:
     assert not audit.rollback_attempted
     # no rollback restart happened: only the ONE target 'up' was issued
     assert sum(1 for c in ex.calls if _has(c, "up", "-d")) == 1
+
+
+# --------------------------------------------------------------------------- #
+# B2 — sudo privilege + pinned project name
+# --------------------------------------------------------------------------- #
+def test_pins_project_name_to_avoid_volume_drift() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    _run(ex, _cfg(), _verify_const(VerifyOutcome.SUCCESS))
+    up = next(c for c in ex.calls if "up" in c)
+    assert "-p" in up and up[up.index("-p") + 1] == "apexscan"
+
+
+def test_direct_mode_has_no_sudo_prefix() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    _run(ex, _cfg(), _verify_const(VerifyOutcome.SUCCESS))
+    assert all("sudo" not in c for c in ex.calls)
+
+
+def test_sudo_mode_prefixes_docker_and_fs_with_sudo_dash_n() -> None:
+    ex = FakeExecutor(_healthy_handler)
+    _run(
+        ex,
+        _cfg(docker_privilege=DockerPrivilege.SUDO_NON_INTERACTIVE),
+        _verify_const(VerifyOutcome.SUCCESS),
+    )
+    docker_calls = [c for c in ex.calls if "docker" in c or ("test" in c and "-d" in c)]
+    for c in docker_calls:
+        assert c[0] == "sudo" and c[1] == "-n"  # exactly `sudo -n`, no arbitrary prefix
+    assert not any("-S" in c for c in ex.calls)  # never sudo -S (no password piping)
+
+
+def test_sudo_password_required_fails_closed_before_mutation() -> None:
+    ex = FakeExecutor(
+        _fail_on(lambda c: c == ["sudo", "-n", "true"], ExecResult(1, "", "a password is required"))
+    )
+    audit = _run(
+        ex,
+        _cfg(docker_privilege=DockerPrivilege.SUDO_NON_INTERACTIVE),
+        _verify_const(VerifyOutcome.SUCCESS),
+    )
+    assert audit.outcome is TransportOutcome.DOCKER_PRIVILEGE_UNAVAILABLE
+    assert "up -d" not in _flat(ex)
 
 
 def test_single_rollback_no_loop() -> None:
