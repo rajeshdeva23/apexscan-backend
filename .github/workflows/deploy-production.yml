@@ -167,6 +167,7 @@ jobs:
             --known-hosts "$HOME/.ssh/prod_known_hosts" \
             --image "$APEXSCAN_IMAGE" --target-sha "$TARGET_SHA" \
             --deploy-path "$DEPLOY_PATH" --base-url "$PUBLIC_BASE_URL" \
+            --docker-privilege sudo_non_interactive --project-name apexscan \
             --dhan-restart-safe --run-id "$RUN_ID"
 
       - name: Remove SSH material

@@ -835,6 +835,44 @@ Environment with required reviewers; obtain the host's real key and set the envi
 nor DEPLOY-2 introduces migrations — the transport fails closed if migrations are flagged). Secrets
 live only in the GitHub environment — never in source, images, or logs.
 
+### 14.10 Legacy → pipeline bridge (DEPLOY-3A)
+
+The read-only DEPLOY-3 preflight found production running the **legacy manual
+model** (locally-built tag image `apexscan-backend:<shortsha>`, `/version` with no
+`build_sha`, deploy dir owned by `apexscan` and accessed via `sudo`, external env
+files under `/etc/apexscan/`, Compose project `apexscan`). DEPLOY-3A adds the
+bridge so the reviewed pipeline can adopt this host without weakening its
+invariants.
+
+- **B1 — Legacy rollback artifact** (`deploy/legacy.py`) — *DESIGN + SUPPORT*.
+  `LegacyRollbackArtifact` pins the EXACT running image by a GHCR digest published
+  from the running image id (never a rebuild) plus a clearly-marked
+  *provenance-only* source SHA (`legacy_unverified_build_sha=True`).
+  `select_rollback_target` consults it ONLY when the backend reports no
+  `build_sha`; once a DEPLOY-1+ image runs, normal SHA+digest semantics are
+  mandatory and the legacy artifact is ignored. Legacy rollback is verified by
+  exact digest + health/startup/readiness (never SHA) and reported distinctly.
+  The one-time GHCR publication of the preserved image is a **separate authorized
+  provisioning step** (prefer `docker save` → push from a registry-authenticated
+  trusted environment so the host needs only PULL access).
+- **B2 — Docker privilege** (`deploy/transport.py`) — *IMPLEMENTED*. A closed
+  `DockerPrivilege` enum (`DIRECT` / `SUDO_NON_INTERACTIVE`) selects a fixed
+  `("sudo","-n")` prefix (no arbitrary prefixes); production uses
+  `sudo_non_interactive`. Preflight proves `sudo -n true` and fails closed with
+  `DOCKER_PRIVILEGE_UNAVAILABLE` if a password is required (never `sudo -S`, never
+  a stored password). The Compose invocation now pins `-p apexscan` so the deploy
+  attaches to the existing project's volumes/networks instead of a
+  deploy-dir-derived new project (which would create empty parallel volumes).
+- **B3 — Deployment bundle** (`deploy/bundle.py`) — *MECHANISM IMPLEMENTED,
+  WIRING BLOCKED*. A versioned `.tar.gz` carries only the Compose files + a
+  manifest binding them to the exact reviewed Git SHA and each file's SHA-256;
+  `verify_bundle` fails closed on path traversal, symlinks, non-regular members,
+  SHA mismatch, or a wrong source SHA. **Blocked on `PRODUCTION_COMPOSE_ARCHITECTURE_MISMATCH`:**
+  the repo base Compose (`env_file: .env`, dev `./backend:/app` mount) does not
+  represent production (external `/etc/apexscan/{apexscan-infra,backend,dhan}.env`,
+  artifacts bind mount). Reconciling the production overlay/base is an explicit
+  architecture decision and is not done casually here.
+
 ---
 
 ## 15. Disaster Recovery
