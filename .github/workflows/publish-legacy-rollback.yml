@@ -83,10 +83,12 @@ jobs:
 
       - name: Load and verify exact preserved image
         run: |
-          loaded="$(docker load -i ./legacy.tar | sed -n 's/^Loaded image ID: //p')"
-          echo "loaded_image_id=$loaded"
-          [ "$loaded" = "$EXPECTED_IMAGE_ID" ] || { echo "loaded image != expected preserved image" >&2; exit 1; }
-          echo "LOADED_IMAGE_ID=$loaded" >> "$GITHUB_ENV"
+          docker load -i ./legacy.tar
+          # Verify the exact preserved image id is present (format-agnostic: docker
+          # load may report "Loaded image: <tag>" when the saved image carries tags).
+          docker image inspect "$EXPECTED_IMAGE_ID" --format '{{.Id}}' >/dev/null 2>&1 \
+            || { echo "expected preserved image not present after load" >&2; exit 1; }
+          echo "LOADED_IMAGE_ID=$EXPECTED_IMAGE_ID" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
