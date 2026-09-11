@@ -32,7 +32,12 @@ from app.market_ipc.envelope import (
     identity_string_for,
     is_stale_trading_date,
 )
-from app.market_ipc.epoch import EPOCH_KEY_PREFIX, EpochAllocator, RedisEpochAllocator
+from app.market_ipc.epoch import (
+    LEGACY_REDIS_EPOCH_KEY_PREFIX,
+    DurableEpochAllocator,
+    EpochAllocator,
+    EpochStateError,
+)
 from app.market_ipc.events import (
     EventKind,
     EventPriority,
@@ -78,15 +83,17 @@ from app.market_ipc.transport import (
 )
 
 __all__ = [
-    "EPOCH_KEY_PREFIX",
     "FEED_WIDE_IDENTITY",
+    "LEGACY_REDIS_EPOCH_KEY_PREFIX",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "BoundedDeduplicator",
     "CompactedReferenceState",
     "CompactedReferenceStore",
     "ConsumerDiagnostics",
+    "DurableEpochAllocator",
     "EpochAllocator",
+    "EpochStateError",
     "EventKind",
     "EventPriority",
     "IngestionHealthState",
@@ -105,7 +112,6 @@ __all__ = [
     "PublisherDiagnostics",
     "RecordingShadowSink",
     "RedisCompactedReferenceStore",
-    "RedisEpochAllocator",
     "RedisMarketEventStream",
     "RedisPublishError",
     "ReferenceEntrySource",
