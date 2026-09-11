@@ -231,6 +231,11 @@ class MarketEventPublisher:
         except RedisPublishError:
             self._counters.publish_failures += 1
             return PublishOutcome.FAILED_TRANSPORT
+        except ValueError:
+            # The envelope re-encode inside the atomic publisher can reject an oversize payload;
+            # isolate it so publish() still never raises (failure isolation is the core contract).
+            self._counters.oversize += 1
+            return PublishOutcome.FAILED_OVERSIZE
         return PublishOutcome.PUBLISHED
 
     def diagnostics(self) -> PublisherDiagnostics:

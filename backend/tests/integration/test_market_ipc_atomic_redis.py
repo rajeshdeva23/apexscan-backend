@@ -183,6 +183,19 @@ async def test_invalid_args_commit_neither_half(redis: Redis) -> None:
     assert await redis.exists(_ref_key()) == 0  # reference NOT written
 
 
+async def test_malformed_incoming_json_commits_neither_half(redis: Redis) -> None:
+    # The incoming-state cjson.decode also runs BEFORE the first write; a malformed body must
+    # error pre-write, leaving both halves untouched (no partial window).
+    script = redis.register_script(_PUBLISH_STREAM_AND_REFERENCE_LUA)
+    with pytest.raises(ResponseError):
+        await script(
+            keys=[MarketIpcConfig().stream_name, _ref_key()],
+            args=["e", b"x", MarketIpcConfig().maxlen, "NSE:TCS", 1, 1, "{not-json", 604800],
+        )
+    assert await redis.xlen(MarketIpcConfig().stream_name) == 0
+    assert await redis.exists(_ref_key()) == 0
+
+
 # --- E / H: newer position -> reference progresses, stream grows ------------- #
 async def test_newer_reference_progresses(redis: Redis) -> None:
     pub = _publisher(redis)

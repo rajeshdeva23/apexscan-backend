@@ -45,10 +45,13 @@ class _FakeAtomic:
         self.stream_reference_calls = 0
         self._reference_outcome = reference_outcome
         self.raise_transport = False
+        self.raise_oversize = False
 
     async def publish_stream_only(self, envelope: MarketEventEnvelope) -> AtomicPublicationResult:
         if self.raise_transport:
             raise RedisPublishError("down")
+        if self.raise_oversize:
+            raise ValueError("oversize")
         self.stream_only_calls += 1
         return AtomicPublicationResult("1", ReferenceOutcome.NO_REFERENCE_DATA)
 
@@ -57,6 +60,8 @@ class _FakeAtomic:
     ) -> AtomicPublicationResult:
         if self.raise_transport:
             raise RedisPublishError("down")
+        if self.raise_oversize:
+            raise ValueError("oversize")
         self.stream_reference_calls += 1
         return AtomicPublicationResult("1", self._reference_outcome)
 
@@ -138,6 +143,15 @@ async def test_atomic_transport_failure_is_isolated() -> None:
     await pub.start()
     assert await pub.publish(_reference()) is PublishOutcome.FAILED_TRANSPORT  # never raises
     assert pub.diagnostics().publish_failures_total == 1
+
+
+async def test_atomic_oversize_reencode_is_isolated() -> None:
+    stream, atomic = _FakeStream(), _FakeAtomic()
+    atomic.raise_oversize = True  # a re-encode ValueError must not escape publish()
+    pub = _publisher(stream, atomic)
+    await pub.start()
+    assert await pub.publish(_reference()) is PublishOutcome.FAILED_OVERSIZE
+    assert pub.diagnostics().oversize_rejections_total == 1
 
 
 async def test_without_atomic_publisher_uses_plain_stream() -> None:
