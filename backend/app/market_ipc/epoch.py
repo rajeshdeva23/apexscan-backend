@@ -19,6 +19,7 @@ rather than silently resetting to a reusable low epoch.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import os
@@ -53,7 +54,12 @@ class DurableEpochAllocator:
     The counter lives in ``<state_dir>/producer-epoch-<producer_id>.json`` on the producer's
     own durable volume, independent of Redis. It is Redis-loss-proof; its own failure model is
     the local volume (see ADR-020): the file survives process/container/host restart with the
-    volume intact, and its loss is an explicit recovery case, not a silent epoch reuse.
+    volume intact, so no epoch is ever reused while the volume persists. A *missing* file is
+    indistinguishable from a genuine first-ever start using local state alone, so it starts at
+    epoch 1 — meaning loss of the durable volume silently restarts the counter and is an
+    OPERATIONAL non-guarantee (reuse a producer_id only with a surviving volume, or seed a
+    higher epoch / use a fresh producer_id on a new volume). Corrupt/partial *existing* state
+    fails closed (raises), never a silent low-epoch reset.
     """
 
     def __init__(self, state_dir: Path) -> None:
@@ -131,7 +137,12 @@ class DurableEpochAllocator:
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)  # atomic on POSIX
+        try:
+            os.replace(tmp, path)  # atomic on POSIX
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)  # don't leak the temp; the old value stays, next start skips
+            raise
         dir_fd = os.open(self._state_dir, os.O_RDONLY)
         try:
             os.fsync(dir_fd)  # persist the rename so the new epoch survives a crash

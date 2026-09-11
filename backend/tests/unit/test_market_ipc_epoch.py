@@ -72,6 +72,20 @@ async def test_epoch_is_redis_independent(tmp_path: Path) -> None:
     assert await DurableEpochAllocator(tmp_path).allocate(_PRODUCER) == 3
 
 
+async def test_durable_volume_loss_restarts_at_one_operational_non_guarantee(
+    tmp_path: Path,
+) -> None:
+    # ADR-020: losing the durable file (a volume loss) is indistinguishable from a first start
+    # with local state alone, so it silently restarts at 1. This is a documented OPERATIONAL
+    # non-guarantee (not code fail-closed) — asserted here so behaviour matches the ADR.
+    assert await DurableEpochAllocator(tmp_path).allocate(_PRODUCER) == 1
+    assert await DurableEpochAllocator(tmp_path).allocate(_PRODUCER) == 2
+    _state_file(tmp_path).unlink()  # simulate durable-volume loss
+    assert (
+        await DurableEpochAllocator(tmp_path).allocate(_PRODUCER) == 1
+    )  # restarts (not fail-closed)
+
+
 # --- H/I: corruption / partial write fails closed --------------------------- #
 @pytest.mark.parametrize(
     "corrupt",

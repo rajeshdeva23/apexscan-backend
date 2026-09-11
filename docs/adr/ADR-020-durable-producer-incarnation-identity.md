@@ -79,15 +79,19 @@ volume. `md:producer:epoch:*` keys are legacy and unused (kept only as a documen
 | Host restart (persistent volume intact) | New, higher epoch; no reuse. |
 | **Redis process restart / `FLUSHDB` / RDB/AOF volume loss / fresh Redis** | **No effect on epoch** — Redis is not the authority. No collision. (This is the M1 fix.) |
 | Crash between allocations (returned epoch discarded) | Next start skips it (gap); never reuses. |
-| Producer epoch-state file corrupt / partial write | `EpochStateError`, fail closed — no silent reuse. |
+| Producer epoch-state file **corrupt / partial write** (file present) | `EpochStateError`, fail closed — no silent reuse. |
 | Concurrent duplicate producer start (same `producer_id`) | Serialized by `flock`; each gets a distinct epoch. |
-| **Producer state-file / volume loss** | Not silently recoverable → `REQUIRES_RECOVERY`: start fails closed unless an operator seeds a higher epoch. Do not reuse. |
-| Total host loss | Unsupported without recovery; a replacement host needs its own durable volume or a seeded higher epoch. |
+| **Producer state-file / volume loss** (file *missing*) | **Silently restarts at epoch 1** — a missing file is indistinguishable from a genuine first start using local state alone. This is an **operational non-guarantee**, not code-enforced fail-closed: to avoid reuse after volume loss, use a fresh `producer_id` or seed a higher epoch on the new volume. |
+| Total host loss | Same as volume loss: a replacement host needs the surviving durable volume, a fresh `producer_id`, or a seeded higher epoch. |
 
 **Guaranteed (supported failure model):** no two allocations return the same epoch for one
-`producer_id` across process/container/host restart, crash-between-allocations, concurrent
-starts, and any Redis state loss.
-**Not guaranteed / fail-closed:** loss or corruption of the producer's own durable epoch file.
+`producer_id` across process/container/host restart **with the durable volume intact**,
+crash-between-allocations, concurrent starts, and any Redis state loss.
+**Fail-closed:** corrupt/partial *existing* epoch state raises `EpochStateError`.
+**Operational non-guarantee (NOT code-enforced):** loss of the producer's own durable volume
+silently restarts at epoch 1, because local state cannot distinguish first-start from
+volume-loss; a future phase could add an explicit init/seed contract to fail closed on this.
+`producer_id` reuse across a lost volume is an operational responsibility.
 
 ## Explicit non-guarantees
 
@@ -106,4 +110,6 @@ at-least-once transport + stable identities + idempotent/deduplicated consumers 
 - **L1 (FeedContinuity wiring)** — untouched.
 - **Operational:** the decoupled producer requires a durable local state directory (mode `0700`,
   files `0600`, no secrets) that survives restarts; back it with the same persistent volume
-  lifecycle as the producer.
+  lifecycle as the producer. The concurrent-start guarantee relies on `flock`, which is reliable
+  on a **local POSIX volume**; do not place the state directory on an NFS mount where `flock`
+  semantics are not guaranteed.
