@@ -11,15 +11,15 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from redis.asyncio import Redis
 
 from app.market_ipc import (
-    EPOCH_KEY_PREFIX,
+    DurableEpochAllocator,
     MarketEventPublisher,
     MarketIpcConfig,
-    RedisEpochAllocator,
     RedisMarketEventStream,
     StaticUniverseVersion,
     build_envelope,
@@ -152,35 +152,16 @@ async def test_maxlen_bounds_stream_growth(redis: Redis) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# atomic epoch allocation
+# publisher end-to-end through real Redis (epoch is now file-durable, not Redis)
 # --------------------------------------------------------------------------- #
-async def test_epoch_allocation_is_monotonic_across_restarts(redis: Redis) -> None:
-    allocator = RedisEpochAllocator(redis)
-    first = await allocator.allocate(_PRODUCER)
-    second = await allocator.allocate(_PRODUCER)  # simulates a second run
-    assert (first, second) == (1, 2)
-    assert await redis.get(f"{EPOCH_KEY_PREFIX}:{_PRODUCER}") == b"2"
-
-
-async def test_concurrent_epoch_allocation_is_unique(redis: Redis) -> None:
-    import asyncio
-
-    allocator = RedisEpochAllocator(redis)
-    epochs = await asyncio.gather(*(allocator.allocate("p") for _ in range(20)))
-    assert sorted(epochs) == list(range(1, 21))  # atomic INCR: all distinct
-
-
-# --------------------------------------------------------------------------- #
-# publisher end-to-end through real Redis
-# --------------------------------------------------------------------------- #
-async def test_publisher_end_to_end_all_kinds(redis: Redis) -> None:
+async def test_publisher_end_to_end_all_kinds(redis: Redis, tmp_path: Path) -> None:
     config = MarketIpcConfig()
     stream = RedisMarketEventStream(redis=redis, config=config)
     publisher = MarketEventPublisher(
         stream=stream,
         config=config,
         producer_id=_PRODUCER,
-        epoch_allocator=RedisEpochAllocator(redis),
+        epoch_allocator=DurableEpochAllocator(tmp_path),
         trading_date_source=_FixedDate(),
         universe_version_source=StaticUniverseVersion(7),
         now=lambda: _NOW,
