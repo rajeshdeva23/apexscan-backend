@@ -48,6 +48,7 @@ from app.market_engine.context import MarketState
 from app.market_engine.historical.service import HistoricalWarmupService
 from app.market_engine.sequence import SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule
+from app.market_engine.tick_diagnostics import TickEngineDiagnostics
 from app.market_intelligence.sector import MembershipResolver, load_sector_membership_dataset
 from app.schemas.market_data import (
     FeedContinuityEvent,
@@ -708,3 +709,8 @@ class LiveMarketRuntimeDependency:
         return (
             composition.runtime.live_feed_decode_diagnostics() if composition is not None else None
         )
+
+    def tick_engine_diagnostics(self) -> TickEngineDiagnostics | None:
+        """Return the TickEngine's bounded accept/reject diagnostics, or ``None``."""
+        composition = self._composition
+        return composition.runtime.tick_engine_diagnostics() if composition is not None else None

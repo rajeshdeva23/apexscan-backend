@@ -61,6 +61,7 @@ async def get_sector_shadow_diagnostics(
         snapshot=source.sector_shadow_snapshot(),
         diagnostics=source.sector_shadow_diagnostics(),
         live_feed=source.live_feed_decode_diagnostics(),
+        tick_engine=source.tick_engine_diagnostics(),
         sector=sector,
         limit=limit,
     )

@@ -8,11 +8,13 @@ leak). Decimals serialize as strings; values stay ``null`` where mathematically 
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
 from app.adapters.base.live_feed_diagnostics import LiveFeedDecodeDiagnostics
+from app.market_engine.tick_diagnostics import TickEngineDiagnostics
 from app.services.sector_intelligence import SectorShadowSnapshot, ShadowDiagnosticsView
 
 MAX_STOCK_LIMIT = 50
@@ -38,6 +40,10 @@ class SectorShadowDiagnosticsSource(Protocol):
         """The bounded live-frame decode diagnostics, or ``None``."""
         ...
 
+    def tick_engine_diagnostics(self) -> TickEngineDiagnostics | None:
+        """The bounded TickEngine accept/reject diagnostics, or ``None``."""
+        ...
+
 
 class SectorShadowDiagnosticsResponse(BaseModel):
     """The read-only diagnostics payload (bounded; no sector math performed here)."""
@@ -51,6 +57,7 @@ class SectorShadowDiagnosticsResponse(BaseModel):
     sectors: list[dict[str, Any]]
     stock_participation: list[dict[str, Any]]
     live_feed: dict[str, Any] | None
+    tick_engine: dict[str, Any] | None = None
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:
@@ -133,12 +140,14 @@ def project(
     snapshot: SectorShadowSnapshot | None,
     diagnostics: ShadowDiagnosticsView | None,
     live_feed: LiveFeedDecodeDiagnostics | None,
+    tick_engine: TickEngineDiagnostics | None = None,
     sector: str | None = None,
     limit: int | None = None,
 ) -> SectorShadowDiagnosticsResponse:
     """Project the runtime's existing state into the response (no recomputation)."""
     runtime = diagnostics.model_dump(mode="json") if diagnostics is not None else None
     live = _live_feed_dump(live_feed)
+    engine = _tick_engine_dump(tick_engine)
     if snapshot is None:
         return SectorShadowDiagnosticsResponse(
             enabled=diagnostics is not None,
@@ -150,6 +159,7 @@ def project(
             sectors=[],
             stock_participation=[],
             live_feed=live,
+            tick_engine=engine,
         )
     return SectorShadowDiagnosticsResponse(
         enabled=True,
@@ -161,6 +171,7 @@ def project(
         sectors=[metrics.model_dump(mode="json") for metrics in snapshot.sector_metrics],
         stock_participation=_stock_participation(snapshot, sector=sector, limit=limit),
         live_feed=live,
+        tick_engine=engine,
     )
 
 
@@ -188,4 +199,30 @@ def _live_feed_dump(live_feed: LiveFeedDecodeDiagnostics | None) -> dict[str, An
         "frames_by_response_code": _str_keys(live_feed.frames_by_response_code),
         "failures_by_response_code": _str_keys(live_feed.failures_by_response_code),
         "failures_by_length_bucket": dict(live_feed.failures_by_length_bucket),
+    }
+
+
+def _iso(moment: object) -> str | None:
+    """Serialize a datetime to ISO-8601, or ``None`` when absent."""
+    return moment.isoformat() if isinstance(moment, datetime) else None
+
+
+def _tick_engine_dump(tick_engine: TickEngineDiagnostics | None) -> dict[str, Any] | None:
+    if tick_engine is None:
+        return None
+    return {
+        "ticks_received": tick_engine.ticks_received,
+        "ticks_accepted": tick_engine.ticks_accepted,
+        "ticks_rejected_total": tick_engine.ticks_rejected_total,
+        "rejected_by_reason": dict(tick_engine.rejected_by_reason),
+        "references_received": tick_engine.references_received,
+        "references_accepted": tick_engine.references_accepted,
+        "references_rejected": tick_engine.references_rejected,
+        "last_accepted_event_timestamp": _iso(tick_engine.last_accepted_event_timestamp),
+        "last_rejected_reason": tick_engine.last_rejected_reason,
+        "last_rejected_event_timestamp": _iso(tick_engine.last_rejected_event_timestamp),
+        "last_rejection_observed_at": _iso(tick_engine.last_rejection_observed_at),
+        "last_rejected_event_clock_delta_seconds": (
+            tick_engine.last_rejected_event_clock_delta_seconds
+        ),
     }

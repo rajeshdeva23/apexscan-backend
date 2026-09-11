@@ -41,6 +41,7 @@ from app.market_engine.sequence import MonotonicSequence, SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule, TradingCalendar
 from app.market_engine.session_statistics import SessionStatisticsAuthority
 from app.market_engine.state import InstrumentStateRegistry
+from app.market_engine.tick_diagnostics import TickEngineDiagnostics
 from app.market_engine.tick_engine import TickEngine
 from app.market_ipc import MarketEventPublisher
 from app.schemas.market_data import (
@@ -959,6 +960,10 @@ class LiveMarketRuntime:
         if isinstance(source, LiveFeedDiagnosticsSource):
             return source.live_feed_decode_diagnostics()
         return None
+
+    def tick_engine_diagnostics(self) -> TickEngineDiagnostics:
+        """Return the TickEngine's bounded accept/reject diagnostics (read-only)."""
+        return self._tick_engine.diagnostics_snapshot()
 
     def _on_evidence_observer_done(self, task: asyncio.Task[None]) -> None:
         """Observe evidence-observer driver completion. Cancellation is the normal shutdown path.
