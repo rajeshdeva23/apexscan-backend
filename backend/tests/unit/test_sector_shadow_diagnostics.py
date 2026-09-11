@@ -16,6 +16,7 @@ from app.main import create_app
 from app.market_engine.clock import ManualClock
 from app.market_engine.context import MarketContext, MarketState, SessionContext
 from app.market_engine.events import MarketContextCreated
+from app.market_engine.tick_diagnostics import TickEngineDiagnostics
 from app.market_intelligence.sector import MembershipResolver, load_sector_membership_dataset
 from app.schemas.market_data import (
     Instrument,
@@ -216,11 +217,14 @@ class _HealthyDep:
 
 
 class _ShadowSource:
-    def __init__(self, snapshot, diagnostics, live_feed, *, available: bool = True) -> None:
+    def __init__(
+        self, snapshot, diagnostics, live_feed, *, available: bool = True, tick_engine=None
+    ) -> None:
         self._snapshot = snapshot
         self._diagnostics = diagnostics
         self._live_feed = live_feed
         self._available = available
+        self._tick_engine = tick_engine
 
     async def start(self, timeout_seconds: float) -> None:
         return None
@@ -242,6 +246,9 @@ class _ShadowSource:
 
     def live_feed_decode_diagnostics(self):  # noqa: ANN201
         return self._live_feed
+
+    def tick_engine_diagnostics(self):  # noqa: ANN201
+        return self._tick_engine
 
 
 def _app(source: _ShadowSource | None) -> object:
@@ -301,6 +308,36 @@ def test_project_missing_session_open_counts() -> None:
     assert response.universe["missing_session_open_count"] == 2
 
 
+def test_project_includes_tick_engine_diagnostics() -> None:
+    engine = TickEngineDiagnostics(
+        ticks_received=10,
+        ticks_accepted=3,
+        ticks_rejected_total=7,
+        rejected_by_reason={"invalid": 7, "duplicate": 0, "stale": 0},
+        last_rejected_reason="invalid",
+        last_rejected_event_clock_delta_seconds=19800.0,
+    )
+    response = project(snapshot=None, diagnostics=None, live_feed=None, tick_engine=engine)
+    assert response.tick_engine is not None
+    assert response.tick_engine["ticks_received"] == 10
+    assert response.tick_engine["rejected_by_reason"]["invalid"] == 7
+    assert response.tick_engine["last_rejected_event_clock_delta_seconds"] == 19800.0
+
+
+def test_project_tick_engine_absent_is_null() -> None:
+    response = project(snapshot=None, diagnostics=None, live_feed=None, tick_engine=None)
+    assert response.tick_engine is None
+
+
+async def test_endpoint_exposes_tick_engine_field() -> None:
+    snap, diag = await _snapshot_async(complete=5)
+    engine = TickEngineDiagnostics(ticks_received=4, ticks_accepted=1, ticks_rejected_total=3)
+    app = _app(_ShadowSource(snap, diag, None, tick_engine=engine))
+    resp = await _get(app, "/api/v1/diagnostics/sector-shadow")
+    assert resp.status_code == 200
+    assert resp.json()["tick_engine"]["ticks_received"] == 4
+
+
 def test_project_is_deterministic_and_triggers_no_evaluation() -> None:
     snap, diag = _snapshot(complete=5)
     first = project(snapshot=snap, diagnostics=diag, live_feed=None)
@@ -310,7 +347,12 @@ def test_project_is_deterministic_and_triggers_no_evaluation() -> None:
 
 def test_response_contains_no_secret_fields() -> None:
     snap, diag = _snapshot(complete=5)
-    body = project(snapshot=snap, diagnostics=diag, live_feed=None).model_dump_json().lower()
+    engine = TickEngineDiagnostics(ticks_received=9, ticks_accepted=2, ticks_rejected_total=7)
+    body = (
+        project(snapshot=snap, diagnostics=diag, live_feed=None, tick_engine=engine)
+        .model_dump_json()
+        .lower()
+    )
     for secret in ("token", "totp", "pin", "secret", "password", "authorization", "bearer"):
         assert secret not in body
 

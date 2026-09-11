@@ -32,6 +32,10 @@ from app.market_engine.session_statistics import (
     resolve_session_statistics,
 )
 from app.market_engine.state import InstrumentState, InstrumentStateRegistry
+from app.market_engine.tick_diagnostics import (
+    TickEngineDecisionCounters,
+    TickEngineDiagnostics,
+)
 from app.market_engine.validation import ValidationOutcome, classify
 from app.schemas.market_data import (
     FeedContinuityEvent,
@@ -134,6 +138,7 @@ class TickEngine:
         self._candles = candles
         self._session_statistics_authority = session_statistics_authority
         self._halt_active = False
+        self._diagnostics = TickEngineDecisionCounters()
 
     def set_halt(self, *, active: bool) -> None:
         """Record the external emergency-halt fact reflected on the next accepted update.
@@ -163,21 +168,29 @@ class TickEngine:
             A :class:`ProcessResult` carrying the outcome and any new context.
         """
         if isinstance(event, MarketReference):
-            return self._accept_reference(event)
+            result = self._accept_reference(event)
+            self._diagnostics.record_reference(result.outcome)
+            return result
         instrument = event.instrument
         state = self._registry.get(instrument)
+        now = self._clock.now()
         outcome = classify(
             event,
             known=self._registry.is_known(instrument),
             state=state,
-            now=self._clock.now(),
+            now=now,
         )
+        self._diagnostics.record_tick(outcome, event_timestamp=event.event_timestamp, now=now)
         if outcome is not ValidationOutcome.ACCEPT:
             logger.debug(
                 "rejected %s for %s: %s", type(event).__name__, instrument.symbol, outcome.value
             )
             return ProcessResult(outcome=outcome, context=None)
         return self._accept(event)
+
+    def diagnostics_snapshot(self) -> TickEngineDiagnostics:
+        """Return an immutable snapshot of bounded accept/reject diagnostics (read-only)."""
+        return self._diagnostics.snapshot()
 
     def _session_for(self, event: Tick | Quote) -> SessionContext | None:
         """Classify session facts for an accepted event from its event time."""
