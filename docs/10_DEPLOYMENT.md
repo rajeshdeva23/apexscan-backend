@@ -782,9 +782,21 @@ authenticates Dhan. *Provisioning:* GHCR publishing uses the built-in `GITHUB_TO
 Manual only (`workflow_dispatch`), guarded by the `production` protected environment and a
 single-flight `apexscan-production` concurrency group. The operator supplies the target SHA and must
 tick `dhan_restart_safety_confirmed`. Gates (fail closed): SHA is reachable from `origin/main` and its
-CI is green (`deploy/eligibility.py`); the immutable image digest exists in GHCR; Dhan restart safety
-is confirmed; then the **transport preflight**. If the production transport secrets are absent the
-preflight stops with `PRODUCTION_TRANSPORT_NOT_CONFIGURED`.
+required **source-validation** checks are green (`deploy/eligibility.py`); the immutable image digest
+exists in GHCR; Dhan restart safety is confirmed; then the **transport preflight**. If the production
+transport secrets are absent the preflight stops with `PRODUCTION_TRANSPORT_NOT_CONFIGURED`.
+
+Source eligibility establishes only whether a SHA *may* be promoted. It checks an explicit
+allow-list of required source checks — `REQUIRED_SOURCE_CHECKS` = `Backend quality and security`,
+`Compose runtime validation` (ci.yml), and `Quality gates, build, publish` (build-image.yml) — each
+of which must have a completed, `success` **latest** GitHub Actions run for the SHA (a green rerun
+clears an older failure; a failed rerun overrides an older success). The production deploy workflow
+(`deploy-production.yml`) posts its own job results as check-runs on the same source commit; these are
+deployment *outcomes* and never gate source eligibility, so a failed deployment attempt blocks only
+that attempt — it can never permanently poison an otherwise-green SHA. An allow-list is used (not an
+exclusion list, which would fail open when new workflows appear), only the GitHub Actions app can
+satisfy a required check (same-named checks from other apps are ignored), and any missing, pending,
+non-`success`, or API-unreadable required check fails closed.
 
 **Production transport** (`deploy/transport.py` + `deploy/executor.py`, DEPLOY-2) —
 *TRANSPORT_IMPLEMENTED / NOT_PROVISIONED*. The promote job writes the pinned SSH key and
