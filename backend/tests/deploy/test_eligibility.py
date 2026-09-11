@@ -159,6 +159,26 @@ def test_same_started_at_uses_run_id_tiebreak() -> None:
     assert evaluate_eligibility(target_sha=_MAIN, main_ancestry=[_MAIN], check_runs=runs).eligible
 
 
+def test_newer_failure_with_empty_started_at_still_overrides_success() -> None:
+    # A completed failure with a missing started_at must NOT sort below an older success:
+    # run_id (always present, monotonic) is authoritative, so this stays fail-closed.
+    runs = _all_green()
+    runs[0] = _run(_REQUIRED[0], conclusion="success", started_at="2026-09-11T05:00:00Z", run_id=10)
+    runs.append(_run(_REQUIRED[0], conclusion="failure", started_at="", run_id=11))
+    result = evaluate_eligibility(target_sha=_MAIN, main_ancestry=[_MAIN], check_runs=runs)
+    assert not result.eligible
+    assert any("not green" in r and _REQUIRED[0] in r for r in result.reasons)
+
+
+@pytest.mark.parametrize("terminal", ["skipped", "cancelled", "neutral", "timed_out", None])
+def test_required_check_non_success_conclusions_are_ineligible(terminal: str | None) -> None:
+    runs = _all_green()
+    runs[0] = _run(_REQUIRED[0], conclusion=terminal)
+    result = evaluate_eligibility(target_sha=_MAIN, main_ancestry=[_MAIN], check_runs=runs)
+    assert not result.eligible
+    assert any(_REQUIRED[0] in r for r in result.reasons)
+
+
 # --- §10 K/L: spoofing / foreign checks ------------------------------------ #
 def test_foreign_app_cannot_satisfy_required_check() -> None:  # K
     runs = [r for r in _all_green() if r.name != _REQUIRED[0]]

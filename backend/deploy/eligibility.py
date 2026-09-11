@@ -56,9 +56,9 @@ class CheckRun:
         status: The run status (``queued`` / ``in_progress`` / ``completed``).
         conclusion: The terminal conclusion (``success`` / ``failure`` / ...), or
             None while not yet completed.
-        started_at: ISO-8601 start time; ISO-8601 sorts chronologically, so it
-            orders reruns of the same check. Empty string when unknown.
-        run_id: The check-run id; monotonic, used as a deterministic tiebreak.
+        started_at: ISO-8601 start time (informational only; may be empty when unknown).
+        run_id: The check-run id; GitHub assigns it monotonically at creation, so it
+            is the authoritative "which run is newest" ordering for reruns.
         app_slug: The owning GitHub App slug (``github-actions`` for Actions).
     """
 
@@ -88,15 +88,17 @@ def _latest_required_run(check_runs: Sequence[CheckRun], name: str) -> CheckRun 
 
     Only check-runs from the GitHub Actions app are considered, so a same-named check
     from an unrelated app cannot satisfy a required source check. "Most recent" is the
-    greatest ``(started_at, run_id)`` — ISO-8601 start time first, then the monotonic
-    id as a deterministic tiebreak when two runs share a start time.
+    greatest check-run ``id``: GitHub assigns ids monotonically at creation, so a rerun
+    always has a higher id than the run it supersedes. The id is used (not ``started_at``)
+    because it is always present — a run with a missing/empty ``started_at`` must never be
+    able to sort *below* an older run and let a stale success mask a newer failure.
     """
     candidates = [
         run for run in check_runs if run.name == name and run.app_slug == _ACTIONS_APP_SLUG
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda run: (run.started_at, run.run_id))
+    return max(candidates, key=lambda run: run.run_id)
 
 
 def evaluate_eligibility(
