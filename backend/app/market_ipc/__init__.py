@@ -9,6 +9,11 @@ the existing in-process ingestion path remains the sole authority.
 
 from __future__ import annotations
 
+from app.market_ipc.atomic import (
+    AtomicPublicationResult,
+    AtomicPublisher,
+    RedisAtomicPublisher,
+)
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.consumer import (
     ConsumerDiagnostics,
@@ -85,6 +90,9 @@ from app.market_ipc.transport import (
 __all__ = [
     "FEED_WIDE_IDENTITY",
     "LEGACY_REDIS_EPOCH_KEY_PREFIX",
+    "AtomicPublicationResult",
+    "AtomicPublisher",
+    "RedisAtomicPublisher",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "BoundedDeduplicator",

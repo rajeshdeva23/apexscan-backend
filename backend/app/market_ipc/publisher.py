@@ -19,10 +19,12 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
+from app.market_ipc.atomic import AtomicPublisher
 from app.market_ipc.config import MarketIpcConfig
-from app.market_ipc.envelope import build_envelope, encode_envelope
+from app.market_ipc.envelope import MarketEventEnvelope, build_envelope, encode_envelope
 from app.market_ipc.epoch import EpochAllocator
 from app.market_ipc.events import IpcPayload
+from app.market_ipc.reference import ReferenceOutcome, reference_from_envelope
 from app.market_ipc.transport import MarketEventStream, RedisPublishError
 from app.schemas.market_data import (
     FeedContinuityEvent,
@@ -99,6 +101,9 @@ class PublisherDiagnostics(BaseModel):
     serialization_failures_total: int
     oversize_rejections_total: int
     unsupported_type_total: int
+    stream_only_total: int
+    stream_reference_total: int
+    reference_noop_total: int
     last_publish_at: datetime | None
 
 
@@ -115,6 +120,7 @@ class MarketEventPublisher:
         trading_date_source: TradingDateSource,
         universe_version_source: UniverseVersionSource,
         now: Callable[[], datetime],
+        atomic_publisher: AtomicPublisher | None = None,
     ) -> None:
         if not producer_id:
             raise ValueError("producer_id must be non-empty")
@@ -122,6 +128,10 @@ class MarketEventPublisher:
         self._config = config
         self._producer_id = producer_id
         self._epoch_allocator = epoch_allocator
+        # When provided, reference-bearing events are appended to the stream AND compacted into
+        # the reference hash in a single atomic call (D1); a STREAM_ONLY event uses the plain
+        # stream append. When None, behaviour is Phase-B stream-only (no reference projection).
+        self._atomic_publisher = atomic_publisher
         self._trading_date_source = trading_date_source
         self._universe_version_source = universe_version_source
         self._now = now
@@ -184,13 +194,48 @@ class MarketEventPublisher:
             self._counters.serialization += 1
             return PublishOutcome.FAILED_SERIALIZATION
 
+        outcome = await self._transmit(envelope)
+        if outcome is PublishOutcome.PUBLISHED:
+            self._counters.published += 1
+            self._last_publish_at = self._now()
+        return outcome
+
+    async def _transmit(self, envelope: MarketEventEnvelope) -> PublishOutcome:
+        """Send one envelope: plain stream append, or atomic stream+reference when configured."""
+        if self._atomic_publisher is None:
+            try:
+                await self._stream.publish(envelope)
+            except RedisPublishError:
+                self._counters.publish_failures += 1
+                return PublishOutcome.FAILED_TRANSPORT
+            return PublishOutcome.PUBLISHED
         try:
-            await self._stream.publish(envelope)
+            reference_state = reference_from_envelope(envelope)
+        except Exception:  # noqa: BLE001 - decode must not escape the shadow path
+            self._counters.serialization += 1
+            return PublishOutcome.FAILED_SERIALIZATION
+        try:
+            if reference_state is None:  # STREAM_ONLY
+                await self._atomic_publisher.publish_stream_only(envelope)
+                self._counters.stream_only += 1
+            else:  # STREAM_PLUS_REFERENCE — atomic append + compaction
+                result = await self._atomic_publisher.publish_stream_and_reference(
+                    envelope, reference_state
+                )
+                self._counters.stream_reference += 1
+                if result.reference_outcome in (
+                    ReferenceOutcome.STALE_REJECTED,
+                    ReferenceOutcome.DUPLICATE,
+                ):
+                    self._counters.reference_noop += 1
         except RedisPublishError:
             self._counters.publish_failures += 1
             return PublishOutcome.FAILED_TRANSPORT
-        self._counters.published += 1
-        self._last_publish_at = self._now()
+        except ValueError:
+            # The envelope re-encode inside the atomic publisher can reject an oversize payload;
+            # isolate it so publish() still never raises (failure isolation is the core contract).
+            self._counters.oversize += 1
+            return PublishOutcome.FAILED_OVERSIZE
         return PublishOutcome.PUBLISHED
 
     def diagnostics(self) -> PublisherDiagnostics:
@@ -206,6 +251,9 @@ class MarketEventPublisher:
             serialization_failures_total=self._counters.serialization,
             oversize_rejections_total=self._counters.oversize,
             unsupported_type_total=self._counters.unsupported,
+            stream_only_total=self._counters.stream_only,
+            stream_reference_total=self._counters.stream_reference,
+            reference_noop_total=self._counters.reference_noop,
             last_publish_at=self._last_publish_at,
         )
 
@@ -220,6 +268,9 @@ class _Counters:
         "serialization",
         "oversize",
         "unsupported",
+        "stream_only",
+        "stream_reference",
+        "reference_noop",
     )
 
     def __init__(self) -> None:
@@ -229,6 +280,9 @@ class _Counters:
         self.serialization = 0
         self.oversize = 0
         self.unsupported = 0
+        self.stream_only = 0
+        self.stream_reference = 0
+        self.reference_noop = 0
 
 
 def _as_ipc_payload(datum: PublishableEvent) -> IpcPayload:
