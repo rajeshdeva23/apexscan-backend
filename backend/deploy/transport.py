@@ -234,8 +234,19 @@ def _preflight(executor: RemoteExecutor, cfg: DeployConfig) -> TransportOutcome 
 
 
 def _running_digest(executor: RemoteExecutor, cfg: DeployConfig) -> str | None:
-    """The current backend image reference from Compose, or None if not a digest."""
-    result = executor.run([*_compose(cfg), "ps", "--format", "{{.Image}}", _BACKEND])
+    """The current backend image reference from Compose, or None if not a digest.
+
+    ``docker compose ps`` interpolates the Compose model before listing, and the
+    production Compose declares ``image: ${APEXSCAN_IMAGE:?}`` — so ``APEXSCAN_IMAGE``
+    must be set or ``ps`` fails to parse and no running digest is captured (which would
+    fail-closed a modern rollback). It is set to ``cfg.target_image`` purely to satisfy
+    interpolation: ``ps --format {{.Image}}`` reports the **running container's** image,
+    never the Compose-config value, so the captured digest is the currently-running
+    backend (the true rollback target), not the deploy target.
+    """
+    result = executor.run(
+        [*_compose(cfg, image=cfg.target_image), "ps", "--format", "{{.Image}}", _BACKEND]
+    )
     digest = result.stdout.strip().splitlines()[0] if result.ok and result.stdout.strip() else ""
     return digest if _DIGEST_REF.match(digest) else None
 
