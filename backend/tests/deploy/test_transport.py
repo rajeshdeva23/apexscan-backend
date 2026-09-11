@@ -485,3 +485,57 @@ def test_legacy_args_construction_contract() -> None:
     assert _legacy_artifact_from_args(_args()) is None  # no digest -> no artifact
     with pytest.raises(LegacyArtifactError):  # malformed digest -> raises (main catches -> None)
         _legacy_artifact_from_args(_args(legacy_digest="evil/malware@sha256:" + "a" * 64))
+
+
+# --------------------------------------------------------------------------- #
+# _running_digest — modern rollback digest capture (DEPLOY-TRANSPORT-FIX-1)
+# --------------------------------------------------------------------------- #
+def test_running_digest_supplies_apexscan_image_and_returns_running_image() -> None:
+    # Production Compose needs APEXSCAN_IMAGE to interpolate even for `ps`; the fix
+    # supplies the (deploy) target image only to parse — but `ps` reports the RUNNING
+    # container's image, so the captured rollback digest is the current image, not target.
+    from deploy.transport import _running_digest
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if _has(cmd, "ps", "--format", "backend"):
+            return ExecResult(0, _PREV_DIGEST, "")  # running image A
+        return ExecResult(0, "", "")
+
+    ex = FakeExecutor(handler)
+    digest = _running_digest(ex, _cfg())
+    assert digest == _PREV_DIGEST  # running image A ...
+    assert digest != _TARGET_IMAGE  # ... never the deploy target B
+    ps_call = next(c for c in ex.calls if _has(c, "ps", "--format", "backend"))
+    assert f"APEXSCAN_IMAGE={_TARGET_IMAGE}" in ps_call  # interpolation satisfied
+    assert "env" in ps_call
+    # read-only: no mutating compose subcommands
+    for verb in ("up", "create", "pull", "restart", "stop", "rm", "down"):
+        assert verb not in ps_call
+
+
+def test_running_digest_ps_failure_fails_closed() -> None:
+    from deploy.transport import _running_digest
+
+    ex = FakeExecutor(
+        lambda cmd: ExecResult(1, "", "boom") if _has(cmd, "ps") else ExecResult(0, "", "")
+    )
+    assert _running_digest(ex, _cfg()) is None
+
+
+def test_running_digest_empty_output_fails_closed() -> None:
+    from deploy.transport import _running_digest
+
+    ex = FakeExecutor(
+        lambda cmd: ExecResult(0, "  \n", "") if _has(cmd, "ps") else ExecResult(0, "", "")
+    )
+    assert _running_digest(ex, _cfg()) is None
+
+
+def test_running_digest_malformed_output_fails_closed() -> None:
+    from deploy.transport import _running_digest
+
+    for bad in ("not-a-digest", "postgres:17-alpine", "ghcr.io/o/other@sha256:" + "a" * 64):
+        ex = FakeExecutor(
+            lambda cmd, b=bad: ExecResult(0, b, "") if _has(cmd, "ps") else ExecResult(0, "", "")
+        )
+        assert _running_digest(ex, _cfg()) is None
