@@ -166,8 +166,22 @@ class MarketEventPublisher:
         does not reuse its sequence for the next, different payload, so a ``(producer_id, epoch,
         sequence)`` identity is never bound to two payloads. No retry in Phase B.
         """
+        prepared = self.prepare(datum)
+        if isinstance(prepared, PublishOutcome):
+            return prepared
+        return await self.transmit(prepared)
+
+    def prepare(self, datum: PublishableEvent) -> MarketEventEnvelope | PublishOutcome:
+        """Build the immutable envelope (identity + size check) WITHOUT any Redis I/O.
+
+        This is the CPU-only front half of :meth:`publish`: it allocates the producer sequence
+        (fixing ``(producer_id, producer_epoch, producer_sequence)``) and builds/size-checks the
+        envelope. It returns the envelope on success or an early :class:`PublishOutcome` failure
+        (unsupported / oversize / serialization). The M2 async boundary calls this on the
+        ingestion path so identity is fixed at submission and carried through the queue unchanged.
+        """
         if self._epoch is None:
-            raise RuntimeError("publisher.publish called before start()")
+            raise RuntimeError("publisher.prepare called before start()")
         self._counters.attempted += 1
         try:
             payload: IpcPayload = _as_ipc_payload(datum)
@@ -193,7 +207,15 @@ class MarketEventPublisher:
         except Exception:  # noqa: BLE001 - serialization must not escape the shadow path
             self._counters.serialization += 1
             return PublishOutcome.FAILED_SERIALIZATION
+        return envelope
 
+    async def transmit(self, envelope: MarketEventEnvelope) -> PublishOutcome:
+        """Publish an already-prepared envelope to Redis (the back half of :meth:`publish`).
+
+        Reuses the same STREAM_ONLY / STREAM_PLUS_REFERENCE routing and never raises. The M2
+        worker calls this off the ingestion hot path; the envelope's identity is unchanged from
+        :meth:`prepare`, so a re-``transmit`` never reallocates a sequence.
+        """
         outcome = await self._transmit(envelope)
         if outcome is PublishOutcome.PUBLISHED:
             self._counters.published += 1

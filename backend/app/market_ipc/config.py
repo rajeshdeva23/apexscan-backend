@@ -28,6 +28,9 @@ class MarketIpcConfig(BaseModel):
     dedup_max_entries: int = Field(default=100_000, ge=1_000, le=10_000_000)
     max_payload_bytes: int = Field(default=65_536, ge=256, le=262_144)
     reference_ttl_seconds: int = Field(default=604_800, ge=3_600, le=2_592_000)  # 7d; 1h..30d
+    # M2 async publication boundary (off by default with everything else; never activates IPC).
+    publish_queue_capacity: int = Field(default=10_000, ge=1, le=1_000_000)
+    publish_shutdown_drain_timeout_seconds: float = Field(default=5.0, ge=0.0, le=300.0)
 
     @field_validator(
         "stream_name",
