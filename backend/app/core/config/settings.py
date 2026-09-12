@@ -397,6 +397,24 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_single_dhan_owner(self) -> Self:
+        """Reject a single config/process that would run two live Dhan owners (H2 safety).
+
+        The backend legacy provider (``market_provider_enabled``) and the decoupled ingestion
+        service (``market_ingestion_service_enabled``) each own a Dhan auth/WebSocket session.
+        This guard is defence-in-depth for a **shared** settings object/process; it cannot see the
+        real two-container topology where each container has its own env file (that dual-Dhan
+        rollout case is B6, still DESIGN_RESOLVED_IMPLEMENTATION_PENDING per ADR-025). Fail fast
+        rather than allow accidental dual ownership in one process.
+        """
+        if self.market_provider_enabled and self.market_ingestion_service_enabled:
+            raise ValueError(
+                "MARKET_PROVIDER_ENABLED and MARKET_INGESTION_SERVICE_ENABLED must not both be "
+                "true: exactly one component may own the Dhan connection (ADR-025 single-owner)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_production_safety(self) -> Self:  # noqa: C901
         """Reject settings that are safe only for local development in production."""
         if self.dhan_live_smoke_enabled:

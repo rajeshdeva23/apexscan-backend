@@ -48,6 +48,32 @@ def test_settings_reject_consumer_without_role(monkeypatch: pytest.MonkeyPatch) 
     assert "poisoning dedup" in str(excinfo.value)
 
 
+def test_settings_reject_two_dhan_owners(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _settings(
+            monkeypatch,
+            MARKET_PROVIDER_ENABLED="true",  # backend legacy Dhan owner
+            MARKET_INGESTION_SERVICE_ENABLED="true",  # ingestion Dhan owner
+            # Dummy creds so the earlier credential-presence check passes and the single-owner
+            # guard is what fires (not a real secret).
+            DHAN_AUTH_MODE="access_token",
+            DHAN_ACCESS_TOKEN="dummy-not-a-real-token",
+        )
+    assert "single-owner" in str(excinfo.value)
+
+
+def test_settings_allow_ingestion_service_with_legacy_backend_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(
+        monkeypatch,
+        MARKET_PROVIDER_ENABLED="false",
+        MARKET_INGESTION_SERVICE_ENABLED="true",
+    )
+    assert settings.market_ingestion_service_enabled is True
+    assert settings.market_path_mode() is MarketPathMode.LEGACY_ONLY  # publisher OFF
+
+
 def test_settings_market_ipc_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(monkeypatch)
     config = settings.market_ipc_config()
