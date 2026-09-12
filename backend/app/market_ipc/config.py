@@ -26,6 +26,9 @@ class MarketIpcConfig(BaseModel):
     block_ms: int = Field(default=5_000, ge=0, le=60_000)
     claim_idle_ms: int = Field(default=30_000, ge=1_000, le=600_000)
     dedup_max_entries: int = Field(default=100_000, ge=1_000, le=10_000_000)
+    # C1 durable consumer idempotency (off with everything else; never activates IPC).
+    dedup_key_prefix: str = Field(default="md:dedup", min_length=1, max_length=128)
+    dedup_ttl_seconds: int = Field(default=86_400, ge=3_600, le=2_592_000)  # 1d; 1h..30d
     max_payload_bytes: int = Field(default=65_536, ge=256, le=262_144)
     reference_ttl_seconds: int = Field(default=604_800, ge=3_600, le=2_592_000)  # 7d; 1h..30d
     # M2 async publication boundary (off by default with everything else; never activates IPC).
@@ -38,6 +41,7 @@ class MarketIpcConfig(BaseModel):
         "consumer_name",
         "reference_key_prefix",
         "health_key",
+        "dedup_key_prefix",
     )
     @classmethod
     def _no_whitespace(cls, value: str) -> str:

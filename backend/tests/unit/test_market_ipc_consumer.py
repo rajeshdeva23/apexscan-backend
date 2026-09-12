@@ -17,12 +17,14 @@ from redis.exceptions import RedisError
 from app.market_ipc import (
     SCHEMA_VERSION,
     BoundedDeduplicator,
+    Deduplicator,
+    InMemoryDeduplicator,
     MarketEventConsumer,
     MarketEventEnvelope,
     MarketIpcConfig,
     RecordingShadowSink,
 )
-from app.market_ipc.envelope import identity_string_for
+from app.market_ipc.envelope import ProducerEventIdentity, identity_string_for
 from app.market_ipc.events import EventKind, IpcPayload, encode_payload, event_kind_for
 from app.market_ipc.transport import RawDeliveredEvent
 from app.schemas.market_data import (
@@ -138,7 +140,10 @@ def _consumer(
     current_universe: int | None = 7,
     now: datetime = _NOW,
     dedup: BoundedDeduplicator | None = None,
+    deduplicator: Deduplicator | None = None,
 ) -> MarketEventConsumer:
+    if deduplicator is None and dedup is not None:
+        deduplicator = InMemoryDeduplicator(dedup)
     return MarketEventConsumer(
         transport=transport,  # type: ignore[arg-type]  # test fake implements the used subset
         config=MarketIpcConfig(),
@@ -146,7 +151,7 @@ def _consumer(
         trading_date_source=lambda: current_date,
         universe_version_source=lambda: current_universe,
         now=lambda: now,
-        deduplicator=dedup,
+        deduplicator=deduplicator,
     )
 
 
@@ -362,6 +367,55 @@ async def test_bounded_dedup_eviction_allows_reapply_outside_window() -> None:
     transport.push(_raw(_envelope(_tick(), seq=1)))  # replay of the evicted identity
     await consumer.poll_once()
     assert sink.applied_total == 4  # 3 distinct + 1 re-applied after eviction
+
+
+class _FaultyDeduplicator:
+    """Deduplicator that raises RedisError on the selected call (fail-closed exercise)."""
+
+    def __init__(self, *, fail_contains: bool = False, fail_record: bool = False) -> None:
+        self._fail_contains = fail_contains
+        self._fail_record = fail_record
+        self.recorded: list[ProducerEventIdentity] = []
+
+    async def contains(self, identity: ProducerEventIdentity) -> bool:
+        if self._fail_contains:
+            raise RedisError("dedup store down")
+        return identity in self.recorded
+
+    async def record(self, identity: ProducerEventIdentity) -> None:
+        if self._fail_record:
+            raise RedisError("dedup store down")
+        self.recorded.append(identity)
+
+
+async def test_dedup_contains_failure_fails_closed_and_never_applies() -> None:
+    transport = FakeRawTransport()
+    sink = RecordingShadowSink()
+    consumer = _consumer(
+        transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_contains=True)
+    )
+    message_id = transport.push(_raw(_envelope(_tick(), seq=1)))
+    await consumer.poll_once()
+
+    assert sink.applied_total == 0  # never applied without idempotency protection
+    assert consumer.diagnostics().dedup_store_failures == 1
+    assert message_id in transport.pending  # left pending -> redelivered, not lost
+    assert transport.acked == []
+
+
+async def test_dedup_record_failure_after_apply_fails_closed_and_leaves_pending() -> None:
+    transport = FakeRawTransport()
+    sink = RecordingShadowSink()
+    consumer = _consumer(
+        transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_record=True)
+    )
+    message_id = transport.push(_raw(_envelope(_tick(), seq=1)))
+    await consumer.poll_once()
+
+    assert sink.applied_total == 1  # applied, but the durable mark did not commit
+    assert consumer.diagnostics().dedup_store_failures == 1
+    assert consumer.diagnostics().acked_total == 0
+    assert message_id in transport.pending  # not ACKed -> redelivers (shadow re-apply harmless)
 
 
 # --------------------------------------------------------------------------- #
