@@ -75,6 +75,30 @@ async def test_disabled_service_touches_no_dhan_epoch_or_redis() -> None:
     assert redis_from_url.call_count == 0
 
 
+class _FakeSettings:
+    """Minimal settings stub exposing only what the entrypoint uses."""
+
+    def __init__(self, flags: PhaseHFlags) -> None:
+        self._flags = flags
+
+    def phase_h_flags(self) -> PhaseHFlags:
+        return self._flags
+
+
+async def test_entrypoint_run_disabled_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.market_ingestion import __main__ as entry
+
+    monkeypatch.setattr(entry, "get_settings", lambda: _FakeSettings(_flags(ingestion=False)))
+    assert await entry._run() == 0  # inert clean exit
+
+
+async def test_entrypoint_run_enabled_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.market_ingestion import __main__ as entry
+
+    monkeypatch.setattr(entry, "get_settings", lambda: _FakeSettings(_flags(ingestion=True)))
+    assert await entry._run() == 1  # refuses live boot (H2), never connects Dhan
+
+
 def test_importing_package_has_no_live_side_effects() -> None:
     # Fresh interpreter: importing the ingestion package must not pull in the Dhan provider or M1
     # epoch module, nor construct a Redis client (import purity, §25).
