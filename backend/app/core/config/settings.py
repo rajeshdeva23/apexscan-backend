@@ -19,6 +19,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.market_ingestion.mode import (
+    MarketPathMode,
+    PhaseHConfigError,
+    PhaseHFlags,
+    derive_market_path_mode,
+    validate_phase_h_flags,
+)
+from app.market_ipc.config import MarketIpcConfig
+
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "staging", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _LOCAL_CORS_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -131,6 +140,19 @@ class Settings(BaseSettings):
     # cadence (the coordinator owns that via the strictest freshness max_age); keep it at or
     # below the strictest configured max_age so no due transition is missed.
     session_statistics_refresh_poll_seconds: float = Field(default=1.0, gt=0, le=60)
+
+    # --- Phase-H market-path activation (ADR-025; DECOUPLING H1) ------------
+    # Six independent flags governing the decoupled market-ingestion rollout. Defaults are the
+    # current production shape (LEGACY_ONLY): the backend owns the legacy Dhan path and nothing
+    # IPC is activated. Adding these settings changes NO behaviour — the ingestion service, IPC
+    # publisher/consumer, M2, C1, and L1 all stay off until explicitly enabled in a later phase.
+    # Illegal combinations are rejected fail-fast by validate_phase_h_flag_matrix (ADR-025).
+    market_ingestion_service_enabled: bool = Field(default=False)
+    ipc_publisher_enabled: bool = Field(default=False)
+    ipc_consumer_enabled: bool = Field(default=False)
+    ipc_shadow_compare_enabled: bool = Field(default=False)
+    ipc_authoritative_enabled: bool = Field(default=False)
+    legacy_market_path_enabled: bool = Field(default=True)
 
     # --- Market session (NSE cash-equity; ADR-004) -------------------------
     # Exchange timezone for interpreting canonical UTC timestamps into the
@@ -346,6 +368,34 @@ class Settings(BaseSettings):
 
     # Pre-existing Phase-2/3 complexity (11 > 8); tracked debt. Refactor is out
     # of P4.0 scope; new code is gated by C901 (docs/11 Rule 16).
+    def phase_h_flags(self) -> PhaseHFlags:
+        """Bundle the six Phase-H activation flags (ADR-025) for validation/derivation."""
+        return PhaseHFlags(
+            market_ingestion_service_enabled=self.market_ingestion_service_enabled,
+            ipc_publisher_enabled=self.ipc_publisher_enabled,
+            ipc_consumer_enabled=self.ipc_consumer_enabled,
+            ipc_shadow_compare_enabled=self.ipc_shadow_compare_enabled,
+            ipc_authoritative_enabled=self.ipc_authoritative_enabled,
+            legacy_market_path_enabled=self.legacy_market_path_enabled,
+        )
+
+    def market_path_mode(self) -> MarketPathMode:
+        """Derive the ADR-025 rollout mode from the (validated) Phase-H flags."""
+        return derive_market_path_mode(self.phase_h_flags())
+
+    def market_ipc_config(self) -> MarketIpcConfig:
+        """Build the bounded market-IPC transport config (defaults in H1; inert until composed)."""
+        return MarketIpcConfig()
+
+    @model_validator(mode="after")
+    def validate_phase_h_flag_matrix(self) -> Self:
+        """Reject illegal Phase-H flag combinations fail-fast (ADR-025 flag matrix)."""
+        try:
+            validate_phase_h_flags(self.phase_h_flags())
+        except PhaseHConfigError as error:
+            raise ValueError(str(error)) from error
+        return self
+
     @model_validator(mode="after")
     def validate_production_safety(self) -> Self:  # noqa: C901
         """Reject settings that are safe only for local development in production."""

@@ -82,6 +82,31 @@ services:
     networks:
       - apexscan-net
 
+  # -------------------------------------------------------------------------
+  # Market ingestion — future decoupled Dhan→IPC producer (DECOUPLING H1).
+  # INERT: gated behind the "market-ingestion" profile so the default dev stack
+  # never starts it. Shares the backend image but runs the dedicated entrypoint,
+  # which is a no-op while MARKET_INGESTION_SERVICE_ENABLED is unset/false. No
+  # public port. Live boot is H2.
+  # -------------------------------------------------------------------------
+  market-ingestion:
+    profiles: ["market-ingestion"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: apexscan-market-ingestion
+    command: ["python", "-m", "app.market_ingestion"]
+    restart: "no"
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    networks:
+      - apexscan-net
+
 networks:
   apexscan-net:
     driver: bridge
