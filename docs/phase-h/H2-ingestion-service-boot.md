@@ -28,8 +28,10 @@ publication still OFF**.
 - **`__main__.py`** — the entrypoint now composes, starts, and (when enabled) serves until the
   supervisor ends, then shuts down; disabled remains a clean inert exit.
 - **`Settings`** — a fail-fast **single-Dhan-owner** guard: `MARKET_PROVIDER_ENABLED` (backend
-  legacy provider) and `MARKET_INGESTION_SERVICE_ENABLED` may not both be true in one config
-  (ADR-025 §B6).
+  legacy provider) and `MARKET_INGESTION_SERVICE_ENABLED` may not both be true in one config. This
+  is defence-in-depth for a **shared** settings object/process only; the real two-container
+  topology (each container with its own env) is not covered here — that dual-Dhan rollout case is
+  **B6** (DESIGN_RESOLVED_IMPLEMENTATION_PENDING per ADR-025).
 
 ## Ownership after H2
 

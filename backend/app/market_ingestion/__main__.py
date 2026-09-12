@@ -23,12 +23,14 @@ logger = logging.getLogger(__name__)
 async def _run() -> int:
     """Compose, start, and (when enabled) serve the ingestion service; return an exit code."""
     settings = get_settings()
-    service = await compose_market_ingestion_service(settings)
+    service = None
     try:
+        service = await compose_market_ingestion_service(settings)
         await service.start()
-    except Exception:  # noqa: BLE001 - a startup failure is a clean non-zero exit, not a crash
+    except Exception:  # noqa: BLE001 - a compose/startup failure is a clean non-zero exit
         logger.exception("market-ingestion service failed to start")
-        await service.stop()
+        if service is not None:
+            await service.stop()
         return 1
     logger.info("market-ingestion status=%s mode=%s", service.status, service.mode)
     if service.status is ServiceStatus.RUNNING:

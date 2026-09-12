@@ -214,7 +214,7 @@ class MarketIngestionService:
             status=self._status,
             mode=self.mode,
             provider_connected=self._provider_connected,
-            events_total=supervisor.events_total if supervisor is not None else 0,
+            events_total=self._sink.diagnostics().events_total,
             reconnect_total=supervisor.reconnect_total if supervisor is not None else 0,
             last_failure=supervisor.last_failure if supervisor is not None else None,
         )

@@ -398,12 +398,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_single_dhan_owner(self) -> Self:
-        """Reject a single config that would run two live Dhan owners (H2 lifecycle safety).
+        """Reject a single config/process that would run two live Dhan owners (H2 safety).
 
         The backend legacy provider (``market_provider_enabled``) and the decoupled ingestion
         service (``market_ingestion_service_enabled``) each own a Dhan auth/WebSocket session.
-        Enabling both in one settings object would connect Dhan twice under one client id
-        (ADR-025 §Safety B6); fail fast rather than allow accidental dual ownership.
+        This guard is defence-in-depth for a **shared** settings object/process; it cannot see the
+        real two-container topology where each container has its own env file (that dual-Dhan
+        rollout case is B6, still DESIGN_RESOLVED_IMPLEMENTATION_PENDING per ADR-025). Fail fast
+        rather than allow accidental dual ownership in one process.
         """
         if self.market_provider_enabled and self.market_ingestion_service_enabled:
             raise ValueError(

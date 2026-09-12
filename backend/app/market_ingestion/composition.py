@@ -13,6 +13,7 @@ re-connecting in :meth:`MarketIngestionService.start` does not regenerate the to
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -38,13 +39,20 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
     from app.schemas.market_data import MarketDataKind, SubscriptionRequest
 
     provider = DhanRestAdapter.from_settings(settings)
-    await provider.connect()  # idempotent; creates HTTP clients, no token/WS yet
-    await provider.load_instruments()
-    universe = _canonical_universe(
-        tuple(
-            ref.instrument for ref in provider.load_nse_cash_equity_live_universe().cash_references
+    try:
+        await provider.connect()  # idempotent; creates HTTP clients, no token/WS yet
+        await provider.load_instruments()
+        universe = _canonical_universe(
+            tuple(
+                ref.instrument
+                for ref in provider.load_nse_cash_equity_live_universe().cash_references
+            )
         )
-    )
+    except BaseException:
+        # A universe-resolution/connect failure must not leak the opened provider connection.
+        with contextlib.suppress(Exception):
+            await provider.disconnect()
+        raise
     request = SubscriptionRequest(instruments=universe, data_types=frozenset({MarketDataKind.TICK}))
     return MarketIngestionService(
         flags=flags,

@@ -52,7 +52,6 @@ class ProviderSupervisor:
         self._sleep = sleep or asyncio.sleep
         self._max_reconnects = max_reconnects
         self._status = SupervisorStatus.IDLE
-        self._events = 0
         self._reconnects = 0
         self._consecutive_failures = 0
         self._last_failure: str | None = None
@@ -61,11 +60,6 @@ class ProviderSupervisor:
     def status(self) -> SupervisorStatus:
         """Current supervisor status."""
         return self._status
-
-    @property
-    def events_total(self) -> int:
-        """Total canonical events routed to the sink."""
-        return self._events
 
     @property
     def reconnect_total(self) -> int:
@@ -93,7 +87,6 @@ class ProviderSupervisor:
         try:
             self._status = SupervisorStatus.STREAMING
             async for datum in self._provider.stream_market_data(self._request):
-                self._events += 1
                 self._sink.handle(datum)
         except asyncio.CancelledError:
             raise
