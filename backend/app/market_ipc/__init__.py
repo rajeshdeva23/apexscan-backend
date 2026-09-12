@@ -14,6 +14,13 @@ from app.market_ipc.atomic import (
     AtomicPublisher,
     RedisAtomicPublisher,
 )
+from app.market_ipc.boundary import (
+    AsyncPublicationBoundary,
+    BoundaryDiagnostics,
+    BoundaryState,
+    DrainResult,
+    SubmitOutcome,
+)
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.consumer import (
     ConsumerDiagnostics,
@@ -92,7 +99,12 @@ __all__ = [
     "LEGACY_REDIS_EPOCH_KEY_PREFIX",
     "AtomicPublicationResult",
     "AtomicPublisher",
+    "AsyncPublicationBoundary",
+    "BoundaryDiagnostics",
+    "BoundaryState",
+    "DrainResult",
     "RedisAtomicPublisher",
+    "SubmitOutcome",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "BoundedDeduplicator",
