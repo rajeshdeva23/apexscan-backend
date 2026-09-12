@@ -181,7 +181,7 @@ class MarketEventPublisher:
         ingestion path so identity is fixed at submission and carried through the queue unchanged.
         """
         if self._epoch is None:
-            raise RuntimeError("publisher.prepare called before start()")
+            raise RuntimeError("publisher used before start()")
         self._counters.attempted += 1
         try:
             payload: IpcPayload = _as_ipc_payload(datum)

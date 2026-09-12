@@ -79,6 +79,11 @@ The publisher was split into `prepare()` (front half, no I/O) + `transmit()` (ba
 - **Unknown Redis outcome / retry:** unchanged from D1/ADR-021 — a commit whose result is lost
   may, on retry, append another stream record with the same identity. That is **at-least-once**;
   cross-process dedup is **C1**, not M2.
+- **Sequence gaps:** `prepare()` allocates the `producer_sequence` before enqueue, so a
+  `REJECTED_OVERFLOW` (or oversize/serialization prepare rejection) consumes a sequence that is
+  never transmitted — a gap in the published stream. This extends the existing D1 advance-on-
+  failure contract (consumers already tolerate non-contiguous sequences; a gap never binds two
+  payloads to one identity).
 
 ## Explicit non-guarantees
 

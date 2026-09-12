@@ -148,6 +148,7 @@ class AsyncPublicationBoundary:
         self._state = BoundaryState.NOT_STARTED
         self._worker: asyncio.Task[None] | None = None
         self._high_watermark = 0
+        self._in_flight = 0  # items dequeued but not yet transmitted (for exact drain accounting)
         self._enqueued = 0
         self._published = 0
         self._publish_failures = 0
@@ -200,16 +201,21 @@ class AsyncPublicationBoundary:
         """Dequeue FIFO and transmit via the D1 publisher; one worker preserves order."""
         while True:
             envelope = await self._queue.get()
+            self._in_flight += 1  # dequeued; counted as pending until transmit resolves
             try:
                 outcome = await self._publisher.transmit(envelope)
             except asyncio.CancelledError:
-                self._queue.task_done()  # keep join() accounting consistent on cancellation
+                # Cancelled mid-transmit: the item is neither published nor re-queued. Keep it
+                # counted as in-flight so stop() surfaces it in pending_at_stop (no silent loss);
+                # task_done keeps join() accounting consistent.
+                self._queue.task_done()
                 raise
             except Exception as error:  # noqa: BLE001 - a terminal worker fault must be observable
                 self._publish_failures += 1
                 self._last_failure = type(error).__name__
                 self._last_failure_at = self._now()
                 self._state = BoundaryState.FAILED  # fail closed; reject further submissions
+                self._in_flight -= 1
                 self._queue.task_done()
                 return
             if outcome is PublishOutcome.PUBLISHED:
@@ -219,6 +225,7 @@ class AsyncPublicationBoundary:
                 self._publish_failures += 1
                 self._last_failure = outcome.value
                 self._last_failure_at = self._now()
+            self._in_flight -= 1
             self._queue.task_done()
 
     async def stop(self) -> DrainResult:
@@ -227,9 +234,10 @@ class AsyncPublicationBoundary:
         Never waits forever and never silently discards accepted items: if the drain times out
         (e.g. Redis stalled or the worker failed), the still-pending depth is surfaced.
         """
-        if self._state in (BoundaryState.NOT_STARTED, BoundaryState.STOPPED):
-            self._state = BoundaryState.STOPPED
-            return DrainResult(drained_complete=True, pending_at_stop=0)
+        if self._state is BoundaryState.NOT_STARTED:
+            return DrainResult(drained_complete=True, pending_at_stop=0)  # never ran; leave state
+        if self._state is BoundaryState.STOPPED:
+            return DrainResult(drained_complete=True, pending_at_stop=0)  # idempotent
         was_failed = self._state is BoundaryState.FAILED
         self._state = BoundaryState.STOPPING
         complete = True
@@ -238,7 +246,9 @@ class AsyncPublicationBoundary:
                 await asyncio.wait_for(self._queue.join(), self._drain_timeout)
             except TimeoutError:
                 complete = False
-        pending = self._queue.qsize()
+        # Count the item the worker holds mid-transmit (not in qsize) so an incomplete drain never
+        # under-reports accepted-but-unpublished events.
+        pending = self._queue.qsize() + self._in_flight
         await self._cancel_worker()
         self._state = BoundaryState.STOPPED
         return DrainResult(drained_complete=complete and pending == 0, pending_at_stop=pending)

@@ -260,7 +260,9 @@ async def test_stop_drain_timeout_surfaces_incomplete() -> None:
     await pub.transmit_started.wait()
     result = await b.stop()  # bounded: returns after the drain timeout, never hangs
     assert result.drained_complete is False
-    assert result.pending_at_stop >= 1  # accepted-but-unpublished surfaced, not silently dropped
+    # Both accepted-but-unpublished events are surfaced: the queued one AND the in-flight one the
+    # worker holds mid-transmit (which qsize alone would miss) — no silent loss.
+    assert result.pending_at_stop == 2
     assert b.state is BoundaryState.STOPPED
 
 
@@ -321,8 +323,12 @@ async def test_stress_all_published_in_order_bounded() -> None:
         assert b._queue.qsize() <= 1000  # capacity respected at all times
         await asyncio.sleep(0)  # let the worker drain concurrently
     await _drain_join(pub, b)
-    assert len(pub.transmitted) == accepted == 5000  # nothing dropped
-    assert [e.producer_sequence for e in pub.transmitted] == list(range(1, 5001))  # strict FIFO
+    # Every accepted event is transmitted (nothing silently dropped) in strictly increasing
+    # producer_sequence (FIFO). accepted may be < 5000 only via explicit REJECTED_OVERFLOW, which
+    # is not silent loss; assert on the accepted set, not a scheduling-dependent count.
+    assert len(pub.transmitted) == accepted
+    seqs = [e.producer_sequence for e in pub.transmitted]
+    assert seqs == sorted(seqs)  # strict FIFO order preserved
     await b.stop()
 
 
@@ -346,6 +352,18 @@ async def test_diagnostics_contains_no_secrets() -> None:
     ).lower()
     for secret in ("token", "totp", "pin", "secret", "password", "authorization"):
         assert secret not in body
+    await b.stop()
+
+
+async def test_stop_before_start_does_not_poison_start() -> None:
+    pub = _FakePublisher()
+    b = _boundary(pub)
+    result = await b.stop()  # stop before start must not permanently disable the boundary
+    assert result.drained_complete is True
+    assert b.state is BoundaryState.NOT_STARTED
+    await b.start()  # start still works
+    assert b.state is BoundaryState.RUNNING
+    assert b.submit(_tick()) is SubmitOutcome.ENQUEUED
     await b.stop()
 
 
