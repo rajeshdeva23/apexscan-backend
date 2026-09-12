@@ -18,7 +18,8 @@ under all default configuration**.
   `READY`). Constructs no provider, allocates no epoch, connects no Redis.
 - **`app/market_ingestion/__main__.py`** — the dedicated entrypoint `python -m app.market_ingestion`.
   Disabled (default) → logs its inert status and exits 0 with zero Dhan/IPC/Redis activity.
-  Enabled → refuses to boot (live boot is H2) and exits non-zero.
+  Enabled → in H1 the entrypoint refused to boot (live boot was deferred to H2). **Superseded by
+  H2**, which implements the real provider lifecycle — see `H2-ingestion-service-boot.md`.
 - **`Settings`** — six activation flags + a fail-fast matrix validator + accessors
   (`phase_h_flags()`, `market_path_mode()`, `market_ipc_config()`).
 - **Compose** — a profile-gated `market-ingestion` service in both compose files, excluded from the
