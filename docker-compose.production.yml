@@ -91,6 +91,34 @@ services:
     networks:
       - apexscan-net
 
+  # -------------------------------------------------------------------------
+  # Market ingestion — future decoupled Dhan→IPC producer (DECOUPLING H1).
+  #
+  # INERT by design: gated behind the "market-ingestion" Compose profile, so the
+  # default `docker compose up` (and the deploy pipeline's `up backend`) NEVER
+  # start it. It shares the backend image but runs the dedicated entrypoint,
+  # which with MARKET_INGESTION_SERVICE_ENABLED unset/false performs no Dhan
+  # auth, WebSocket, epoch allocation, Redis, or IPC activity and exits cleanly.
+  # No public port (§14). Owns dhan.env (secret-ownership seam); the backend
+  # keeps its own Dhan access until H9/H10. Live boot is H2.
+  # -------------------------------------------------------------------------
+  market-ingestion:
+    profiles: ["market-ingestion"]
+    image: ${APEXSCAN_IMAGE:?APEXSCAN_IMAGE must be a digest-pinned registry reference}
+    container_name: apexscan-market-ingestion
+    command: ["python", "-m", "app.market_ingestion"]
+    # Runs once and exits cleanly while inert; "no" avoids restart-looping a clean
+    # exit. H2 revisits this to unless-stopped when the service performs live work.
+    restart: "no"
+    env_file:
+      - /etc/apexscan/apexscan-infra.env
+      - /etc/apexscan/dhan.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - apexscan-net
+
 networks:
   apexscan-net:
     name: apexscan-net
