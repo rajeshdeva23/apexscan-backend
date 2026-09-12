@@ -103,7 +103,7 @@ async def test_fresh_consumer_suppresses_already_applied_identity(redis: Redis) 
     config = _config()
     producer = RedisMarketEventStream(redis=redis, config=config)
     await producer.ensure_group()
-    await producer.publish(_envelope(seq=1))
+    first_stream_id = await producer.publish(_envelope(seq=1))
 
     first = _durable_consumer(redis, config, RecordingShadowSink())
     await first.start()
@@ -112,7 +112,8 @@ async def test_fresh_consumer_suppresses_already_applied_identity(redis: Redis) 
 
     # A DIFFERENT Redis Stream id carrying the SAME canonical identity (at-least-once re-publish),
     # consumed by a FRESH consumer whose in-memory cache is empty (simulated process restart).
-    await producer.publish(_envelope(seq=1))
+    second_stream_id = await producer.publish(_envelope(seq=1))
+    assert second_stream_id != first_stream_id  # genuinely a distinct transport id
     second = _durable_consumer(redis, config, RecordingShadowSink())
     await second.start()
     await second.poll_once()
