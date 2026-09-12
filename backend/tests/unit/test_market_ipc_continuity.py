@@ -287,3 +287,34 @@ def test_observe_boundary_derives_overflow_break_from_counter_delta() -> None:
     tracker.observe_boundary(_boundary_diagnostics(overflow_total=1))
     assert tracker.state is ContinuityState.BROKEN
     assert tracker.snapshot().reason is ContinuityReason.PUBLICATION_QUEUE_OVERFLOW
+
+
+def test_observe_boundary_overflow_delta_does_not_double_count() -> None:
+    tracker = _started()
+    tracker.observe_boundary(_boundary_diagnostics(overflow_total=1))
+    tracker.observe_boundary(_boundary_diagnostics(overflow_total=1))  # same total again
+    assert tracker.snapshot().continuity_break_total == 1  # one transition, not two
+
+
+# 20 + 39. hot-path purity: observations are synchronous (never await I/O)
+def test_observation_methods_are_synchronous() -> None:
+    import inspect
+
+    for name in (
+        "producer_started",
+        "provider_connected",
+        "provider_disconnected",
+        "publication_accepted",
+        "publication_succeeded",
+        "publication_failed",
+        "publication_uncertain",
+        "publication_overflow",
+        "worker_failed",
+        "record_submission",
+        "record_publication",
+        "observe_boundary",
+        "drain_completed",
+        "snapshot",
+    ):
+        method = getattr(FeedContinuityTracker, name)
+        assert not inspect.iscoroutinefunction(method), f"{name} must not be async (no I/O)"

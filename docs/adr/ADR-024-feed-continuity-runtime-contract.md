@@ -68,6 +68,19 @@ are retained (bounded ints) for observability across incarnations.
   recovery from the boundary's **public** diagnostics via idempotent counter deltas — so a
   composition can drive continuity **without modifying M2**.
 
+### Wiring requirements for a future Phase-H composition
+- `observe_boundary` (or equivalent diagnostics polling) is **mandatory** for worker-fault
+  detection. When the M2 worker faults the boundary goes `FAILED`; `submit` then returns
+  `REJECTED_NOT_RUNNING` and `transmit` is no longer called, so the `record_submission` /
+  `record_publication` seams alone **cannot** observe the fault — continuity would stay `HEALTHY`
+  forever. A composition wiring only the submit/publication seams is incomplete.
+- One tracker instance must be driven by **one boundary per producer incarnation**. A new
+  incarnation (`producer_started` with a new `producer_epoch`) resets this tracker's seen-counter
+  baselines to zero, which is correct only against a **fresh** boundary whose cumulative counters
+  also restart at zero (the documented M2 lifecycle: new epoch = new `publisher.start()` = new
+  boundary). Reusing one boundary across an epoch change would replay its historical
+  overflow/failure counters as fresh terminal breaks against the new incarnation.
+
 ### Rejected alternatives
 - **Reusing ADR-006's `FeedContinuity` enum** — it is a candle-completeness market-data fact
   consumed by the engine; it cannot express queue overflow, worker failure, or accepted-vs-

@@ -102,10 +102,17 @@ class FeedContinuitySnapshot:
 class FeedContinuityTracker:
     """Observes normalized runtime signals and reports truthful publication continuity (L1).
 
-    Wire it at the decoupled producer seams: :meth:`record_submission` at the M2 submit boundary,
-    :meth:`record_publication` at the D1 transmit boundary, and/or :meth:`observe_boundary` from
-    the boundary's public diagnostics. It never infers loss from sequence gaps and never clears a
-    terminal break on a provider reconnect.
+    Wire it at the decoupled producer seams: :meth:`record_submission` at the M2 submit boundary
+    and :meth:`record_publication` at the D1 transmit boundary track accepted/published positions.
+    :meth:`observe_boundary` (from the boundary's public diagnostics) is **mandatory** for
+    worker-fault detection: once the M2 worker faults the boundary goes ``FAILED`` — ``submit``
+    then returns ``REJECTED_NOT_RUNNING`` and ``transmit`` stops being called, so the submit/
+    publication seams alone can never observe the fault. A Phase-H composition MUST drive
+    :meth:`observe_boundary` (or equivalent diagnostics polling), and MUST supply a **fresh**
+    boundary per producer incarnation (a new epoch resets this tracker's seen-counter baselines,
+    which is correct only against a boundary whose cumulative counters also restart at zero — the
+    documented M2 lifecycle: new epoch = new ``publisher.start()`` = new boundary). It never
+    infers loss from sequence gaps and never clears a terminal break on a provider reconnect.
     """
 
     def __init__(self) -> None:
@@ -262,9 +269,11 @@ class FeedContinuityTracker:
     ) -> None:
         """Map a D1/publisher :class:`PublishOutcome` to a continuity observation (transmit-seam).
 
-        ``FAILED_TRANSPORT`` conflates a definite failure with an unknown outcome (the current
-        D1/publisher contract cannot distinguish them), so it is mapped conservatively to a
-        terminal :meth:`publication_failed` rather than fabricating certainty either way.
+        ``PUBLISHED`` advances the published position; **every** non-``PUBLISHED`` outcome maps to
+        a terminal :meth:`publication_failed`. In practice ``transmit`` returns only ``PUBLISHED``
+        or ``FAILED_TRANSPORT``, and ``FAILED_TRANSPORT`` conflates a definite failure with an
+        unknown outcome (the current D1/publisher contract cannot distinguish them) — so mapping
+        it conservatively to a terminal break fabricates certainty in neither direction.
         """
         if outcome is PublishOutcome.PUBLISHED:
             self.publication_succeeded(producer_sequence=producer_sequence)
