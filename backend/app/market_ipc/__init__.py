@@ -29,6 +29,12 @@ from app.market_ipc.consumer import (
     RecordingShadowSink,
     ShadowMarketEventSink,
 )
+from app.market_ipc.continuity import (
+    ContinuityReason,
+    ContinuityState,
+    FeedContinuitySnapshot,
+    FeedContinuityTracker,
+)
 from app.market_ipc.dedup import BoundedDeduplicator
 from app.market_ipc.durable_dedup import (
     CompositeDeduplicator,
@@ -122,6 +128,10 @@ __all__ = [
     "dedup_key",
     "CompactedReferenceState",
     "CompactedReferenceStore",
+    "ContinuityReason",
+    "ContinuityState",
+    "FeedContinuitySnapshot",
+    "FeedContinuityTracker",
     "ConsumerDiagnostics",
     "DurableEpochAllocator",
     "EpochAllocator",
