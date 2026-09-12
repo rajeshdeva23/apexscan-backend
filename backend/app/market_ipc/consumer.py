@@ -11,8 +11,13 @@ is not constructed by production composition. The in-process Dhan pipeline stays
 
 Delivery is at-least-once (Redis redelivery via XAUTOCLAIM). Dedup is committed only AFTER a
 successful shadow application, so a failed apply is redelivered and retried rather than lost.
-Exactly-once is NOT claimed: dedup is a bounded in-memory window, so a process restart or total
-Redis state loss can re-apply an event (see carried-forward finding M1).
+Dedup is pluggable (:class:`Deduplicator`): the default is a NON-durable in-memory window
+(Phase-C behaviour), while C1 wiring injects a durable Redis authority (:class:`Composite\
+Deduplicator`) so a completed application is recognised across process/consumer restart and
+Redis Stream redelivery. A durable dedup store failure is fail-closed (entry left pending, never
+applied blind). Exactly-once is still NOT claimed: the residual "applied but the durable mark
+had not yet committed" window can re-apply an event on redelivery — harmless for the current
+non-authoritative shadow sink; total Redis data loss discards stream and dedup state together.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from redis.exceptions import RedisError
 
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.dedup import BoundedDeduplicator
+from app.market_ipc.durable_dedup import Deduplicator, InMemoryDeduplicator
 from app.market_ipc.envelope import (
     SUPPORTED_SCHEMA_VERSIONS,
     MarketEventEnvelope,
@@ -64,6 +70,7 @@ class MessageOutcome(StrEnum):
     EVENT_KIND_MISMATCH = "event_kind_mismatch"
     SINK_FAILED = "sink_failed"
     ACK_FAILED = "ack_failed"
+    DEDUP_UNAVAILABLE = "dedup_unavailable"  # durable dedup store failed — fail closed, retry
 
 
 # Outcomes that are permanently invalid for the current session/consumer or already handled:
@@ -147,6 +154,7 @@ class ConsumerDiagnostics(BaseModel):
     sink_failures: int
     ack_failures: int
     read_failures: int
+    dedup_store_failures: int
     last_received_at: datetime | None
     last_applied_at: datetime | None
     last_ack_at: datetime | None
@@ -166,7 +174,7 @@ class MarketEventConsumer:
         trading_date_source: TradingDateAuthority,
         universe_version_source: UniverseVersionAuthority,
         now: Callable[[], datetime],
-        deduplicator: BoundedDeduplicator | None = None,
+        deduplicator: Deduplicator | None = None,
     ) -> None:
         self._transport = transport
         self._config = config
@@ -174,9 +182,10 @@ class MarketEventConsumer:
         self._trading_date_source = trading_date_source
         self._universe_version_source = universe_version_source
         self._now = now
-        # `is not None`, not `or`: an empty BoundedDeduplicator is falsy (it defines __len__).
+        # Default is the NON-durable in-memory window (Phase-C behaviour); production C1 wiring
+        # injects a CompositeDeduplicator (durable Redis authority + in-memory cache).
         if deduplicator is None:
-            deduplicator = BoundedDeduplicator(config.dedup_max_entries)
+            deduplicator = InMemoryDeduplicator(BoundedDeduplicator(config.dedup_max_entries))
         self._dedup = deduplicator
         self._counters = _ConsumerCounters()
         self._running = False
@@ -243,7 +252,11 @@ class MarketEventConsumer:
             return await self._finalize(message_id, gate_outcome)
 
         identity = ProducerEventIdentity.from_envelope(envelope)
-        if self._dedup.contains(identity):
+        try:
+            already_applied = await self._dedup.contains(identity)
+        except RedisError:
+            return self._record_dedup_failure()  # fail closed: leave pending, never apply blind
+        if already_applied:
             self._counters.duplicate += 1
             return await self._finalize(message_id, MessageOutcome.DUPLICATE)
 
@@ -344,10 +357,22 @@ class MarketEventConsumer:
             self._counters.sink_failures += 1
             self._last_error_at = self._now()
             return MessageOutcome.SINK_FAILED  # not ACKed -> redelivered and retried
-        self._dedup.record(identity)  # committed only after successful application
+        try:
+            await self._dedup.record(identity)  # durable mark, only after successful application
+        except RedisError:
+            # Applied, but the durable mark did not commit: fail closed (do NOT ACK). The entry
+            # redelivers; the shadow sink re-applies harmlessly (no durable/business effect). An
+            # authoritative sink would require an atomic sink+mark transition (ADR-023).
+            return self._record_dedup_failure()
         self._counters.applied += 1
         self._last_applied_at = self._now()
         return await self._finalize(message_id, MessageOutcome.APPLIED)
+
+    def _record_dedup_failure(self) -> MessageOutcome:
+        """Count a durable-dedup store failure and fail closed (entry left pending)."""
+        self._counters.dedup_store_failures += 1
+        self._last_error_at = self._now()
+        return MessageOutcome.DEDUP_UNAVAILABLE
 
     async def _finalize(self, message_id: str, outcome: MessageOutcome) -> MessageOutcome:
         """ACK terminal outcomes; leave transient ones pending for redelivery."""
@@ -397,6 +422,7 @@ class MarketEventConsumer:
             sink_failures=counters.sink_failures,
             ack_failures=counters.ack_failures,
             read_failures=counters.read_failures,
+            dedup_store_failures=counters.dedup_store_failures,
             last_received_at=self._last_received_at,
             last_applied_at=self._last_applied_at,
             last_ack_at=self._last_ack_at,
@@ -433,6 +459,7 @@ class _ConsumerCounters:
         "sink_failures",
         "ack_failures",
         "read_failures",
+        "dedup_store_failures",
     )
 
     def __init__(self) -> None:
@@ -453,3 +480,4 @@ class _ConsumerCounters:
         self.sink_failures = 0
         self.ack_failures = 0
         self.read_failures = 0
+        self.dedup_store_failures = 0

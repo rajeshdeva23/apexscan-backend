@@ -30,6 +30,13 @@ from app.market_ipc.consumer import (
     ShadowMarketEventSink,
 )
 from app.market_ipc.dedup import BoundedDeduplicator
+from app.market_ipc.durable_dedup import (
+    CompositeDeduplicator,
+    Deduplicator,
+    DurableDeduplicator,
+    InMemoryDeduplicator,
+    dedup_key,
+)
 from app.market_ipc.envelope import (
     FEED_WIDE_IDENTITY,
     SCHEMA_VERSION,
@@ -108,6 +115,11 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "BoundedDeduplicator",
+    "CompositeDeduplicator",
+    "Deduplicator",
+    "DurableDeduplicator",
+    "InMemoryDeduplicator",
+    "dedup_key",
     "CompactedReferenceState",
     "CompactedReferenceStore",
     "ConsumerDiagnostics",
