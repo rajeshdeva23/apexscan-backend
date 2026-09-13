@@ -151,6 +151,17 @@ class MarketIngestionService:
         """The injected provider instance (stable across reconnects); None when disabled/absent."""
         return self._provider
 
+    @property
+    def terminal_failure(self) -> bool:
+        """Whether this incarnation hit a terminal publication break (fail-closed signal).
+
+        Set by a supervisor that ended on a :class:`PublicationTerminalError` or by the observer
+        detecting a broken boundary. Stays set through ``stop()`` so a caller/entrypoint can fail
+        closed at the process boundary (non-zero exit) instead of reading a drained ``STOPPED`` as
+        a clean shutdown. A clean supervisor end (stream returned / reconnect budget) never sets it.
+        """
+        return self._terminal.is_set()
+
     async def start(self) -> None:
         """Boot the lifecycle when enabled; no-op when disabled. Fail closed on a startup error."""
         if not self._flags.market_ingestion_service_enabled:

@@ -36,6 +36,9 @@ async def _run() -> int:
     if service.status is ServiceStatus.RUNNING:
         await service.wait()  # serve until the supervisor ends or the process is cancelled
         await service.stop()
+        if service.terminal_failure:  # a terminal publication break fails closed at exit too
+            logger.error("market-ingestion ended on a terminal publication break")
+            return 1
     return 0 if service.status in (ServiceStatus.DISABLED, ServiceStatus.STOPPED) else 1
 
 
