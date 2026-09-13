@@ -140,3 +140,26 @@ def test_consumer_runtime_imports_no_producer_or_provider_surface() -> None:
     modules = _modules(_APP_ROOT / "market_ipc" / "consumer_runtime.py")
     offending = sorted({m for m in modules for f in forbidden if _matches(m, f)})
     assert offending == [], f"consumer runtime imported producer/provider surface: {offending}"
+
+
+def test_shadow_compare_imports_no_authority_redis_or_provider_surface() -> None:
+    """The H4C comparator is a pure canonical-value function: no Redis, authority, or provider.
+
+    Proves the offline parity path holds no Redis client, never reaches the production TickEngine
+    / MarketContext / market engine / strategies, and pulls in no Dhan provider or IPC publisher —
+    so it can compare canonical events but can never mutate authoritative state or contact a broker.
+    """
+    forbidden = (
+        "redis",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.adapters.dhan",
+        "app.strategies",
+        "app.strategy_manager",
+        "app.services",
+        "app.market_ipc.publisher",
+        "app.market_ipc.epoch",
+    )
+    modules = _modules(_APP_ROOT / "market_ipc" / "shadow_compare.py")
+    offending = sorted({m for m in modules for f in forbidden if _matches(m, f)})
+    assert offending == [], f"shadow_compare imported forbidden surface: {offending}"
