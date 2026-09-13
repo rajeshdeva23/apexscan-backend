@@ -190,6 +190,44 @@ async def test_stop_closes_client_once_and_clears_task() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# An abnormal loop exit flips to FAILED (no readiness lie) and still closes the client
+# --------------------------------------------------------------------------- #
+async def test_abnormal_loop_exit_fails_and_closes_client() -> None:
+    transport = InMemoryMarketEventStream()
+    await transport.publish(_envelope(1))
+
+    def _boom() -> int:
+        raise RuntimeError("injected authority-source failure")
+
+    consumer = MarketEventConsumer(
+        transport=transport,
+        config=MarketIpcConfig(block_ms=0),
+        sink=RecordingShadowSink(),
+        trading_date_source=lambda: _TD,
+        universe_version_source=_boom,  # raises inside the gate on the first poll
+        now=lambda: _NOW,
+    )
+    redis = _CountingRedis()
+    runtime = MarketEventConsumerRuntime(
+        mode=MarketPathMode.SHADOW_CONSUME_COMPARE,
+        flags=_shadow_flags(),
+        consumer=consumer,
+        redis=redis,
+        poll_idle_seconds=0.01,
+    )
+    await runtime.start()
+    for _ in range(100):
+        if runtime.state is RuntimeState.FAILED:
+            break
+        await asyncio.sleep(0.01)
+
+    assert runtime.state is RuntimeState.FAILED  # dead loop is visible, not a ready lie
+    assert not runtime.is_ready
+    await runtime.stop()
+    assert redis.closes == 1  # client closed despite the abnormal loop exit
+
+
+# --------------------------------------------------------------------------- #
 # T28: the apply path does not depend on live timestamp correctness (FIX-2)
 # --------------------------------------------------------------------------- #
 async def test_apply_path_is_independent_of_live_timestamps() -> None:

@@ -63,10 +63,6 @@ class RuntimeState(StrEnum):
     STOPPED = "stopped"
 
 
-class ConsumerRuntimeConfigurationError(RuntimeError):
-    """Raised when a runtime is composed for a mode other than the shadow-consume role."""
-
-
 class MarketEventConsumerRuntime:
     """Owns one Redis client + the shadow consumer + its cancellable poll loop.
 
@@ -122,8 +118,8 @@ class MarketEventConsumerRuntime:
         if self._consumer is None:
             self._state = RuntimeState.DISABLED
             return
-        if self._state is RuntimeState.RUNNING:
-            return
+        if self._state in (RuntimeState.STARTING, RuntimeState.RUNNING):
+            return  # already starting/running: never double-launch the poll task
         self._state = RuntimeState.STARTING
         try:
             # Idempotent XGROUP CREATE (mkstream); raises if Redis is unreachable.
@@ -133,39 +129,50 @@ class MarketEventConsumerRuntime:
             await self._close_redis()  # unwind: never leave the owned client open on a failed start
             raise
         self._task = asyncio.create_task(self._run())
+        self._task.add_done_callback(self._on_task_done)
         self._state = RuntimeState.RUNNING
 
     async def _run(self) -> None:
         """Drive bounded poll cycles until stopped; ``poll_once`` never raises (faults counted).
 
-        With ``block_ms > 0`` the XREADGROUP long-poll paces the loop; with ``block_ms == 0``
-        (tests) a small idle sleep prevents a busy loop. Cancellation (from :meth:`stop`) wakes a
-        blocked read and ends the loop cleanly.
+        With ``block_ms > 0`` the XREADGROUP long-poll paces the loop; with ``block_ms == 0`` the
+        idle sleep prevents a busy loop. The sleep is unconditional so every cycle yields — a zero
+        idle still hands control back so ``stop`` can cancel a non-blocking loop. Cancellation wakes
+        a blocked read and ends the loop cleanly.
         """
         assert self._consumer is not None
         while self._state is RuntimeState.RUNNING:
             await self._consumer.poll_once()
-            if self._poll_idle_seconds:
-                await asyncio.sleep(self._poll_idle_seconds)
+            await asyncio.sleep(self._poll_idle_seconds)
+
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
+        """Flip to FAILED if the poll loop ends abnormally so readiness never lies (§35)."""
+        if task.cancelled() or self._state is not RuntimeState.RUNNING:
+            return
+        if task.exception() is not None:
+            self._state = RuntimeState.FAILED
 
     async def stop(self) -> None:
         """Stop the loop, cancel a blocked read, and close the Redis client exactly once.
 
         Idempotent and safe from any state. ``poll_once`` processes each entry to a terminal
         outcome before the next, so cancelling between entries never ACKs a partially processed
-        event — an un-ACKed entry simply redelivers (§36).
+        event — an un-ACKed entry simply redelivers (§36). The Redis client is closed even if the
+        loop task ended abnormally, so an unexpected loop fault can never leak the owned client.
         """
         if self._consumer is None:
             self._state = RuntimeState.DISABLED
             return
         self._state = RuntimeState.STOPPING
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        await self._close_redis()
-        self._state = RuntimeState.STOPPED
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._task
+                self._task = None
+        finally:
+            await self._close_redis()
+            self._state = RuntimeState.STOPPED
 
     async def _close_redis(self) -> None:
         """Close the owned Redis client at most once (idempotent; a close fault is swallowed)."""
