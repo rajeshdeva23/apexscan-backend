@@ -33,11 +33,15 @@ concurrent same-`client_id` sessions)**.
   process-memory-only). Enabling the ingestion service **at all** makes it a live Dhan owner (token +
   WebSocket), so a live side-by-side shadow means **two live Dhan owners on one `client_id`** — the
   exact arrangement whose safety is unverified.
-- A **second Dhan account/identity is not a practical migration prerequisite** (Option A unavailable).
+- H3D **recommended Option A** (a *separate* shadow Dhan identity) as the cleanest, highest-safety
+  route to a true side-by-side shadow, but noted it is **not provisioned or approved today**.
 
-Therefore the roadmap must **not depend on simultaneous Dhan ownership**. Both ADR-026's dual-owner
-live-shadow window (H3E) and ADR-025's live side-by-side shadow-compare modes are off the critical
-path.
+**This amendment decides** not to make provisioning a second Dhan identity a migration
+*prerequisite*: with same-`client_id` concurrency UNKNOWN and no second identity available now, the
+roadmap must **not depend on simultaneous Dhan ownership**. (This is ADR-027's decision, not an H3D
+finding; if a second identity is later provisioned, H3D's Option A remains the recommended path and
+this policy can be revisited.) Both ADR-026's dual-owner live-shadow window (H3E) and ADR-025's live
+side-by-side shadow-compare modes are therefore off the critical path.
 
 ## Decision
 
@@ -135,9 +139,19 @@ does not implement it and flags it as the phase's `ARCHITECTURE_DECISION_REQUIRE
   **regenerate a token**, subject to the ~2-min generation cooldown → a rollback carries a bounded
   re-authentication gap. A rollback that needs another token generation is **operationally risky until
   proven** and must be rehearsed (H9A) before H9B.
+- **First live contact is the cutover (accepted residual risk).** Because Option A (a second identity)
+  is not a prerequisite, ingestion's live Dhan auth/WS/universe-subscription cannot be rehearsed
+  against real Dhan *before* H9B — the cutover is the first live ingestion Dhan contact. This is
+  inherent to single-owner + no-second-account and is mitigated (not eliminated) by the abort
+  conditions and a rehearsed rollback; it is accepted knowingly, and argues for running the first
+  cutover outside the live session.
 - **B10 secret migration is staged:** backend keeps Dhan secrets through cutover and rollback; backend
   Dhan credentials are removed **only after** a proven cutover (H10). Never remove backend credentials
-  before the rollback strategy is frozen and rehearsed.
+  before the rollback strategy is frozen and rehearsed. **During the H9B→H10 window** the backend
+  still holds Dhan secrets, so single ownership is enforced by the single-owner interlock + the
+  disabled legacy path (`market_provider_enabled=false`), **not** by secret-absence — a backend
+  restart in this window must not re-acquire Dhan (the Q9 criterion is only *structurally* guaranteed
+  once H10 removes the secrets).
 
 ## Blocker impact
 

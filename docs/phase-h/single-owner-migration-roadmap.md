@@ -15,10 +15,12 @@ Dhan account (Option A) or documented same-`client_id` concurrency (Option B). *
   one (token is process-memory-only; ~2-min generation cooldown).
 - Enabling the ingestion service **at all** makes it a live Dhan owner (token + WS) — so a live
   side-by-side shadow = **two live Dhan owners on one identity**, whose safety is unverified.
-- A **second Dhan account is not a practical prerequisite**.
+- H3D **recommended** Option A (a separate shadow identity) as the cleanest route, but it is **not
+  provisioned or approved today**.
 
-We therefore do **not** assume a second account and do **not** build the roadmap on simultaneous
-ownership.
+**This amendment decides** (not an H3D finding) not to make a second Dhan identity a prerequisite:
+we do **not** build the roadmap on simultaneous ownership. If a second identity is later provisioned,
+H3D's Option A remains the recommended path and this policy can be revisited.
 
 ## The single-owner rule
 
@@ -41,7 +43,9 @@ authority verification + rollback gate → `H10` remove backend Dhan ownership/s
 FIX-2 is a **separate track**. H4A/H4B (consumer composition, pending recovery, failure hardening)
 can proceed **before** FIX-2. Any gate that asserts **timestamp correctness** or **consume-compare
 parity** against legacy (H4C parity claims, H5, H9C authority verification) **requires FIX-2 resolved
-and validated** first. FIX-2 is not implemented here.
+and validated** first. FIX-2 is not implemented here. (This *refines* H3D §23's coarser "FIX-2
+required before any consume-side comparison (H4)": the non-comparison H4A/H4B sub-phases are
+unblocked; only the comparison/timestamp gates depend on FIX-2.)
 
 ### How much of H4 needs no real Dhan
 
