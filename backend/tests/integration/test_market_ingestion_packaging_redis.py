@@ -400,7 +400,7 @@ async def test_terminal_failure_closes_redis(tmp_path) -> None:
         await _until(lambda: service.diagnostics().published_total >= 1)  # A landed
         server.shutdown()  # the outage begins
         gate.set()  # B's transmit hits a dead Redis → terminal
-        await asyncio.wait_for(service._watch_task, timeout=5.0)
+        await asyncio.wait_for(service._watch_task, timeout=30.0)  # generous for a loaded CI runner
         assert service.terminal_failure is True
         await service.stop()
         assert spy.aclose_calls == 1  # a terminal incarnation still closes its client

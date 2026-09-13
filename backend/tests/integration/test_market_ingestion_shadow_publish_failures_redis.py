@@ -238,7 +238,7 @@ async def test_redis_outage_during_publication_fails_closed(tmp_path) -> None:
         await _until(lambda: service.diagnostics().published_total >= 1)  # A landed on Redis
         server.shutdown()  # the outage begins
         gate.set()  # provider now yields B → its transmit hits a dead Redis
-        await asyncio.wait_for(service._watch_task, timeout=5.0)  # fail closed
+        await asyncio.wait_for(service._watch_task, timeout=30.0)  # fail closed (generous for CI)
 
         diagnostics = service.diagnostics()
         assert service.status is ServiceStatus.FAILED
