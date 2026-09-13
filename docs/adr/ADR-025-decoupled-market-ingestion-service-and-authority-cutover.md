@@ -7,6 +7,7 @@
 | **Deciders** | Platform / Market-Ingestion Decoupling Architecture |
 | **Supersedes** | — |
 | **Superseded by** | — |
+| **Amended by** | ADR-027 (rollout/migration sequence — single-owner migration policy; live side-by-side shadow modes replaced by offline validation + a single-owner cutover) |
 | **Related** | ADR-006 (feed continuity fact), ADR-010 (runtime composition), ADR-020 (M1), ADR-021 (D1), ADR-022 (M2), ADR-023 (C1), ADR-024 (L1); DESIGN-REVIEW-2 |
 
 > This ADR is a **design and readiness gate only**. It implements nothing, activates nothing,
