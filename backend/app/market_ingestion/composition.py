@@ -1,10 +1,12 @@
-"""Composition root for the market-ingestion service (DECOUPLING PHASE H2).
+"""Composition root for the market-ingestion service (DECOUPLING PHASE H2 / H3A).
 
 Builds a real, provider-owning :class:`MarketIngestionService` from settings when the service is
 enabled, and a disabled/inert service otherwise. Provider construction (and the Dhan adapter
 import) is **lazy** — it happens only inside this async builder when the service is enabled, so
-importing the package remains side-effect free. IPC publication stays OFF: nothing here allocates
-an M1 epoch, starts M2, constructs the D1 publisher, or touches Redis.
+importing the package remains side-effect free. In publisher mode (H3A) it additionally builds the
+M1/D1/M2/L1 publication stack over Redis; the M1 epoch is still allocated later by
+``boundary.start()``. Reaching the publisher branch requires ``live_h3_publish_approved`` (the
+Settings interlock refuses to construct otherwise), so an accidental live enable cannot occur.
 
 Ownership: the ingestion service owns one Dhan auth manager / provider (one connect ⇒ one cached
 token). ``connect`` is idempotent and token generation is lazy, so resolving the universe here and
@@ -15,13 +17,19 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.market_ingestion.service import MarketIngestionService
 
 if TYPE_CHECKING:
     from app.core.config import Settings
+    from app.market_ingestion.publication import PublicationStack
     from app.schemas.market_data import Instrument
+
+# Stable producer identity for the decoupled ingestion service (M1 producer_id).
+_PRODUCER_ID = "market-ingestion"
 
 
 class UniverseResolutionError(RuntimeError):
@@ -54,11 +62,31 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
             await provider.disconnect()
         raise
     request = SubscriptionRequest(instruments=universe, data_types=frozenset({MarketDataKind.TICK}))
+    publication = _build_publication(settings) if flags.ipc_publisher_enabled else None
     return MarketIngestionService(
         flags=flags,
         provider=provider,
         subscription_request=request,
+        publication=publication,
         provider_lifecycle_timeout_seconds=settings.provider_lifecycle_timeout_seconds,
+    )
+
+
+def _build_publication(settings: Settings) -> PublicationStack:
+    """Construct the H3 publication stack over the configured Redis (publisher mode; live-gated)."""
+    from redis.asyncio import Redis
+
+    from app.market_ingestion.publication import build_publication_stack
+
+    redis: Redis = Redis.from_url(settings.redis_url)
+    now = datetime.now(UTC)
+    return build_publication_stack(
+        redis=redis,
+        config=settings.market_ipc_config(),
+        producer_id=_PRODUCER_ID,
+        state_dir=Path(settings.market_ingestion_state_dir),
+        now=lambda: datetime.now(UTC),
+        trading_date=now.date(),
     )
 
 

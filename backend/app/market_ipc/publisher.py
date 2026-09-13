@@ -145,6 +145,15 @@ class MarketEventPublisher:
         """Whether the publisher has allocated an epoch and is ready to publish."""
         return self._epoch is not None
 
+    @property
+    def current_sequence(self) -> int:
+        """The last allocated producer_sequence (0 before the first prepare); O(1) read.
+
+        Read-only observability accessor over the existing counter — no behaviour/atomicity change.
+        Lets a caller record the just-accepted event's sequence without building diagnostics().
+        """
+        return self._sequence
+
     async def start(self) -> None:
         """Allocate a restart-unique epoch and ensure the stream group exists.
 

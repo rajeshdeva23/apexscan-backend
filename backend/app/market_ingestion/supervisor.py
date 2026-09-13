@@ -15,7 +15,8 @@ from collections.abc import Awaitable, Callable
 from enum import StrEnum
 
 from app.adapters.base.broker_adapter import LiveMarketDataAdapter
-from app.market_ingestion.sink import ProviderOnlyEventSink
+from app.market_ingestion.errors import PublicationTerminalError
+from app.market_ingestion.sink import EventSink
 from app.schemas.market_data import SubscriptionRequest
 
 logger = logging.getLogger(__name__)
@@ -41,16 +42,24 @@ class ProviderSupervisor:
         *,
         provider: LiveMarketDataAdapter,
         request: SubscriptionRequest,
-        sink: ProviderOnlyEventSink,
+        sink: EventSink,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         max_reconnects: int | None = None,
+        on_disconnect: Callable[[], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
     ) -> None:
-        """Wire the supervisor; ``max_reconnects=None`` self-heals indefinitely (production)."""
+        """Wire the supervisor; ``max_reconnects=None`` self-heals indefinitely (production).
+
+        ``on_disconnect``/``on_reconnect`` are optional L1 hooks called on a *recoverable* transport
+        drop and on the following reconnect attempt (never on a terminal publication break).
+        """
         self._provider = provider
         self._request = request
         self._sink = sink
         self._sleep = sleep or asyncio.sleep
         self._max_reconnects = max_reconnects
+        self._on_disconnect = on_disconnect
+        self._on_reconnect = on_reconnect
         self._status = SupervisorStatus.IDLE
         self._reconnects = 0
         self._consecutive_failures = 0
@@ -74,13 +83,17 @@ class ProviderSupervisor:
     async def run(self) -> None:
         """Consume the stream, restarting on terminal failure until cancelled/budget exhausted."""
         while True:
-            await self._consume_once()
+            await self._consume_once()  # returns only on a recoverable end (terminal propagates)
+            if self._on_disconnect is not None:
+                self._on_disconnect()  # L1: provider transport dropped (recoverable)
             if self._max_reconnects is not None and self._reconnects >= self._max_reconnects:
                 self._status = SupervisorStatus.FAILED
                 return
             self._reconnects += 1
             self._status = SupervisorStatus.RECOVERING
             await self._sleep(self._backoff())
+            if self._on_reconnect is not None:
+                self._on_reconnect()  # L1: attempting reconnect (awaiting recovery evidence)
 
     async def _consume_once(self) -> None:
         """Run one stream attempt; record a terminal end (only cancellation propagates)."""
@@ -89,6 +102,11 @@ class ProviderSupervisor:
             async for datum in self._provider.stream_market_data(self._request):
                 self._sink.handle(datum)
         except asyncio.CancelledError:
+            raise
+        except PublicationTerminalError:
+            # A publication continuity break is TERMINAL for the incarnation — it must propagate
+            # (stop intake), never be self-healed into a reconnect loop. Dedicated handler ahead
+            # of the generic catch-all below (the type alone would otherwise be swallowed).
             raise
         except Exception as error:  # noqa: BLE001 - a terminal stream fault self-heals above
             self._last_failure = type(error).__name__
