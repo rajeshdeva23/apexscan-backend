@@ -97,6 +97,16 @@ from app.market_ipc.reference import (
     merge_reference,
     reference_from_envelope,
 )
+from app.market_ipc.shadow_compare import (
+    ORDERING_MODEL,
+    CanonicalEventView,
+    ParityClass,
+    ParityMismatch,
+    ParityReport,
+    compare,
+    view_from_envelope,
+    views_from_applied,
+)
 from app.market_ipc.state import (
     CompactedReferenceState,
     CompactedReferenceStore,
@@ -115,6 +125,11 @@ from app.market_ipc.transport import (
 __all__ = [
     "FEED_WIDE_IDENTITY",
     "LEGACY_REDIS_EPOCH_KEY_PREFIX",
+    "ORDERING_MODEL",
+    "CanonicalEventView",
+    "ParityClass",
+    "ParityMismatch",
+    "ParityReport",
     "AtomicPublicationResult",
     "AtomicPublisher",
     "AsyncPublicationBoundary",
@@ -175,6 +190,7 @@ __all__ = [
     "UniverseVersionComparison",
     "UniverseVersionSource",
     "build_envelope",
+    "compare",
     "compare_universe_version",
     "compose_consumer_runtime",
     "decode_envelope",
@@ -189,4 +205,6 @@ __all__ = [
     "priority_for",
     "reference_from_envelope",
     "reference_key",
+    "view_from_envelope",
+    "views_from_applied",
 ]
