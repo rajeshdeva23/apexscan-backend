@@ -24,11 +24,19 @@ open a WebSocket, deploy, or change production.
 | Fact | Value | Source |
 |------|-------|--------|
 | `CURRENT_LEGACY_DHAN_OWNER` | the `apexscan-backend` process (`market_provider_enabled=true` → `dhan_runtime_composition` builds the Dhan adapter + `DhanAuthManager` + live WS) | VERIFIED_REPOSITORY |
-| `FUTURE_INGESTION_DHAN_OWNER` | `apexscan-market-ingestion` (only when `market_ingestion_service_enabled=true` **and** `live_h3_publish_approved=true`) | VERIFIED_REPOSITORY |
+| `FUTURE_INGESTION_DHAN_OWNER` | `apexscan-market-ingestion` — becomes a **live Dhan owner (token + WebSocket)** whenever `market_ingestion_service_enabled=true` **alone** (the H2 provider lifecycle: `start()` unconditionally calls `_start_provider()` → `ProviderCoordinator.start` → `connect()` + `get_health()` on `/profile` → **token generation**, then the supervisor opens the WS). `ipc_publisher_enabled` / `live_h3_publish_approved` gate **only** Redis shadow publication, **not** the Dhan connection. | VERIFIED_REPOSITORY (`service.py:175-177`, `provider_coordinator.py:60-82`, `adapter.py:353-357`) |
 | `CURRENT_SECRET_OWNER` | production `dhan.env` mounted by **both** `backend` and `market-ingestion` (`docker-compose.production.yml:71,115`) | VERIFIED_REPOSITORY |
-| `INGESTION_SECRET_ACCESS` | YES — mounts `/etc/apexscan/dhan.env` (but the service is profile-gated + inert today) | VERIFIED_REPOSITORY |
-| `LIVE_H3_INTERLOCK` | `Settings.validate_h3_live_publish_interlock` — `ipc_publisher_enabled ⇒ live_h3_publish_approved` (default `false`), fail-fast | VERIFIED_REPOSITORY |
-| `SINGLETON_CONTROLS` | `validate_single_dhan_owner` (shared-process: not both `market_provider_enabled ∧ market_ingestion_service_enabled`) + unique `container_name: apexscan-market-ingestion` + profile gating (not default-started) + no public port | VERIFIED_REPOSITORY |
+| `INGESTION_SECRET_ACCESS` | YES — mounts `/etc/apexscan/dhan.env` (but the service is profile-gated + `MARKET_INGESTION_SERVICE_ENABLED` unset ⇒ inert today) | VERIFIED_REPOSITORY |
+| `LIVE_H3_INTERLOCK` | `Settings.validate_h3_live_publish_interlock` — `ipc_publisher_enabled ⇒ live_h3_publish_approved` (default `false`), fail-fast. **Gates only the Redis publisher, NOT the Dhan connection** (see the correction in §14). | VERIFIED_REPOSITORY |
+| `SINGLETON_CONTROLS` | `validate_single_dhan_owner` (**shared-process only** — cannot see the two-container topology, so it does not stop two separate processes from each owning Dhan) + unique `container_name: apexscan-market-ingestion` + profile gating (not default-started) + no public port | VERIFIED_REPOSITORY |
+
+> **Primary live-Dhan control (corrected after review):** what keeps ingestion from becoming a
+> second live Dhan owner in production is **`MARKET_INGESTION_SERVICE_ENABLED=false` (default) plus
+> Compose profile-gating** (the container is never started by the default stack). The
+> `live_h3_publish_approved` interlock is a *secondary* control that only blocks Redis publication —
+> it does **not** prevent the token/WebSocket the B6 hazard is about. This strengthens the NO-GO: the
+> B6 token/session hazard is triggered by enabling the service at all, so operational discipline
+> (service disabled + profile-gated) is the real safety boundary until B6 is cleared.
 
 **Secret topology (§13):** `BACKEND_HAS_DHAN_SECRET_ACCESS = YES`,
 `INGESTION_HAS_DHAN_SECRET_ACCESS = YES`, `SAME_IDENTITY_POSSIBLE = YES` (same `dhan.env` ⇒ same
@@ -49,9 +57,9 @@ legacy backend **and** the ingestion service to be **simultaneous** Dhan owners 
 | `TOKEN_CACHE_LOCATION` | **process memory only** (`_RuntimeAccessToken`; never written to disk/Redis) | VERIFIED_REPOSITORY |
 | `TOKEN_PERSISTENCE` | NONE | VERIFIED_REPOSITORY |
 | `RESTART_BEHAVIOR` | a fresh process has no cached token → regenerates on first use (container recreation forces regen — see [[apexscan-dhan-token-deploy-hazard]]) | VERIFIED_REPOSITORY |
-| `SECOND_PROCESS_BEHAVIOR` | a second same-`client_id` process runs its **own** `DhanAuthManager` and generates its **own** token independently | VERIFIED_REPOSITORY |
+| `SECOND_PROCESS_BEHAVIOR` | a second same-`client_id` process runs its **own** `DhanAuthManager` and generates its **own** token independently — triggered as soon as `market_ingestion_service_enabled=true` (not gated by the publisher approval) | VERIFIED_REPOSITORY |
 | token validity | 24 hours | VERIFIED_OFFICIAL |
-| `TOKEN_REGENERATION_COOLDOWN` | **2 minutes** — Dhan answers a too-soon request with HTTP 200 + `"Token can be generated once every 2 minutes."`, mapped to a rate-limit error in `auth.py` | VERIFIED_REPOSITORY (provider runtime message; not restated as a number on the fetched official pages) |
+| `TOKEN_REGENERATION_COOLDOWN` | **2 minutes** — Dhan answers a too-soon request with HTTP 200 + `"Token can be generated once every 2 minutes."`, mapped to a rate-limit error in `auth.py`. Treat conservatively. | INFERRED (from Dhan's runtime error message captured in code; not stated as a number on the fetched official pages) |
 
 ## External provider evidence (§9)
 
@@ -79,6 +87,12 @@ of 5), **but** each ApexScan process authenticates independently and Dhan's offi
 state whether a second same-`client_id` token generation invalidates the first, nor whether two
 same-`client_id` tokens coexist. Per §10/§34, this is **UNKNOWN** and must not be read as YES.
 
+The Authentication page does say, of the API-key/secret **consent (`consentAppId`) flow**, "at any
+given point of time, only one token will be generated." That language is scoped to the consent flow,
+**not** the direct-TOTP `generateAccessToken` endpoint ApexScan uses, so it is **non-dispositive**
+for the direct-flow concurrency question — but note it leans *toward* a single-active-token model, so
+if anything it reinforces the NO-GO rather than clearing it.
+
 `SAME_CLIENT_CONCURRENT_FEED_SUPPORT = UNKNOWN`.
 
 ## B6 analysis — options (§8)
@@ -103,17 +117,30 @@ conservative outcome (§44), not a failure of the review.
 
 ## Safety posture (§14/§15)
 
-- Live interlock **proven**: `ipc_publisher_enabled=true` without `live_h3_publish_approved=true`
-  fails Settings construction (`test_settings_reject_publisher_without_live_approval`); with approval
-  it derives `INGESTION_SHADOW_PUBLISH` (`test_settings_allow_publisher_with_live_approval`). Default
-  `live_h3_publish_approved=false`.
-- Ingestion profile-gated, not default-started, singleton `container_name`, no public port
-  (`docker-compose.production.yml` + `tests/deploy/test_compose_dev.py`).
-- `docker compose --profile market-ingestion up` with `MARKET_INGESTION_SERVICE_ENABLED=true` **and**
-  `LIVE_H3_PUBLISH_APPROVED=true` would make both backend and ingestion Dhan owners — this is the
-  governed, interlocked path, never the default; the default `up` never starts ingestion.
-- Consumer/C1 remain OFF (flags default off; `validate_settings` rejects consumer-without-role; not
-  composed). Dual authority not possible without deliberately flipping approved flags.
+**What the live interlock actually gates (corrected after review).** `validate_h3_live_publish_interlock`
+gates **only** the Redis publisher: `ipc_publisher_enabled=true` requires `live_h3_publish_approved=true`
+(proven — `test_settings_reject_publisher_without_live_approval` /
+`test_settings_allow_publisher_with_live_approval`; default `false`). It does **not** gate the Dhan
+connection. Because `start()` always runs `_start_provider()`, **`MARKET_INGESTION_SERVICE_ENABLED=true`
+alone makes ingestion a live Dhan owner** (token + WS), whether or not the publisher is approved. So:
+
+- The control that prevents ingestion from becoming a second live Dhan owner is
+  **`MARKET_INGESTION_SERVICE_ENABLED=false` (default) + Compose profile-gating** — not the publisher
+  interlock. The interlock only stops a *service that is already a live Dhan owner* from also
+  publishing to Redis.
+- Ingestion is profile-gated, not default-started, singleton `container_name`, no public port. The
+  dev `docker-compose.yml` is test-guarded for these facts (`tests/deploy/test_compose_dev.py`); the
+  same facts in `docker-compose.production.yml` were verified by direct file read (they are **not**
+  covered by `tests/deploy/test_compose_production.py`, which does not assert the market-ingestion
+  service — a small test-coverage gap noted for a future deploy phase).
+- `docker compose --profile market-ingestion up` with `MARKET_INGESTION_SERVICE_ENABLED=true` would
+  make both backend and ingestion live Dhan owners **even without publisher approval** (the publisher
+  approval only adds Redis publication). The default `up` (and the deploy pipeline's `up backend`)
+  never starts ingestion; activation is a deliberate, governed act — which is exactly why B6 must be
+  cleared first.
+- Consumer/C1 remain OFF (flags default off; Settings rejects consumer-without-role; not composed).
+  Dual **authority** (`ipc_authoritative` ⊕ `legacy`) is separately rejected as mutually exclusive, so
+  H3E's producer-shadow cannot become authoritative.
 
 ## H3E design (frozen for a future authorized activation only)
 
@@ -156,8 +183,10 @@ conservative outcome (§44), not a failure of the review.
 "multiple subscriptions" correctly separated from concurrent WS sessions (Q2/Q14); token
 generation possibly invalidating the authoritative session (Q3/Q4) and restart-triggered 2-min
 rate-limit (Q5) are the **HIGH live-safety risks** — they correctly force `READY_FOR_H3E = NO`
-rather than flawing the review; dual authority / accidental consumer / accidental Compose activation
-(Q6/Q7/Q8) are blocked by defaults + interlock + single-owner + profile gating; rollback-without-
+rather than flawing the review; dual **authority** is blocked by mutual exclusion (Q6), accidental
+consumer by consumer-without-role rejection (Q7), and accidental Compose activation of the Dhan
+connection by `MARKET_INGESTION_SERVICE_ENABLED=false` (default) + profile-gating (Q8) — **not** by
+the publisher interlock, which only blocks Redis publication; rollback-without-
 new-auth is clean only for Option A (Q9); we explicitly do **not** rely on undocumented behavior
 (Q10 — UNKNOWN kept UNKNOWN); FIX-2 blocks consume-comparison not producer evidence (Q11); same
 credential in two containers is a real structural fact controlled by non-activation (Q12); official
