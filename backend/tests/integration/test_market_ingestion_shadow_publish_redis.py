@@ -181,9 +181,7 @@ async def test_market_reference_commits_compacted_reference_atomically(
     assert stored is not None  # reference hash committed atomically with the stream (D1)
 
 
-async def test_epoch_allocated_once_and_accepted_position_advances(
-    redis: Redis, tmp_path
-) -> None:
+async def test_epoch_allocated_once_and_accepted_position_advances(redis: Redis, tmp_path) -> None:
     provider = _FakeProvider([_tick("A"), _tick("B"), _tick("C")])
     service = _service(redis, provider, str(tmp_path))
     await _run_and_stop(service)

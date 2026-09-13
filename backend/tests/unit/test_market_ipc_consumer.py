@@ -391,9 +391,7 @@ class _FaultyDeduplicator:
 async def test_dedup_contains_failure_fails_closed_and_never_applies() -> None:
     transport = FakeRawTransport()
     sink = RecordingShadowSink()
-    consumer = _consumer(
-        transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_contains=True)
-    )
+    consumer = _consumer(transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_contains=True))
     message_id = transport.push(_raw(_envelope(_tick(), seq=1)))
     await consumer.poll_once()
 
@@ -406,9 +404,7 @@ async def test_dedup_contains_failure_fails_closed_and_never_applies() -> None:
 async def test_dedup_record_failure_after_apply_fails_closed_and_leaves_pending() -> None:
     transport = FakeRawTransport()
     sink = RecordingShadowSink()
-    consumer = _consumer(
-        transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_record=True)
-    )
+    consumer = _consumer(transport, sink=sink, deduplicator=_FaultyDeduplicator(fail_record=True))
     message_id = transport.push(_raw(_envelope(_tick(), seq=1)))
     await consumer.poll_once()
 
