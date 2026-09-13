@@ -155,6 +155,12 @@ class ConsumerDiagnostics(BaseModel):
     ack_failures: int
     read_failures: int
     dedup_store_failures: int
+    # H4B pending-recovery (XAUTOCLAIM) counters — bounded scalars, no per-entry cardinality.
+    pending_recovery_runs: int
+    pending_reclaimed: int
+    pending_reclaim_failures: int
+    pending_reclaimed_applied: int
+    pending_reclaimed_duplicates: int
     last_received_at: datetime | None
     last_applied_at: datetime | None
     last_ack_at: datetime | None
@@ -211,10 +217,12 @@ class MarketEventConsumer:
         try:
             claimed = await self._claim_stale_bounded()
         except RedisError:
+            self._counters.reclaim_failures += 1  # recovery-scoped view of the claim fault
             self._record_read_failure()
             return
+        self._counters.recovery_runs += 1
         for entry in claimed:
-            await self._handle(entry, claimed=True)
+            self._record_reclaimed(await self._handle(entry, claimed=True))
         try:
             new_entries = await self._transport.read_raw()
         except RedisError:
@@ -222,6 +230,17 @@ class MarketEventConsumer:
             return
         for entry in new_entries:
             await self._handle(entry, claimed=False)
+
+    def _record_reclaimed(self, outcome: MessageOutcome) -> None:
+        """Attribute one reclaimed entry's terminal outcome to the recovery-scoped counters.
+
+        A reclaimed entry that failed transiently (sink/mark/ack) counts in neither applied nor
+        duplicate — it stays pending and is retried on a later recovery pass.
+        """
+        if outcome is MessageOutcome.APPLIED:
+            self._counters.reclaimed_applied += 1
+        elif outcome is MessageOutcome.DUPLICATE:
+            self._counters.reclaimed_duplicates += 1
 
     async def _claim_stale_bounded(self) -> list[RawDeliveredEvent]:
         """Reclaim one bounded XAUTOCLAIM page (<= ``read_count``) of stale pending entries.
@@ -423,6 +442,11 @@ class MarketEventConsumer:
             ack_failures=counters.ack_failures,
             read_failures=counters.read_failures,
             dedup_store_failures=counters.dedup_store_failures,
+            pending_recovery_runs=counters.recovery_runs,
+            pending_reclaimed=counters.claimed,
+            pending_reclaim_failures=counters.reclaim_failures,
+            pending_reclaimed_applied=counters.reclaimed_applied,
+            pending_reclaimed_duplicates=counters.reclaimed_duplicates,
             last_received_at=self._last_received_at,
             last_applied_at=self._last_applied_at,
             last_ack_at=self._last_ack_at,
@@ -460,6 +484,10 @@ class _ConsumerCounters:
         "ack_failures",
         "read_failures",
         "dedup_store_failures",
+        "recovery_runs",
+        "reclaim_failures",
+        "reclaimed_applied",
+        "reclaimed_duplicates",
     )
 
     def __init__(self) -> None:
@@ -481,3 +509,7 @@ class _ConsumerCounters:
         self.ack_failures = 0
         self.read_failures = 0
         self.dedup_store_failures = 0
+        self.recovery_runs = 0
+        self.reclaim_failures = 0
+        self.reclaimed_applied = 0
+        self.reclaimed_duplicates = 0
