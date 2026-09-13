@@ -124,6 +124,17 @@ def test_unexpected_event_is_classified_unexpected() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Semantic (not serialization): numerically-equal Decimals with different bytes MATCH
+# --------------------------------------------------------------------------- #
+def test_semantically_equal_decimals_match_despite_byte_difference() -> None:
+    assert _env(seq=1, price="100.5").payload != _env(seq=1, price="100.50").payload  # bytes differ
+    report = compare([_view(seq=1, price="100.5")], [_view(seq=1, price="100.50")])
+    assert report.is_clean  # compared by canonical value, not JSON text
+    assert report.matched_total == 1
+    assert report.value_mismatch_total == 0
+
+
+# --------------------------------------------------------------------------- #
 # T05: C1 duplicate suppression is healthy, never MISSING/UNEXPECTED
 # --------------------------------------------------------------------------- #
 def test_duplicate_suppression_is_healthy() -> None:
@@ -170,6 +181,16 @@ def test_b2_duplicate_application_is_surfaced_separately() -> None:
     b2 = [m for m in report.sample if m.classification is ParityClass.KNOWN_B2_DUPLICATE]
     assert len(b2) == 1
     assert b2[0].identity == "market-ingestion:1:1"
+
+
+def test_fixture_duplicate_and_b2_reapply_are_counted_separately() -> None:
+    # Fixture repeats identity 3x; the sink applied it twice (one legit + one B2 reapply). C1
+    # suppressed 3 - 2 = 1; the excess application is the B2 window (orthogonal dimensions).
+    report = compare([_view(seq=1), _view(seq=1), _view(seq=1)], [_view(seq=1), _view(seq=1)])
+    assert report.matched_total == 1
+    assert report.duplicate_suppressed_total == 1  # exp_count - act_count, not exp_count - 1
+    assert report.known_b2_duplicate_total == 1
+    assert not report.is_clean
 
 
 # --------------------------------------------------------------------------- #

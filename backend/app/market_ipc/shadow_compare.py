@@ -233,8 +233,8 @@ def _tally_expected(
                 ParityClass.VALUE_MISMATCH, identity, exp.kind, name, expected_value, actual_value
             )
         )
-    if exp_count > 1:  # the fixture repeated this identity; the extras were correctly suppressed
-        tally.dup_suppressed += exp_count - 1
+    if exp_count > act_count:  # fixture repeated this identity beyond what applied: C1 suppressed
+        tally.dup_suppressed += exp_count - act_count
     if act_count > 1:  # the sink applied it more than once: the B2 apply->mark window
         tally.b2 += act_count - 1
         tally.add(_mismatch(ParityClass.KNOWN_B2_DUPLICATE, identity, exp.kind))
