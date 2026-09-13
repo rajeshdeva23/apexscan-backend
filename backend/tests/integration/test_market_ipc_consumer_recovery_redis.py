@@ -366,8 +366,9 @@ async def test_ack_lost_reclaim_is_duplicate_not_reapplied(redis: Redis) -> None
     assert a.diagnostics().ack_failures == 1
     assert await _pending(redis, config) == 1  # applied + marked, but not acked
 
-    # Consumer B reclaims after idle: durable dedup recognises it -> no reapply -> ACK.
-    b = _consumer(redis, _fast_idle(config, consumer_name="B"), RecordingShadowSink())
+    # Consumer B reclaims after idle: durable dedup recognises it -> no reapply -> ACK. B shares
+    # A's sink, so a spurious reapply would push applied_total to 2 and fail this assertion.
+    b = _consumer(redis, _fast_idle(config, consumer_name="B"), sink)
     await b.start()
     await asyncio.sleep(0.02)
     await b.poll_once()
@@ -494,15 +495,17 @@ async def test_claim_redis_failure_is_visible_no_false_ack() -> None:
     config = _config()
     broken = Redis(unix_socket_path="/nonexistent/apexscan-h4b.sock")
     sink = RecordingShadowSink()
-    consumer = _consumer(broken, config, sink)
-    await consumer.poll_once()  # must not raise
+    try:
+        consumer = _consumer(broken, config, sink)
+        await consumer.poll_once()  # must not raise
 
-    diag = consumer.diagnostics()
-    assert diag.pending_reclaim_failures == 1  # recovery-scoped visibility
-    assert diag.read_failures == 1  # generic read-failure counter preserved (H4A contract)
-    assert diag.acked_total == 0  # no false ACK
-    assert sink.applied_total == 0
-    await broken.aclose()
+        diag = consumer.diagnostics()
+        assert diag.pending_reclaim_failures == 1  # recovery-scoped visibility
+        assert diag.read_failures == 1  # generic read-failure counter preserved (H4A contract)
+        assert diag.acked_total == 0  # no false ACK
+        assert sink.applied_total == 0
+    finally:
+        await broken.aclose()
 
 
 # =========================================================================== #
@@ -603,10 +606,13 @@ async def test_pending_and_new_no_starvation(redis: Redis) -> None:
 # Runtime-level: abandoned recovery via the poll loop; close-once, no leak (T18/T21/T22)
 # =========================================================================== #
 class _Settings:
-    def __init__(self, socket: str, *, name: str = "backend-0", fast_idle: bool = True) -> None:
+    def __init__(
+        self, socket: str, *, name: str = "backend-0", fast_idle: bool = True, block_ms: int = 0
+    ) -> None:
         self.redis_url = f"unix://{socket}"
         self._name = name
         self._fast_idle = fast_idle
+        self._block_ms = block_ms
 
     def phase_h_flags(self) -> PhaseHFlags:
         return PhaseHFlags(
@@ -619,7 +625,7 @@ class _Settings:
         )
 
     def market_ipc_config(self) -> MarketIpcConfig:
-        base = MarketIpcConfig(block_ms=0, consumer_name=self._name)
+        base = MarketIpcConfig(block_ms=self._block_ms, consumer_name=self._name)
         return base.model_copy(update={"claim_idle_ms": 1}) if self._fast_idle else base
 
 
@@ -690,9 +696,10 @@ async def test_runtime_shutdown_during_recovery_leaves_pending(
 
 
 async def test_runtime_blocked_read_and_recovery_shut_down_cleanly(redis_socket: str) -> None:
-    # block_ms>0: the loop long-polls (recovery pass claims nothing, then a blocking read); stop()
-    # must cancel promptly. Redis closed exactly once across a double stop().
-    settings = _Settings(redis_socket, name="backend-0", fast_idle=False)
+    # block_ms>0: each cycle runs a (no-op) recovery pass then a genuinely blocking XREADGROUP on
+    # an empty stream; stop() must cancel the blocked read promptly. Redis closed exactly once
+    # across a double stop().
+    settings = _Settings(redis_socket, name="backend-0", fast_idle=False, block_ms=5_000)
     runtime = await compose_consumer_runtime(
         settings,  # type: ignore[arg-type]
         sink=RecordingShadowSink(),
@@ -700,8 +707,6 @@ async def test_runtime_blocked_read_and_recovery_shut_down_cleanly(redis_socket:
         universe_version_source=lambda: 7,
         now=lambda: _NOW,
     )
-    # Force a blocking read window.
-    object.__setattr__(runtime, "_poll_idle_seconds", 0.0)
     await runtime.start()
     closes = {"n": 0}
     original = runtime._redis.aclose  # noqa: SLF001
@@ -711,7 +716,10 @@ async def test_runtime_blocked_read_and_recovery_shut_down_cleanly(redis_socket:
         await original()
 
     runtime._redis.aclose = _counting  # type: ignore[method-assign]  # noqa: SLF001
-    await runtime.stop()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await runtime.stop()  # must wake the 5s-blocked read, not wait it out
+    assert loop.time() - start < 2.0
     await runtime.stop()
     assert closes["n"] == 1
     assert runtime._task is None  # noqa: SLF001

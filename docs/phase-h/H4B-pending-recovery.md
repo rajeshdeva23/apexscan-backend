@@ -126,8 +126,12 @@ Redis client is closed exactly once (H4A lifecycle, unchanged).
 
 `ConsumerDiagnostics` gains bounded scalar counters (no per-entry cardinality):
 `pending_recovery_runs`, `pending_reclaimed`, `pending_reclaim_failures`,
-`pending_reclaimed_applied`, `pending_reclaimed_duplicates`. Live pending depth is read on demand
-with `XPENDING` in tests/ops — deliberately not part of the cheap in-memory snapshot.
+`pending_reclaimed_applied`, `pending_reclaimed_duplicates`. `pending_reclaimed` counts reclaim
+*attempts* — an entry that fails transiently (sink/dedup/ack) is re-claimed on a later pass and
+counted again, so it can exceed the number of distinct entries recovered; `pending_reclaimed_applied`
+and `pending_reclaimed_duplicates` count terminal outcomes and do not double-count. Live pending
+depth is read on demand with `XPENDING` in tests/ops — deliberately not part of the cheap in-memory
+snapshot.
 
 ## Blocker statuses (unchanged)
 
