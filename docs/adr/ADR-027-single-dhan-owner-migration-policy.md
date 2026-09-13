@@ -150,8 +150,8 @@ does not implement it and flags it as the phase's `ARCHITECTURE_DECISION_REQUIRE
   before the rollback strategy is frozen and rehearsed. **During the H9B→H10 window** the backend
   still holds Dhan secrets, so single ownership is enforced by the single-owner interlock + the
   disabled legacy path (`market_provider_enabled=false`), **not** by secret-absence — a backend
-  restart in this window must not re-acquire Dhan (the Q9 criterion is only *structurally* guaranteed
-  once H10 removes the secrets).
+  restart in this window must not re-acquire Dhan (the backend-restart-no-Dhan criterion under
+  *Success criteria preserved* below is only *structurally* guaranteed once H10 removes the secrets).
 
 ## Blocker impact
 
