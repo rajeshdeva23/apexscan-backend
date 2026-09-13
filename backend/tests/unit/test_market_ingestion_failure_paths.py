@@ -16,7 +16,6 @@ bounded L1 *observer* poll, so those tests await ``service._watch_task`` under a
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -511,11 +510,11 @@ async def test_stop_racing_terminal_settles_without_unhandled_error() -> None:
     stack = _stack(publisher)
     service = _service(stack, provider)
     await service.start()
+    watch = service._watch_task  # capture before stop() nulls it — the terminal watcher may race
     # Do NOT wait for fail-closed: race stop() against the observer-driven terminal watcher.
     await service.stop()
-    with contextlib.suppress(asyncio.CancelledError):
-        if service._watch_task is not None:
-            await service._watch_task
+    settled = (await asyncio.gather(watch, return_exceptions=True))[0]
+    assert settled is None or isinstance(settled, asyncio.CancelledError)  # no terminal escaped
     assert service.status is ServiceStatus.STOPPED
     assert provider.disconnect_calls >= 1  # provider ends disconnected regardless of the race
 

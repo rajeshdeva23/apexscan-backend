@@ -1,6 +1,6 @@
 # PHASE H3B — Shadow-publish failure-path hardening
 
-**Status:** implemented on `feature/decoupling-hardening` (holiday branch, NOT `main`).
+**Status:** delivered via PR #59 into the `feature/decoupling-hardening` holiday branch (NOT `main`).
 **Governing architecture:** ADR-026 (no new ADR — H3B hardens the frozen H3 design, it does not
 redesign it).
 
