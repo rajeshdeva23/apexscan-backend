@@ -11,8 +11,18 @@ shadow validation needs).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from app.schemas.market_data import MarketData
+
+
+@runtime_checkable
+class EventSink(Protocol):
+    """Destination for one decoded canonical event (H2 counting sink or H3 publishing sink)."""
+
+    def handle(self, datum: MarketData) -> None:
+        """Handle one decoded event. May raise to signal a terminal condition (fail closed)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     ipc_shadow_compare_enabled: bool = Field(default=False)
     ipc_authoritative_enabled: bool = Field(default=False)
     legacy_market_path_enabled: bool = Field(default=True)
+    # H3 live-activation interlock (ADR-026): enabling the IPC publisher in a deployed process means
+    # a real Dhan connection, so it requires an explicit approval that stays false until the B6 live
+    # sub-decision is made. Default false → an accidental publisher-on deployment refuses to boot.
+    live_h3_publish_approved: bool = Field(default=False)
+    # Durable directory for the M1 producer-epoch file (ingestion service's own volume).
+    market_ingestion_state_dir: str = Field(default="artifacts/market_ingestion", min_length=1)
 
     # --- Market session (NSE cash-equity; ADR-004) -------------------------
     # Exchange timezone for interpreting canonical UTC timestamps into the
@@ -411,6 +417,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MARKET_PROVIDER_ENABLED and MARKET_INGESTION_SERVICE_ENABLED must not both be "
                 "true: exactly one component may own the Dhan connection (ADR-025 single-owner)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_h3_live_publish_interlock(self) -> Self:
+        """Require explicit approval to enable the IPC publisher (ADR-026 live interlock).
+
+        A deployed process with ``ipc_publisher_enabled=true`` builds a real Dhan connection and
+        publishes to Redis — i.e. live shadow, which the frozen B6 decision (NO_LIVE_H3_YET) defers.
+        Fail fast unless ``live_h3_publish_approved`` is explicitly set, so a publisher-on
+        deployment cannot start accidentally before the B6 live sub-decision is made.
+        """
+        if self.ipc_publisher_enabled and not self.live_h3_publish_approved:
+            raise ValueError(
+                "IPC_PUBLISHER_ENABLED=true requires LIVE_H3_PUBLISH_APPROVED=true "
+                "(live shadow publish is deferred by the B6 NO_LIVE_H3_YET decision, ADR-026)"
             )
         return self
 
