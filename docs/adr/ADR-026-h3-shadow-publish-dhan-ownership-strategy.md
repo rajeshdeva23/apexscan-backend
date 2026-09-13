@@ -7,6 +7,7 @@
 | **Deciders** | Platform / Market-Ingestion Decoupling Architecture |
 | **Supersedes** | — |
 | **Superseded by** | — |
+| **Amended by** | ADR-027 (§B6 live-shadow sub-decision & recommended subphases — single-owner migration policy; the live dual-owner shadow / H3E is superseded) |
 | **Related** | ADR-020 (M1), ADR-021 (D1), ADR-022 (M2), ADR-023 (C1), ADR-024 (L1), ADR-025 (Phase-H design; B6); DECOUPLING H1/H2 |
 
 > **Design review only.** No code, no production contact, no real Dhan, no Redis publication, no
