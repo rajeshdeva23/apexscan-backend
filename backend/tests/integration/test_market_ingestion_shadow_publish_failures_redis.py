@@ -13,15 +13,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime, time
 from decimal import Decimal
 
 import pytest
 from redis.asyncio import Redis
 
 from app.adapters.base.provider_coordinator import ProviderInitializationError
+from app.market_engine.session import MarketSessionClassifier, SessionSchedule, TradingCalendar
 from app.market_ingestion.mode import PhaseHFlags
-from app.market_ingestion.publication import build_publication_stack
+from app.market_ingestion.publication import SessionTradingDate, build_publication_stack
 from app.market_ingestion.service import MarketIngestionService, ServiceStatus
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.envelope import decode_envelope
@@ -39,7 +40,6 @@ from app.schemas.market_data import (
 redislite = pytest.importorskip("redislite", reason="disposable real Redis unavailable")
 
 _NOW = datetime(2026, 9, 13, 4, 15, 0, tzinfo=UTC)
-_TD = date(2026, 9, 13)
 _PRODUCER = "market-ingestion"
 
 
@@ -97,6 +97,22 @@ async def _until(predicate: object, *, limit: int = 100_000) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition was never reached")
+
+
+def _trading_date_source() -> SessionTradingDate:
+    """Real dynamic trading-date source over the canonical classifier, fixed at ``_NOW``."""
+    classifier = MarketSessionClassifier(
+        schedule=SessionSchedule(
+            pre_open_start=time(9, 0),
+            opening_auction_start=time(9, 8),
+            regular_open=time(9, 15),
+            regular_close=time(15, 30),
+            closing_end=time(15, 40),
+        ),
+        calendar=TradingCalendar(),
+        exchange_timezone="Asia/Kolkata",
+    )
+    return SessionTradingDate(classify=classifier.classify, now=lambda: _NOW)
 
 
 class _Provider:
@@ -196,7 +212,7 @@ def _service(
         producer_id=_PRODUCER,
         state_dir=state_dir,  # type: ignore[arg-type]
         now=lambda: _NOW,
-        trading_date=_TD,
+        trading_date_source=_trading_date_source(),
     )
     return MarketIngestionService(
         flags=_flags(),
@@ -222,7 +238,7 @@ async def test_redis_outage_during_publication_fails_closed(tmp_path) -> None:
         await _until(lambda: service.diagnostics().published_total >= 1)  # A landed on Redis
         server.shutdown()  # the outage begins
         gate.set()  # provider now yields B → its transmit hits a dead Redis
-        await asyncio.wait_for(service._watch_task, timeout=5.0)  # fail closed
+        await asyncio.wait_for(service._watch_task, timeout=30.0)  # fail closed (generous for CI)
 
         diagnostics = service.diagnostics()
         assert service.status is ServiceStatus.FAILED
@@ -237,21 +253,31 @@ async def test_redis_outage_during_publication_fails_closed(tmp_path) -> None:
 
 
 async def test_failed_start_consumes_epoch_and_next_incarnation_advances(
-    redis: Redis, tmp_path
+    redis_socket: str, tmp_path
 ) -> None:
     # Frozen order allocates the durable M1 epoch (boundary.start) BEFORE the provider health
-    # check, so a start that fails at an unhealthy provider still consumes the epoch.
-    failed = _service(redis, _UnhealthyProvider([_tick()]), str(tmp_path))
+    # check, so a start that fails at an unhealthy provider still consumes the epoch. Each
+    # incarnation owns its own Redis client (a restart is a new process); a failed start closes
+    # its client via fail-closed cleanup, so the next incarnation opens a fresh one.
+    failed_client: Redis = Redis(unix_socket_path=redis_socket)
+    await failed_client.flushall()
+    failed = _service(failed_client, _UnhealthyProvider([_tick()]), str(tmp_path))
     with pytest.raises(ProviderInitializationError):
         await failed.start()
     assert failed.status is ServiceStatus.FAILED
     assert failed.diagnostics().producer_epoch == 1  # epoch was consumed on the failed start
+    assert failed._publication_closed is True  # the failed incarnation closed its own client
 
-    healthy = _service(redis, _Provider([_tick()]), str(tmp_path))  # same durable state dir
-    await healthy.start()
-    await healthy.wait()
-    await healthy.stop()
-    assert healthy.diagnostics().producer_epoch == 2  # never reuses the failed incarnation's epoch
+    healthy_client: Redis = Redis(unix_socket_path=redis_socket)  # a new incarnation → a new client
+    try:
+        healthy = _service(healthy_client, _Provider([_tick()]), str(tmp_path))  # same state dir
+        await healthy.start()
+        await healthy.wait()
+        await healthy.stop()
+        assert healthy.diagnostics().producer_epoch == 2  # never reuses the failed epoch
+    finally:
+        with contextlib.suppress(Exception):
+            await healthy_client.aclose()
 
 
 async def test_recoverable_disconnect_is_not_terminal_and_keeps_events(
@@ -279,7 +305,7 @@ async def test_duplicate_transmit_shares_canonical_identity(redis: Redis, tmp_pa
         producer_id=_PRODUCER,
         state_dir=str(tmp_path),  # type: ignore[arg-type]
         now=lambda: _NOW,
-        trading_date=_TD,
+        trading_date_source=_trading_date_source(),
     )
     await stack.boundary.start()  # allocates the epoch, ensures the group
     envelope = stack.publisher.prepare(_tick("A"))

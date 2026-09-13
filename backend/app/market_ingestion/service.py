@@ -120,6 +120,7 @@ class MarketIngestionService:
         self._watch_task: asyncio.Task[None] | None = None
         self._terminal = asyncio.Event()
         self._provider_connected = False
+        self._publication_closed = False
         self._status = (
             ServiceStatus.NOT_STARTED
             if flags.market_ingestion_service_enabled
@@ -283,6 +284,7 @@ class MarketIngestionService:
         if self.publisher_mode and self._publication is not None:
             with contextlib.suppress(Exception):
                 await self._publication.boundary.stop()
+        await self._close_publication()  # a failed start still closes its owned Redis client
 
     async def stop(self) -> None:
         """Stop intake, drain M2, disconnect the provider deterministically (idempotent)."""
@@ -297,11 +299,25 @@ class MarketIngestionService:
         if self.publisher_mode and self._publication is not None:  # M2 bounded drain → L1 final
             result = await self._publication.boundary.stop()
             self._publication.continuity.drain_completed(result)
+        await self._close_publication()  # close the owned Redis client (after drain + L1 finalize)
         await self._cancel_task(self._observer_task)
         await self._cancel_task(self._watch_task)
         self._observer_task = self._watch_task = None
         self._provider_connected = False
         self._status = ServiceStatus.STOPPED
+
+    async def _close_publication(self) -> None:
+        """Close the stack-owned Redis client exactly once, after M2 has drained (idempotent).
+
+        Ordering (§5): callers invoke this only after ``boundary.stop()`` has drained M2 and L1 is
+        finalised — never before, since the worker publishes through this client. Failures are
+        suppressed so a close error can never mask the shutdown/original failure.
+        """
+        if self._publication is None or self._publication_closed:
+            return
+        self._publication_closed = True
+        with contextlib.suppress(Exception):
+            await self._publication.aclose()
 
     async def wait(self) -> None:
         """Block until the supervisor task ends; no-op if none.

@@ -73,20 +73,30 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
 
 
 def _build_publication(settings: Settings) -> PublicationStack:
-    """Construct the H3 publication stack over the configured Redis (publisher mode; live-gated)."""
+    """Construct the H3 publication stack over the configured Redis (publisher mode; live-gated).
+
+    The trading date is resolved per event by :class:`SessionTradingDate` over the canonical
+    :class:`MarketSessionClassifier`, so a long-lived producer crosses exchange-local session
+    boundaries without a restart. The Redis client is created here and owned by the returned stack
+    (closed on shutdown by the service).
+    """
     from redis.asyncio import Redis
 
-    from app.market_ingestion.publication import build_publication_stack
+    from app.market_engine.session import MarketSessionClassifier
+    from app.market_ingestion.publication import SessionTradingDate, build_publication_stack
+
+    def _utc_now() -> datetime:
+        return datetime.now(UTC)
 
     redis: Redis = Redis.from_url(settings.redis_url)
-    now = datetime.now(UTC)
+    classifier = MarketSessionClassifier.from_settings(settings)
     return build_publication_stack(
         redis=redis,
         config=settings.market_ipc_config(),
         producer_id=_PRODUCER_ID,
         state_dir=Path(settings.market_ingestion_state_dir),
-        now=lambda: datetime.now(UTC),
-        trading_date=now.date(),
+        now=_utc_now,
+        trading_date_source=SessionTradingDate(classify=classifier.classify, now=_utc_now),
     )
 
 
