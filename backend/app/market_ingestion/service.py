@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, cast
 
 from app.adapters.base.broker_adapter import BrokerAdapter, LiveMarketDataAdapter
 from app.adapters.base.provider_coordinator import ProviderCoordinator
+from app.market_ingestion.errors import PublicationTerminalError
 from app.market_ingestion.mode import (
     MarketPathMode,
     PhaseHFlags,
@@ -292,11 +293,16 @@ class MarketIngestionService:
         self._status = ServiceStatus.STOPPED
 
     async def wait(self) -> None:
-        """Block until the supervisor task ends (cancelled or budget exhausted); no-op if none."""
+        """Block until the supervisor task ends; no-op if none.
+
+        A terminal publication break propagates out of the supervisor task; it is handled by the
+        terminal watcher (fail-closed), so ``wait`` swallows it here — it must not escape into the
+        caller/entrypoint and skip graceful shutdown. Ordinary cancellation is likewise tolerated.
+        """
         task = self._supervisor_task
         if task is None:
             return
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, PublicationTerminalError):
             await task
 
     @staticmethod

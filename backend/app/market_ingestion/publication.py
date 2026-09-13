@@ -23,6 +23,7 @@ from pathlib import Path
 from redis.asyncio import Redis
 
 from app.market_ingestion.errors import PublicationTerminalError
+from app.market_ingestion.sink import ProviderSinkDiagnostics
 from app.market_ipc.atomic import RedisAtomicPublisher
 from app.market_ipc.boundary import AsyncPublicationBoundary, SubmitOutcome
 from app.market_ipc.config import MarketIpcConfig
@@ -70,6 +71,11 @@ class PublishingEventSink:
         self._boundary = boundary
         self._continuity = continuity
         self._publisher = publisher
+        self._events = 0
+
+    def diagnostics(self) -> ProviderSinkDiagnostics:
+        """Total events routed to M2 (parity with the provider-only sink's diagnostics)."""
+        return ProviderSinkDiagnostics(events_total=self._events)
 
     def handle(self, datum: MarketData) -> None:
         """Submit one event to M2 and record it in L1; raise on a terminal break (no Redis I/O).
@@ -78,6 +84,7 @@ class PublishingEventSink:
         recorded as the L1 accepted position — distinct from the published position, which the
         bounded observer advances from confirmed M2/D1 completions.
         """
+        self._events += 1
         outcome = self._boundary.submit(datum)
         if outcome is SubmitOutcome.ENQUEUED:
             self._continuity.publication_accepted(

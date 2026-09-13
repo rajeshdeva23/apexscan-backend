@@ -186,6 +186,25 @@ def test_sink_enqueued_records_accepted_position() -> None:
     assert tracker.snapshot().last_accepted_sequence == 5
 
 
+def test_accepted_position_leads_published_under_backlog() -> None:
+    # Enqueue is not Redis durability: with the worker not draining (published_total stays 0), the
+    # accepted position advances ahead of confirmed publication.
+    tracker = FeedContinuityTracker()
+    tracker.producer_started(producer_id="p", producer_epoch=1)
+    counter = SimpleNamespace(current_sequence=0)
+    boundary = _FakeBoundary(submit_outcome=SubmitOutcome.ENQUEUED)  # published_total == 0
+    sink = PublishingEventSink(
+        boundary=boundary,  # type: ignore[arg-type]
+        continuity=tracker,
+        publisher=counter,  # type: ignore[arg-type]
+    )
+    for seq in (1, 2, 3):
+        counter.current_sequence = seq
+        sink.handle(_tick())
+    assert tracker.snapshot().last_accepted_sequence == 3  # accepted
+    assert boundary.diagnostics().published_total == 0  # nothing confirmed published yet
+
+
 def test_sink_overflow_is_terminal() -> None:
     tracker = FeedContinuityTracker()
     tracker.producer_started(producer_id="p", producer_epoch=1)

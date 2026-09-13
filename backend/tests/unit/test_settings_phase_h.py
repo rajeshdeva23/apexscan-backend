@@ -74,6 +74,26 @@ def test_settings_allow_ingestion_service_with_legacy_backend_disabled(
     assert settings.market_path_mode() is MarketPathMode.LEGACY_ONLY  # publisher OFF
 
 
+def test_settings_reject_publisher_without_live_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _settings(
+            monkeypatch,
+            MARKET_INGESTION_SERVICE_ENABLED="true",
+            IPC_PUBLISHER_ENABLED="true",  # live shadow publish — needs explicit approval
+        )
+    assert "LIVE_H3_PUBLISH_APPROVED" in str(excinfo.value)
+
+
+def test_settings_allow_publisher_with_live_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(
+        monkeypatch,
+        MARKET_INGESTION_SERVICE_ENABLED="true",
+        IPC_PUBLISHER_ENABLED="true",
+        LIVE_H3_PUBLISH_APPROVED="true",
+    )
+    assert settings.market_path_mode() is MarketPathMode.INGESTION_SHADOW_PUBLISH
+
+
 def test_settings_market_ipc_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(monkeypatch)
     config = settings.market_ipc_config()

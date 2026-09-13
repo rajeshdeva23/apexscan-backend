@@ -205,6 +205,59 @@ async def test_restart_allocates_a_new_epoch(redis: Redis, tmp_path) -> None:
     assert second.diagnostics().producer_epoch == 2  # M1 never reuses an epoch
 
 
+class _ReconnectingProvider:
+    """Provider whose first stream episode raises (transport drop) then a second episode ends."""
+
+    def __init__(self) -> None:
+        self._episode = 0
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    async def get_health(self) -> ProviderHealth:
+        return ProviderHealth(status=ProviderStatus.HEALTHY, observed_at=_NOW)
+
+    async def stream_market_data(self, request: SubscriptionRequest) -> AsyncIterator[MarketData]:
+        self._episode += 1
+        yield _tick("A")
+        if self._episode == 1:
+            raise ConnectionError("simulated transport drop")  # recoverable → reconnect
+
+
+async def test_reconnect_preserves_producer_epoch(redis: Redis, tmp_path) -> None:
+    provider = _ReconnectingProvider()
+    stack = build_publication_stack(
+        redis=redis,
+        config=MarketIpcConfig(),
+        producer_id=_PRODUCER,
+        state_dir=str(tmp_path),  # type: ignore[arg-type]
+        now=lambda: _NOW,
+        trading_date=_TD,
+    )
+    service = MarketIngestionService(
+        flags=_flags(),
+        provider=provider,  # type: ignore[arg-type]
+        subscription_request=_request(),
+        publication=stack,
+        supervisor_max_reconnects=1,  # allow the one reconnect, then stop deterministically
+        supervisor_sleep=_yield_sleep,
+        observer_interval_seconds=0.0,
+        observer_sleep=_yield_sleep,
+    )
+    await service.start()
+    await service.wait()
+    await service.stop()
+
+    assert provider.connect_calls == 1  # transport reconnect never re-connects the coordinator/auth
+    assert service.diagnostics().producer_epoch == 1  # same epoch across the reconnect
+    assert await redis.xlen(MarketIpcConfig().stream_name) == 2  # both episodes' ticks published
+
+
 async def test_clean_drain_reports_stopped(redis: Redis, tmp_path) -> None:
     service = _service(redis, _FakeProvider([_tick(), _tick()]), str(tmp_path))
     await _run_and_stop(service)
