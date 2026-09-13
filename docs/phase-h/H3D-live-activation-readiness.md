@@ -41,7 +41,8 @@ open a WebSocket, deploy, or change production.
 **Secret topology (§13):** `BACKEND_HAS_DHAN_SECRET_ACCESS = YES`,
 `INGESTION_HAS_DHAN_SECRET_ACCESS = YES`, `SAME_IDENTITY_POSSIBLE = YES` (same `dhan.env` ⇒ same
 `client_id`). The same credential material is therefore mountable in two containers — this *enables*
-the B6 hazard and is controlled only by keeping ingestion inert/unapproved.
+the B6 hazard and is controlled by keeping the ingestion service **disabled (inert) and
+profile-gated** (approval alone would not prevent the Dhan connection — see §14).
 
 ## Desired H3E topology (frozen for reference; NOT approved)
 
