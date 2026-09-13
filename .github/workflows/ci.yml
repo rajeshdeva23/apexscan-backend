@@ -63,6 +63,13 @@ jobs:
       - name: Prepare CI environment
         run: cp .env.example .env
 
+      - name: Validate market-ingestion Compose packaging
+        run: |
+          docker compose config --services > default-services.txt
+          docker compose --profile market-ingestion config --services > profile-services.txt
+          grep -qx market-ingestion profile-services.txt
+          ! grep -qx market-ingestion default-services.txt
+
       - name: Pull service images
         run: docker compose pull postgres redis
 

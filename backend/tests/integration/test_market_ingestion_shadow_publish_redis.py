@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
 import pytest
 from redis.asyncio import Redis
 
+from app.market_engine.session import MarketSessionClassifier, SessionSchedule, TradingCalendar
 from app.market_ingestion.mode import PhaseHFlags
-from app.market_ingestion.publication import build_publication_stack
+from app.market_ingestion.publication import SessionTradingDate, build_publication_stack
 from app.market_ingestion.service import MarketIngestionService, ServiceStatus
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.envelope import decode_envelope
@@ -106,6 +107,22 @@ async def _yield_sleep(_seconds: float) -> None:
     await asyncio.sleep(0)  # yield to the loop (never starve the observer poll)
 
 
+def _trading_date_source() -> SessionTradingDate:
+    """Real dynamic trading-date source over the canonical classifier (``_NOW`` resolves to _TD)."""
+    classifier = MarketSessionClassifier(
+        schedule=SessionSchedule(
+            pre_open_start=time(9, 0),
+            opening_auction_start=time(9, 8),
+            regular_open=time(9, 15),
+            regular_close=time(15, 30),
+            closing_end=time(15, 40),
+        ),
+        calendar=TradingCalendar(),
+        exchange_timezone="Asia/Kolkata",
+    )
+    return SessionTradingDate(classify=classifier.classify, now=lambda: _NOW)
+
+
 class _FakeProvider:
     """BrokerAdapter + LiveMarketDataAdapter fake yielding one episode of canonical events."""
 
@@ -136,7 +153,7 @@ def _service(redis: Redis, provider: _FakeProvider, state_dir: str) -> MarketIng
         producer_id=_PRODUCER,
         state_dir=state_dir,  # type: ignore[arg-type]  # Path-like str accepted by DurableEpochAllocator
         now=lambda: _NOW,
-        trading_date=_TD,
+        trading_date_source=_trading_date_source(),
     )
     return MarketIngestionService(
         flags=_flags(),
@@ -235,7 +252,7 @@ async def test_reconnect_preserves_producer_epoch(redis: Redis, tmp_path) -> Non
         producer_id=_PRODUCER,
         state_dir=str(tmp_path),  # type: ignore[arg-type]
         now=lambda: _NOW,
-        trading_date=_TD,
+        trading_date_source=_trading_date_source(),
     )
     service = MarketIngestionService(
         flags=_flags(),

@@ -146,6 +146,16 @@ class _StartFailPublisher(_FakePublisher):
         raise ConnectionError("publication infra unavailable")
 
 
+class _FakeRedis:
+    """Minimal Redis double: records aclose() calls (the publisher double does no real I/O)."""
+
+    def __init__(self) -> None:
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
 class _Provider:
     """Provider double: yields one episode of events then ends. Records connect/disconnect."""
 
@@ -253,6 +263,7 @@ def _stack(
         boundary=boundary,
         continuity=continuity,
         sink=sink,
+        redis=_FakeRedis(),  # type: ignore[arg-type]  # publisher double does no real Redis I/O
     )
 
 

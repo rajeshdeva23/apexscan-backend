@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from redis.asyncio import Redis
 
@@ -29,14 +30,18 @@ from app.market_ipc.boundary import AsyncPublicationBoundary, SubmitOutcome
 from app.market_ipc.config import MarketIpcConfig
 from app.market_ipc.continuity import FeedContinuityTracker
 from app.market_ipc.epoch import DurableEpochAllocator
-from app.market_ipc.publisher import MarketEventPublisher, StaticUniverseVersion
+from app.market_ipc.publisher import MarketEventPublisher, StaticUniverseVersion, TradingDateSource
 from app.market_ipc.transport import RedisMarketEventStream
 from app.schemas.market_data import MarketData
+
+if TYPE_CHECKING:
+    from app.market_engine.context import SessionContext
 
 __all__ = [
     "PublicationStack",
     "PublicationTerminalError",
     "PublishingEventSink",
+    "SessionTradingDate",
     "build_publication_stack",
 ]
 
@@ -47,15 +52,34 @@ _TERMINAL_SUBMIT_OUTCOMES = frozenset(
 )
 
 
-class _StaticTradingDate:
-    """Provisional trading-date source for H3A transport composition (a fixed configured date)."""
+class SessionTradingDate:
+    """Dynamic trading-date source: the exchange-local session date of the current instant.
 
-    def __init__(self, trading_date: date) -> None:
-        self._trading_date = trading_date
+    Replaces the H3A ``_StaticTradingDate`` so a long-lived producer crosses trading-date
+    boundaries (an exchange-local midnight, a weekend, a holiday → the next session) without a
+    restart. The publisher reads ``current_trading_date()`` once per event while preparing the
+    envelope, so the reference key ``md:reference:<trading_date>`` follows the live session date
+    automatically.
+
+    The date comes from the canonical :class:`~app.market_engine.session.MarketSessionClassifier`
+    (the market-IPC trading-date authority — see ``app.market_ipc.consumer``), which converts the
+    instant to the exchange timezone *before* taking the date. A server/UTC wall-clock midnight
+    therefore never shifts the trading date; only an exchange-local date change does.
+    """
+
+    def __init__(
+        self,
+        *,
+        classify: Callable[[datetime], SessionContext],
+        now: Callable[[], datetime],
+    ) -> None:
+        """Wire the source to a session classifier's ``classify`` and an injected UTC clock."""
+        self._classify = classify
+        self._now = now
 
     def current_trading_date(self) -> date:
-        """Return the configured provisional trading date."""
-        return self._trading_date
+        """Return the exchange-local trading date of the current instant (evaluated per event)."""
+        return self._classify(self._now()).trading_date
 
 
 class PublishingEventSink:
@@ -110,6 +134,17 @@ class PublicationStack:
     boundary: AsyncPublicationBoundary
     continuity: FeedContinuityTracker
     sink: PublishingEventSink
+    redis: Redis
+
+    async def aclose(self) -> None:
+        """Close the owned Redis client (the final shutdown step).
+
+        The composition root creates one Redis client per incarnation and hands it to this stack;
+        the ingestion service closes it here *after* M2 has drained and L1 is finalised — never
+        before, because the worker publishes through this client. redis-py's ``aclose`` is safe to
+        call more than once.
+        """
+        await self.redis.aclose()
 
 
 def build_publication_stack(
@@ -119,13 +154,16 @@ def build_publication_stack(
     producer_id: str,
     state_dir: Path,
     now: Callable[[], datetime],
-    trading_date: date,
+    trading_date_source: TradingDateSource,
     universe_version: int = 0,
 ) -> PublicationStack:
     """Construct the H3 publication stack over ``redis`` (real or test); no epoch allocated yet.
 
     The M1 epoch is allocated later, by ``boundary.start()`` → ``publisher.start()`` (frozen
-    startup order); constructing the stack performs no Redis I/O and no epoch allocation.
+    startup order); constructing the stack performs no Redis I/O and no epoch allocation. The
+    ``redis`` client is owned by the returned stack and closed by :meth:`PublicationStack.aclose`
+    on shutdown. ``trading_date_source`` is read per event (e.g. :class:`SessionTradingDate`), so a
+    long-lived producer crosses trading-date boundaries without a restart.
     """
     stream = RedisMarketEventStream(redis=redis, config=config)
     atomic_publisher = RedisAtomicPublisher(redis, config)
@@ -134,7 +172,7 @@ def build_publication_stack(
         config=config,
         producer_id=producer_id,
         epoch_allocator=DurableEpochAllocator(state_dir),
-        trading_date_source=_StaticTradingDate(trading_date),
+        trading_date_source=trading_date_source,
         universe_version_source=StaticUniverseVersion(universe_version),
         now=now,
         atomic_publisher=atomic_publisher,
@@ -153,4 +191,5 @@ def build_publication_stack(
         boundary=boundary,
         continuity=continuity,
         sink=sink,
+        redis=redis,
     )

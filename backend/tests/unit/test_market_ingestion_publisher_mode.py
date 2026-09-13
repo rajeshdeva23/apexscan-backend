@@ -112,6 +112,10 @@ class _FakeBoundary:
         return DrainResult(drained_complete=True, pending_at_stop=0)
 
 
+async def _aclose() -> None:
+    """Async no-op close for the fake Redis in the publisher stack (no real I/O here)."""
+
+
 def _stack(boundary: _FakeBoundary) -> PublicationStack:
     tracker = FeedContinuityTracker()
     publisher = SimpleNamespace(
@@ -128,6 +132,7 @@ def _stack(boundary: _FakeBoundary) -> PublicationStack:
         boundary=boundary,  # type: ignore[arg-type]
         continuity=tracker,
         sink=sink,
+        redis=SimpleNamespace(aclose=_aclose),  # type: ignore[arg-type]  # no real Redis I/O
     )
 
 
