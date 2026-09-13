@@ -29,6 +29,12 @@ from app.market_ipc.consumer import (
     RecordingShadowSink,
     ShadowMarketEventSink,
 )
+from app.market_ipc.consumer_runtime import (
+    ConsumerRuntimeConfigurationError,
+    MarketEventConsumerRuntime,
+    RuntimeState,
+    compose_consumer_runtime,
+)
 from app.market_ipc.continuity import (
     ContinuityReason,
     ContinuityState,
@@ -133,6 +139,7 @@ __all__ = [
     "FeedContinuitySnapshot",
     "FeedContinuityTracker",
     "ConsumerDiagnostics",
+    "ConsumerRuntimeConfigurationError",
     "DurableEpochAllocator",
     "EpochAllocator",
     "EpochStateError",
@@ -144,6 +151,7 @@ __all__ = [
     "IpcPayload",
     "LoaderDiagnostics",
     "MarketEventConsumer",
+    "MarketEventConsumerRuntime",
     "MarketEventEnvelope",
     "MarketEventPublisher",
     "MarketEventStream",
@@ -156,6 +164,7 @@ __all__ = [
     "RedisCompactedReferenceStore",
     "RedisMarketEventStream",
     "RedisPublishError",
+    "RuntimeState",
     "ReferenceEntrySource",
     "ReferenceOutcome",
     "ReferenceSnapshot",
@@ -169,6 +178,7 @@ __all__ = [
     "UniverseVersionSource",
     "build_envelope",
     "compare_universe_version",
+    "compose_consumer_runtime",
     "decode_envelope",
     "decode_payload",
     "encode_envelope",

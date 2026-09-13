@@ -109,3 +109,34 @@ def test_reference_recovery_is_not_constructed_by_composition() -> None:
         if hits:
             constructors[str(path)] = hits
     assert constructors == {}, f"reference recovery constructed in composition: {constructors}"
+
+
+def test_consumer_runtime_is_not_wired_into_startup() -> None:
+    """H4A is offline: no production module (outside market_ipc) builds or composes the runtime.
+
+    The shadow consumer runtime must be reachable only through explicit test/offline composition,
+    so merging H4A activates no backend consumer and cannot begin the (forbidden) Redis -> backend
+    -> TickEngine cutover.
+    """
+    seams = ("MarketEventConsumerRuntime(", "compose_consumer_runtime(")
+    wired: dict[str, list[str]] = {}
+    for path in sorted(_APP_ROOT.rglob("*.py")):
+        if path.is_relative_to(_APP_ROOT / "market_ipc"):
+            continue
+        text = path.read_text(encoding="utf-8")
+        hits = [name for name in seams if name in text]
+        if hits:
+            wired[str(path)] = hits
+    assert wired == {}, f"consumer runtime wired into composition: {wired}"
+
+
+def test_consumer_runtime_imports_no_producer_or_provider_surface() -> None:
+    """The shadow consumer runtime pulls no Dhan provider, IPC publisher, or producer-epoch code.
+
+    Proves H4A composes only the consume path: no live provider is created, the publisher is not
+    activated, and no producer epoch is allocated by the runtime.
+    """
+    forbidden = ("app.adapters.dhan", "app.market_ipc.publisher", "app.market_ipc.epoch")
+    modules = _modules(_APP_ROOT / "market_ipc" / "consumer_runtime.py")
+    offending = sorted({m for m in modules for f in forbidden if _matches(m, f)})
+    assert offending == [], f"consumer runtime imported producer/provider surface: {offending}"
