@@ -55,16 +55,18 @@ _TERMINAL_SUBMIT_OUTCOMES = frozenset(
 class SessionTradingDate:
     """Dynamic trading-date source: the exchange-local session date of the current instant.
 
-    Replaces the H3A ``_StaticTradingDate`` so a long-lived producer crosses trading-date
-    boundaries (an exchange-local midnight, a weekend, a holiday → the next session) without a
-    restart. The publisher reads ``current_trading_date()`` once per event while preparing the
-    envelope, so the reference key ``md:reference:<trading_date>`` follows the live session date
-    automatically.
+    Replaces the H3A ``_StaticTradingDate`` so a long-lived producer crosses trading-date boundaries
+    without a restart: as wall-time advances into the next exchange-local day (across a midnight,
+    weekend, or holiday) ``current_trading_date()`` returns that day's date. The publisher reads it
+    once per event, so the reference key ``md:reference:<trading_date>`` follows the live session
+    date automatically.
 
-    The date comes from the canonical :class:`~app.market_engine.session.MarketSessionClassifier`
-    (the market-IPC trading-date authority — see ``app.market_ipc.consumer``), which converts the
-    instant to the exchange timezone *before* taking the date. A server/UTC wall-clock midnight
-    therefore never shifts the trading date; only an exchange-local date change does.
+    The value is the exchange-local date of the instant, from the canonical
+    :class:`~app.market_engine.session.MarketSessionClassifier` (the market-IPC trading-date
+    authority — see ``app.market_ipc.consumer``), which converts to the exchange timezone *before*
+    taking the date. A server/UTC wall-clock midnight therefore never shifts the trading date; only
+    an exchange-local date change does. The calendar affects only ``market_state``, so a non-trading
+    day returns its own exchange-local date (no events arrive then to be published).
     """
 
     def __init__(
