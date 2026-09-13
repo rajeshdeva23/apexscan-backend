@@ -36,7 +36,7 @@ Decode → canonical event → validation:
 | epoch → datetime | `adapters/dhan/live.py:551-554` `_epoch_timestamp(value)` | `return datetime.fromtimestamp(value, tz=UTC)` — interprets the LTT integer as a **POSIX epoch** and yields a UTC-displayed **aware** datetime. |
 | event stamp | `live.py:358,408,432,440,448` | `event_timestamp = _epoch_timestamp(last_trade_time)` for tick/quote/depth. |
 | future-time reject | `market_engine/validation.py:23,70` | `_MAX_FUTURE_SKEW = timedelta(minutes=1)`; `if event.event_timestamp > now + max_future_skew: return INVALID`. |
-| diagnostic | `market_engine/tick_diagnostics.py:33,51,120` | `last_rejected_event_clock_delta_seconds = event_timestamp - now` at the reject decision — the FIX-1 metric. |
+| diagnostic | `market_engine/tick_diagnostics.py:96` (compute site; 33/51/120 = docstring/field/snapshot) | `_last_rejected_delta_seconds = (event_timestamp - now).total_seconds()` at the reject decision — the FIX-1 metric. |
 
 So a live tick whose `event_timestamp` is materially in the future (relative to the injected UTC
 `now`) is rejected `INVALID`, and the recorded delta is `event_timestamp - now`. The future-reject
@@ -75,10 +75,23 @@ would be wrong if Dhan in fact sends a true epoch. (Caveat: the SDK evidence is 
 historical `convert_to_date_time` utility; the SDK's *marketfeed* LTT path was not separately
 confirmed and may differ — another reason to trace the raw value live.)
 
+**In-repo historical sibling.** A second identical helper `_epoch_timestamp` lives at
+`adapters/dhan/normalizer.py:449-450` (`datetime.fromtimestamp(_integral_number(value), tz=UTC)`),
+used at `normalizer.py:221` for **historical candle** start timestamps. The SDK's
+`convert_to_date_time` is itself the REST/historical utility, so the VERIFIED_SDK evidence most
+directly validates *this* historical path and only indirectly the live marketfeed path. FIX-2 must
+therefore decide **consciously** whether the REST/historical epoch shares the live LTT
+interpretation: the two helpers may need to diverge (live localizes an IST-naive value) or stay
+identical (both true epochs). Test T13 ("historical/non-live paths unaffected") is the guard, and it
+is uncheckable without naming this sibling.
+
 ### The decisive live test (§14)
 
 Capture, for a **known** live trade during the Sep 15 session, the **raw LTT integer** and compute
-`fromtimestamp(raw, UTC)`; compare to the true UTC instant of that trade (≈ receive time):
+`fromtimestamp(raw, UTC)`; compare to the true UTC instant of that trade. **Use a liquid,
+actively-trading instrument** whose LTT is within seconds of now — an illiquid instrument's
+legitimately-lagged last trade could blur delta≈0 against delta≈19800; where possible compare
+against the exchange-published trade time rather than mere receive time:
 
 - If `fromtimestamp(raw, UTC) ≈ true instant` (delta ≈ 0) → Dhan sends a **true POSIX epoch**;
   ApexScan is correct; the +delta in FIX-1 has another cause (§12) → **RC3 likely NO**.
@@ -88,11 +101,14 @@ Capture, for a **known** live trade during the Sep 15 session, the **raw LTT int
 
 ## Alternative causes to rule out before confirming (§12)
 
-Host/container clock wrong (§13 — unverified, production inaccessible); stale previous-session LTT
-(the closed-market +15310 is consistent with staleness *plus* a possible shift, so it cannot isolate
-the tz error — only live data can); ms-vs-s unit error; decoder byte-offset / wrong field read as
-LTT; framing regression (framing fix `2deddf1` is in `main`; confirm no framing errors in the live
-snapshots — do not modify framing); session-calendar error.
+Host/container clock wrong (§13 — unverified, production inaccessible); stale previous-session LTT —
+but a *stale* prior-session LTT lies in the **past** (→ **negative** delta), so staleness alone
+cannot explain a **positive** future delta; the prior FIX-1 record (positive delta, +≈15310 s, not
+re-verified this phase) therefore argues *toward* a forward shift or a slow host clock and *against*
+pure staleness, which only sharpens the need for live current-session data; ms-vs-s unit error;
+decoder byte-offset / wrong field read as LTT; framing regression (framing fix `2deddf1` is in
+`main`; confirm no framing errors in the live snapshots — do not modify framing); session-calendar
+error.
 
 ## Suspected root-cause candidate (§15 — NO CHANGE MADE)
 
@@ -127,7 +143,9 @@ above.
 
 A future FIX-2 must be applied at the canonical event-construction boundary so the **same** timestamp
 semantics hold for both the legacy backend live path and the future `market-ingestion` canonical
-path — avoid two timestamp semantics. The decoupling/holiday branch is **not** modified by this
+path — avoid two timestamp semantics. Note two `_epoch_timestamp` helpers already exist in-repo
+(`live.py:551` live LTT, `normalizer.py:449` historical candles); FIX-2 must decide per-path whether
+they converge, not blindly edit one. The decoupling/holiday branch is **not** modified by this
 phase.
 
 ## Provisional FIX-2B test matrix (only if RC3 later confirms — §22)
