@@ -277,3 +277,28 @@ def test_h8b_b4_retention_topology_touches_no_authority_broker_or_fix_surface() 
     path = integration / "test_market_ipc_h8b_b4_retention_redis.py"
     offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H8B retention topology imported forbidden surface: {offending}"
+
+
+def test_h8c_b11_loss_detection_touches_no_authority_broker_or_fix_surface() -> None:
+    """H8C: the B11 loss-detector and its proof reconcile L1 + Redis metadata — no authority/broker.
+
+    The detector reads only bounded Redis-native metadata and producer/consumer evidence; it must
+    not reach the TickEngine/MarketContext authority, a strategy/session/trading path, a Dhan broker
+    adapter, or a FIX/WebSocket transport.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "pyotp",
+        "websockets",
+    )
+    module = _APP_ROOT / "market_ipc" / "loss_detection.py"
+    integration = _APP_ROOT.parent / "tests" / "integration"
+    test = integration / "test_market_ipc_h8c_b11_loss_detection_redis.py"
+    offending = sorted(
+        {m for path in (module, test) for m in _modules(path) for f in forbidden if _matches(m, f)}
+    )
+    assert offending == [], f"H8C loss-detection imported forbidden surface: {offending}"
