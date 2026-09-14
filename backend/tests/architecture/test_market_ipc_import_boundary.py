@@ -206,3 +206,27 @@ def test_h6_backend_restart_topology_touches_no_authority_broker_or_fix_surface(
     path = integration / "test_market_ipc_h6_backend_restart_redis.py"
     offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H6 backend-restart topology imported forbidden surface: {offending}"
+
+
+def test_h7_ingestion_restart_topology_touches_no_authority_broker_or_fix_surface() -> None:
+    """H7 (T29-T32): the ingestion-restart topology imports no authority, broker, or FIX surface.
+
+    Proves the restart / new-producer-epoch proof wires only the ingestion producer composition and
+    the shadow consumer/comparator — never the TickEngine/MarketContext authority, a strategy/
+    session/trading path, a Dhan broker adapter, or a FIX/WebSocket transport. A new import must not
+    reach a broker, so an ingestion restart can never contact Dhan or allocate an epoch off a live
+    provider.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "pyotp",
+        "websockets",
+    )
+    integration = _APP_ROOT.parent / "tests" / "integration"
+    path = integration / "test_market_ipc_h7_ingestion_restart_redis.py"
+    offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H7 ingestion-restart topology imported forbidden surface: {offending}"
