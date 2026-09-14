@@ -683,6 +683,47 @@ async def test_h5_t06_t07_ingestion_restart_new_epoch_distinct(
 
 
 # =========================================================================== #
+# H5-T08 backend consumer restart -> durable C1 dedup persists (fresh memory, shared durable)
+# =========================================================================== #
+async def test_h5_t08_backend_consumer_restart_durable_dedup_persists(
+    redis_socket: str, redis: Redis, tmp_path: Path
+) -> None:
+    config = _config()
+    events: list[IpcPayload] = [
+        _tick(symbol=_SYMBOLS[i % len(_SYMBOLS)], price=str(10 + i)) for i in range(10)
+    ]
+    await _produce_events(redis_socket, config, tmp_path, events)
+
+    # Consumer A applies + durably marks + ACKs all 10.
+    sink_a = RecordingShadowSink()
+    a = _consumer(
+        redis,
+        config.model_copy(update={"consumer_name": "A"}),
+        sink_a,
+        deduplicator=_durable(redis, config),
+    )
+    await a.start()
+    await _drain(a, redis, config)
+    assert sink_a.applied_total == 10
+
+    # "Restart": a brand-new consumer B with a FRESH in-memory cache but the SAME durable Redis
+    # authority. Redeliver the identities (at-least-once transport) -> durable survives the restart
+    # -> B recognises every identity and applies nothing.
+    await _reinject_duplicates(redis, config, count=10)
+    sink_b = RecordingShadowSink()
+    b = _consumer(
+        redis,
+        config.model_copy(update={"consumer_name": "B"}),
+        sink_b,
+        deduplicator=_durable(redis, config),
+    )
+    await b.start()
+    await _drain(b, redis, config)
+    assert sink_b.applied_total == 0  # durable C1 persisted across the restart
+    assert b.diagnostics().duplicate_total == 10
+
+
+# =========================================================================== #
 # H5-T09 duplicate identities suppressed by C1 (at-least-once redelivery)
 # =========================================================================== #
 async def test_h5_t09_duplicates_suppressed(
@@ -1076,7 +1117,11 @@ def test_h5_t25_fixture_timestamps_are_canonical_utc() -> None:
 async def test_h5_t26_large_replay_ten_thousand_inputs(
     redis_socket: str, redis: Redis, tmp_path: Path
 ) -> None:
-    config = _config(read_count=1_000, publish_shutdown_drain_timeout_seconds=60.0)
+    config = _config(
+        read_count=1_000,
+        publish_queue_capacity=20_000,  # headroom over the 10k input so no incidental overflow
+        publish_shutdown_drain_timeout_seconds=60.0,
+    )
     events = _representative_mix(10_000)
     provider = _FakeProvider([events])
     service, _ = await _start_service(redis_socket, config, tmp_path, provider)
@@ -1098,7 +1143,11 @@ async def test_h5_t26_large_replay_ten_thousand_inputs(
     assert report.matched_total == 10_000
     assert report.missing_total == 0
     assert report.unexpected_total == 0
+    assert report.value_mismatch_total == 0
     assert sink.applied_total == 10_000
+    diagnostics = consumer.diagnostics()
+    assert diagnostics.duplicate_total == 0  # a healthy replay has no redelivery to suppress
+    assert diagnostics.claimed_total == 0  # nothing stranded -> all via fresh reads, none reclaimed
 
 
 # =========================================================================== #
