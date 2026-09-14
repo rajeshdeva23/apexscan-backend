@@ -296,6 +296,47 @@ def test_h8a_t16_reference_double_apply_equals_single_apply_state() -> None:
     assert a.context.version == b.context.version == 1
 
 
+def test_h8a_t16_flat_close_new_session_reference_still_applies() -> None:
+    # A new-session reference whose previous_close equals the prior session's (a FLAT close) must
+    # NOT be suppressed by the value-equality gate: the gate is session-scoped, so it re-stamps the
+    # new session and previous_close survives the rollover carry-forward instead of being cleared.
+    registry = InstrumentStateRegistry(_instrument(symbol) for symbol in _SYMBOLS)
+    clock = ManualClock(datetime(2026, 9, 14, 7, 0, tzinfo=UTC))  # day D, live session
+    engine = TickEngine(
+        registry=registry,
+        bus=EventBus(),
+        clock=clock,
+        sequence=MonotonicSequence(),
+        session=_classifier(),
+    )
+    engine.process(_reference(previous_close="100"))  # day D reference, session D
+    day_d_tick = Tick(
+        instrument=_instrument(),
+        event_timestamp=datetime(2026, 9, 14, 6, 30, tzinfo=UTC),
+        last_price=Decimal("101"),
+        traded_quantity=1,
+    )
+    engine.process(day_d_tick)  # carries previous_close=100 within session D
+
+    clock.set(datetime(2026, 9, 15, 7, 0, tzinfo=UTC))  # roll to day D+1
+    rollover = engine.process(_reference(previous_close="100"))  # flat close: SAME value, new day
+    assert rollover.outcome is ValidationOutcome.ACCEPT  # NOT suppressed across the rollover
+    assert rollover.context is not None
+    assert rollover.context.previous_close == Decimal("100")
+    assert rollover.context.session is not None
+    assert rollover.context.session.trading_date == date(2026, 9, 15)
+
+    day_d1_tick = Tick(
+        instrument=_instrument(),
+        event_timestamp=datetime(2026, 9, 15, 6, 30, tzinfo=UTC),
+        last_price=Decimal("102"),
+        traded_quantity=1,
+    )
+    result = engine.process(day_d1_tick)
+    assert result.context is not None
+    assert result.context.previous_close == Decimal("100")  # survived rollover, not cleared to None
+
+
 # --------------------------------------------------------------------------- #
 # T17 — a Tick carrying session_ohlc is value-equal on re-apply, so the aggregate is gated
 # --------------------------------------------------------------------------- #

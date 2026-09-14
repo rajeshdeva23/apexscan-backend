@@ -52,23 +52,26 @@ confirmed by an exhaustive independent sweep of `market_engine/`.
 
 ## The reference gate (the one code change)
 
-`TickEngine._accept_reference` now rejects a reference whose `previous_close` already equals the
-instrument's current value as `DUPLICATE` — no version, no publish, no mutation — the reference-path
-analogue of the Tick/Quote value-equality gate. A reference carries no `event_timestamp`, so it can
-have no STALE watermark; a genuine new close (different value, different producer sequence) still
-applies. C1's `contains → apply → mark → ACK` order is unchanged (no mark-before-apply, so no
-opposite "mark then crash before apply" loss).
+`TickEngine._accept_reference` now rejects a reference whose `previous_close` equals the
+instrument's current value **within the same session** as `DUPLICATE` — no version, no publish, no
+mutation — the reference-path analogue of the Tick/Quote value-equality gate. The gate is
+**session-scoped** (`_is_duplicate_reference`): a genuine new-session reference (a different
+classified trading date) always applies, **even when its value coincides with the prior session's
+close — a flat close** — so it re-stamps the new session and `previous_close` survives the rollover
+carry-forward (`_carried_previous_close`) instead of being cleared to `None`. A reference carries no
+`event_timestamp`, so it can have no STALE watermark; a genuine new value still applies. C1's
+`contains → apply → mark → ACK` order is unchanged (no mark-before-apply, so no opposite "mark then
+crash before apply" loss).
 
-**Known ceiling (honest scope).** The reference gate is value-equality, so it idempotently absorbs
-the realistic B2 case: an immediate redelivery of the current reference within the crash window.
-Because `previous_close` is a per-(instrument, trading-date) constant — one reference per instrument
-per session — there is no *newer* reference within a reclaim window, so a delayed reclaim always
-finds the value unchanged and is suppressed. A synthetic stream of many *distinct* references to one
-instrument within one reclaim horizon (not a real market shape) could let a delayed reclaim of an
-older reference regress `previous_close`, since there is no timestamp to reject it; giving the
-engine a producer-sequence watermark would couple it to transport identity and is out of the frozen
-design. Ticks/quotes have no such ceiling — the STALE timestamp watermark rejects any out-of-order
-reclaim. Tests therefore model one reference per instrument (reality).
+**Known ceiling (honest scope).** If ≥2 *distinct* `previous_close` values reached one instrument
+within a reclaim horizon **on the same trading date**, a delayed reclaim of the older reference
+(no timestamp watermark) could regress `previous_close`. This is not reachable under the real feed:
+Dhan's previous-close is the prior session's close, constant intraday (`adapters/dhan/live.py`
+surfaces it verbatim, no intraday correction), and a cross-day reference is rejected by the
+consumer's trading-date gate (`consumer.py`) before it reaches the engine. Giving the engine a
+producer-sequence watermark would couple it to transport identity and is out of the frozen design.
+Ticks/quotes have no such ceiling — the STALE timestamp watermark rejects any out-of-order reclaim.
+Tests model one reference per instrument (reality) and the flat-close rollover explicitly.
 
 ## Crash matrix
 

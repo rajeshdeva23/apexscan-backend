@@ -97,6 +97,27 @@ def _carried_previous_close(
     return prior.previous_close
 
 
+def _is_duplicate_reference(
+    context: MarketContext | None,
+    session: SessionContext | None,
+    event: MarketReference,
+) -> bool:
+    """Whether a reference repeats the current in-session previous_close (the reference gate).
+
+    A MarketReference carries no wire timestamp, so it has no STALE watermark; instead an identical
+    ``previous_close`` for the SAME session is treated as a duplicate — the reference-path analogue
+    of the Tick/Quote value-equality gate that closes B2's apply→mark crash-redelivery window. A
+    genuine new-session reference (a different classified trading date) is NEVER suppressed, even
+    when its value coincides with the prior session's (a flat close), so it re-stamps the session
+    and ``previous_close`` survives the rollover carry-forward (:func:`_carried_previous_close`).
+    """
+    if context is None or context.previous_close != event.previous_close:
+        return False
+    if session is not None and context.session is not None:
+        return session.trading_date == context.session.trading_date
+    return True  # no session concept in play: a same-value reference is a pure duplicate
+
+
 class TickEngine:
     """Routes validated canonical events into per-instrument MarketContext versions."""
 
@@ -295,29 +316,29 @@ class TickEngine:
         is a DUPLICATE: it mints no version, publishes no event, and mutates no state — the
         reference-path analogue of the Tick/Quote value-equality gate (:mod:`validation`).
         A reference carries no ``event_timestamp``, so it can have no STALE watermark gate;
-        a genuine cross-session reference (a different close, and a different producer
-        sequence) always differs in value and still applies. This closes B2's apply→mark
-        crash-redelivery window for the previously-ungated reference: an identical reference
-        re-delivered before its durable dedup mark commits now causes no second mutation
-        (ADR-025 authoritative-sink contract; the "reference gate").
+        An identical in-session reference re-delivered before its durable dedup mark commits causes
+        no second mutation (ADR-025 authoritative-sink contract; the "reference gate"). The gate is
+        session-scoped (:func:`_is_duplicate_reference`): a genuine new-session reference always
+        applies and re-stamps the session, even on a flat close, so ``previous_close`` survives the
+        rollover carry-forward.
         """
         if not self._registry.is_known(event.instrument):
             logger.debug("rejected MarketReference for unknown %s", event.instrument.symbol)
             return ProcessResult(outcome=ValidationOutcome.INVALID, context=None)
         state = self._registry.ensure(event.instrument)
-        if state.context is not None and state.context.previous_close == event.previous_close:
-            logger.debug(
-                "duplicate MarketReference for %s: previous_close unchanged",
-                event.instrument.symbol,
-            )
-            return ProcessResult(outcome=ValidationOutcome.DUPLICATE, context=None)
-        sequence = self._sequence.next_value()
         now = self._clock.now()
         session = (
             self._session.classify(now, halt_active=self._halt_active)
             if self._session is not None
             else None
         )
+        if _is_duplicate_reference(state.context, session, event):
+            logger.debug(
+                "duplicate MarketReference for %s: previous_close unchanged in-session",
+                event.instrument.symbol,
+            )
+            return ProcessResult(outcome=ValidationOutcome.DUPLICATE, context=None)
+        sequence = self._sequence.next_value()
         if state.context is None:
             context = MarketContext.initial(
                 event.instrument,
