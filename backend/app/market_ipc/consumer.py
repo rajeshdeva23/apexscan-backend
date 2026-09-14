@@ -32,7 +32,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import RedisError
 
-from app.market_ipc.config import MarketIpcConfig
+from app.market_ipc.config import MarketIpcConfig, validate_retention_invariant
 from app.market_ipc.dedup import BoundedDeduplicator
 from app.market_ipc.durable_dedup import Deduplicator, InMemoryDeduplicator
 from app.market_ipc.envelope import (
@@ -71,6 +71,7 @@ class MessageOutcome(StrEnum):
     SINK_FAILED = "sink_failed"
     ACK_FAILED = "ack_failed"
     DEDUP_UNAVAILABLE = "dedup_unavailable"  # durable dedup store failed — fail closed, retry
+    BEYOND_HORIZON = "beyond_horizon"  # older than the redelivery horizon — dropped, never applied
 
 
 # Outcomes that are permanently invalid for the current session/consumer or already handled:
@@ -88,6 +89,7 @@ _TERMINAL_ACK_OUTCOMES = frozenset(
         MessageOutcome.UNSUPPORTED_SCHEMA,
         MessageOutcome.PAYLOAD_DECODE_FAILED,
         MessageOutcome.EVENT_KIND_MISMATCH,
+        MessageOutcome.BEYOND_HORIZON,
     }
 )
 
@@ -155,6 +157,7 @@ class ConsumerDiagnostics(BaseModel):
     ack_failures: int
     read_failures: int
     dedup_store_failures: int
+    beyond_horizon_total: int
     # H4B pending-recovery (XAUTOCLAIM) counters — bounded scalars, no per-entry cardinality.
     pending_recovery_runs: int
     pending_reclaimed: int
@@ -202,7 +205,12 @@ class MarketEventConsumer:
         self._last_event_age_ms: float | None = None
 
     async def start(self) -> None:
-        """Ensure the Redis consumer group (and stream) exists; idempotent."""
+        """Ensure the Redis consumer group (and stream) exists; idempotent. Fail closed on B4.
+
+        The retention invariant is re-checked here (not only at config construction) so a config
+        mutated via ``model_copy`` — which bypasses validation — can never start an unsafe consumer.
+        """
+        validate_retention_invariant(self._config)
         await self._transport.ensure_group()
         self._running = True
 
@@ -264,7 +272,17 @@ class MarketEventConsumer:
         envelope, decode_outcome = self._decode_envelope(raw)
         if envelope is None:
             return await self._finalize(message_id, decode_outcome)
-        self._last_event_age_ms = self._event_age_ms(envelope)
+        age_ms = self._event_age_ms(envelope)
+        self._last_event_age_ms = age_ms
+
+        # B4 (ADR-028): an event older than the redelivery horizon is dropped, never applied. This
+        # is the publish-independent horizon bound — it holds even when the market is quiet and no
+        # producer trim runs, so a reclaimed pending entry whose dedup key may have expired can
+        # never be re-applied (it is lost — safe — not double-applied). Within the horizon the
+        # config invariant guarantees the dedup key still exists to suppress a genuine redelivery.
+        if age_ms > self._config.max_redelivery_horizon_seconds * 1_000:
+            self._counters.beyond_horizon += 1
+            return await self._finalize(message_id, MessageOutcome.BEYOND_HORIZON)
 
         gate_outcome = self._gate(envelope)
         if gate_outcome is not None:
@@ -442,6 +460,7 @@ class MarketEventConsumer:
             ack_failures=counters.ack_failures,
             read_failures=counters.read_failures,
             dedup_store_failures=counters.dedup_store_failures,
+            beyond_horizon_total=counters.beyond_horizon,
             pending_recovery_runs=counters.recovery_runs,
             pending_reclaimed=counters.claimed,
             pending_reclaim_failures=counters.reclaim_failures,
@@ -484,6 +503,7 @@ class _ConsumerCounters:
         "ack_failures",
         "read_failures",
         "dedup_store_failures",
+        "beyond_horizon",
         "recovery_runs",
         "reclaim_failures",
         "reclaimed_applied",
@@ -509,6 +529,7 @@ class _ConsumerCounters:
         self.ack_failures = 0
         self.read_failures = 0
         self.dedup_store_failures = 0
+        self.beyond_horizon = 0
         self.recovery_runs = 0
         self.reclaim_failures = 0
         self.reclaimed_applied = 0

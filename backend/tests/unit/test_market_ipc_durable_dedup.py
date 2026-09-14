@@ -86,7 +86,12 @@ class _FakeRedis:
 
 async def test_durable_record_sets_key_with_configured_ttl() -> None:
     redis = _FakeRedis()
-    config = MarketIpcConfig(dedup_key_prefix="md:dedup", dedup_ttl_seconds=3_600)
+    config = MarketIpcConfig(
+        dedup_key_prefix="md:dedup",
+        dedup_ttl_seconds=3_600,
+        max_redelivery_horizon_seconds=1_800,
+        retention_safety_margin_seconds=900,
+    )
     dedup = DurableDeduplicator(redis, config)  # type: ignore[arg-type]
     identity = _identity()
 
