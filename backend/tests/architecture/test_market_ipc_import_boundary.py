@@ -230,3 +230,28 @@ def test_h7_ingestion_restart_topology_touches_no_authority_broker_or_fix_surfac
     path = integration / "test_market_ipc_h7_ingestion_restart_redis.py"
     offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H7 ingestion-restart topology imported forbidden surface: {offending}"
+
+
+def test_h8a_b2_authoritative_topology_touches_no_broker_or_fix_surface() -> None:
+    """H8A: the B2 authoritative-sink proof drives the real TickEngine but no broker/FIX surface.
+
+    H8A is the first phase to exercise ``app.market_engine`` from an IPC test — the engine IS the
+    authoritative sink whose duplicate safety B2 closes, so it is *deliberately permitted* here
+    (unlike H5/H6/H7). What must still be absent: any Dhan broker adapter, FIX/WebSocket transport,
+    sector/strategy/session-authority path, or ``app.services`` composition seam. Proves the proof
+    connects only the consumer + engine + shadow diagnostics — it never reaches a broker, a
+    strategy, or the production composition that would constitute authority ACTIVATION.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "app.services",
+        "pyotp",
+        "websockets",
+    )
+    integration = _APP_ROOT.parent / "tests" / "integration"
+    path = integration / "test_market_ipc_h8a_b2_authoritative_redis.py"
+    offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H8A authoritative topology imported forbidden surface: {offending}"
