@@ -163,3 +163,24 @@ def test_shadow_compare_imports_no_authority_redis_or_provider_surface() -> None
     modules = _modules(_APP_ROOT / "market_ipc" / "shadow_compare.py")
     offending = sorted({m for m in modules for f in forbidden if _matches(m, f)})
     assert offending == [], f"shadow_compare imported forbidden surface: {offending}"
+
+
+def test_h5_offline_topology_touches_no_authority_broker_or_fix_surface() -> None:
+    """H5 (T21-T24): the offline end-to-end topology imports no authority, broker, or FIX surface.
+
+    Proves the composed producer+consumer parity pipeline wires only the ingestion producer
+    composition and the shadow consumer/comparator — never the TickEngine/MarketContext authority,
+    a strategy/session/trading path, a Dhan broker adapter, or a FIX/WebSocket transport.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "pyotp",
+        "websockets",
+    )
+    path = _APP_ROOT.parent / "tests" / "integration" / "test_market_ipc_h5_offline_e2e_redis.py"
+    offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H5 offline topology imported forbidden surface: {offending}"
