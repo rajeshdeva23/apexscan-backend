@@ -119,6 +119,13 @@ Neither bound depends on event rate for correctness; rate informs only operation
   double-apply on either.
 - **Availability vs. correctness:** an event that ages out of the horizon before being applied is
   lost by design; the operator sizes the horizon to the maximum tolerated outage.
+- **Clock-skew assumption:** the age gate compares the consumer clock to the producer's
+  `produced_at` wall clock (not the Dhan LTT `event_timestamp`, so the +5:30 FIX defect does not
+  reach it). A double-apply would require the producer clock to run ahead of the consumer by ≥
+  `retention_safety_margin_seconds` (default 1h) — a bounded, NTP-covered assumption that replaces
+  the old event-rate dependency.
+- **Aware clock at activation (H9):** the age subtraction needs a timezone-aware UTC `now`; when the
+  consumer is eventually composed (H9), production wiring must inject one. Nothing composes it today.
 - `B11` (durable Redis loss detection) remains `DESIGN_RESOLVED / IMPLEMENTATION_PENDING` (H8C);
   `LIVE_DHAN_TIMESTAMP_PARITY = NOT_PROVEN` (FIX-2A untouched). ADR-028 is **Proposed** — governance
   acceptance is a precondition for authoritative activation (H9).
