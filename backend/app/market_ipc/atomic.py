@@ -36,13 +36,44 @@ from app.market_ipc.transport import _FIELD, RedisPublishError
 if TYPE_CHECKING:
     from redis.commands.core import AsyncScript
 
+# B4/ADR-028: age-trim the stream to the redelivery horizon so an event cannot be redelivered once
+# older than the dedup key's guaranteed lifetime. MINID is computed from the Redis server clock
+# (redis.call('TIME')) — the same clock that stamps stream IDs — never a client clock. The trim is
+# EXACT (no '~'): the horizon is a hard bound, so no entry survives past it (the safety margin then
+# covers only clock/apply skew, not approximate-trim overhang). MAXLEN '~' on the XADD stays as the
+# memory cap; whichever bound trims first only shortens redeliverability (always safe for dedup).
+_AGE_TRIM_LUA = """
+local horizon_ms = tonumber(ARGV[HORIZON_ARG])
+if horizon_ms ~= nil and horizon_ms > 0 then
+  local t = redis.call('TIME')
+  local minid = (tonumber(t[1]) * 1000) - horizon_ms
+  -- Format as an integer string: a bare Lua number reaches Redis in scientific notation and is not
+  -- a valid stream id. '<ms>' alone is interpreted as '<ms>-0' by MINID.
+  if minid > 0 then redis.call('XTRIM', KEYS[1], 'MINID', string.format('%d', minid)) end
+end
+"""
+
+# KEYS[1]=stream. ARGV: 1=stream_field, 2=raw_envelope, 3=maxlen, 4=horizon_ms
+_PUBLISH_STREAM_ONLY_LUA = (
+    """
+local maxlen = tonumber(ARGV[3])
+if maxlen == nil then return redis.error_reply('D1_INVALID_ARGS') end
+local mid = redis.call('XADD', KEYS[1], 'MAXLEN', '~', maxlen, '*', ARGV[1], ARGV[2])
+"""
+    + _AGE_TRIM_LUA.replace("HORIZON_ARG", "4")
+    + """
+return mid
+"""
+)
+
 # KEYS[1]=stream, KEYS[2]=reference hash.
 # ARGV: 1=stream_field, 2=raw_envelope, 3=maxlen, 4=instrument_identity,
-#       5=inc_epoch, 6=inc_seq, 7=inc_state_json, 8=ttl_seconds
+#       5=inc_epoch, 6=inc_seq, 7=inc_state_json, 8=ttl_seconds, 9=horizon_ms
 #
 # All parsing/validation happens before the first write (XADD); after it, only deterministic
 # commands run — so the script can never error after a partial effect.
-_PUBLISH_STREAM_AND_REFERENCE_LUA = """
+_PUBLISH_STREAM_AND_REFERENCE_LUA = (
+    """
 local maxlen = tonumber(ARGV[3])
 local inc_epoch = tonumber(ARGV[5])
 local inc_seq = tonumber(ARGV[6])
@@ -85,8 +116,12 @@ if to_write ~= nil then
   redis.call('HSET', KEYS[2], ARGV[4], to_write)
   redis.call('EXPIRE', KEYS[2], ttl)
 end
+"""
+    + _AGE_TRIM_LUA.replace("HORIZON_ARG", "9")
+    + """
 return {mid, ref_status}
 """
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,16 +160,24 @@ class RedisAtomicPublisher:
         self._redis = redis
         self._config = config
         self._script: AsyncScript = redis.register_script(_PUBLISH_STREAM_AND_REFERENCE_LUA)
+        self._stream_only_script: AsyncScript = redis.register_script(_PUBLISH_STREAM_ONLY_LUA)
+
+    @property
+    def _horizon_ms(self) -> int:
+        """The redelivery-horizon age bound (ms) the stream is trimmed to (B4/ADR-028)."""
+        return self._config.max_redelivery_horizon_seconds * 1_000
 
     async def publish_stream_only(self, envelope: MarketEventEnvelope) -> AtomicPublicationResult:
-        """Plain ``XADD`` for a STREAM_ONLY event; never touches a reference key or its TTL."""
+        """``XADD`` a STREAM_ONLY event and age-trim the stream; never touches a reference key.
+
+        The append and the age-trim (MINID by server clock, keeping MAXLEN as the memory cap) run
+        in one server-side call so the redelivery horizon is bounded on every publish (B4/ADR-028).
+        """
         raw = encode_envelope(envelope, max_bytes=self._config.max_payload_bytes)
         try:
-            message_id = await self._redis.xadd(
-                self._config.stream_name,
-                {_FIELD: raw},
-                maxlen=self._config.maxlen,
-                approximate=True,
+            message_id = await self._stream_only_script(
+                keys=[self._config.stream_name],
+                args=[_FIELD, raw, self._config.maxlen, self._horizon_ms],
             )
         except RedisError as error:
             raise RedisPublishError(f"failed to publish to {self._config.stream_name}") from error
@@ -167,6 +210,7 @@ class RedisAtomicPublisher:
                     reference_state.producer_sequence,
                     reference_state.model_dump_json(),
                     self._config.reference_ttl_seconds,
+                    self._horizon_ms,
                 ],
             )
         except RedisError as error:

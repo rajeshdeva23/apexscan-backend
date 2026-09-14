@@ -177,15 +177,24 @@ class RedisMarketEventStream:
         )
         cursor = response[0]
         next_cursor = cursor.decode() if isinstance(cursor, bytes) else str(cursor)
+        # A pending entry whose stream record was trimmed (B4 age-trim / MAXLEN) is reported by
+        # XAUTOCLAIM as a tombstone: Redis >=7 lists its id with nil fields (and auto-drops it from
+        # the PEL); Redis 6.2 (and redis-py) yields ``(None, None)`` with no recoverable id. Skip a
+        # tombstone with no id — it is not a deliverable event and cannot be ACKed by id here — so a
+        # trimmed pending entry can never crash the reclaim loop or be re-applied.
         entries: list[RawDeliveredEvent] = [
-            _extract_raw(message_id, fields) for message_id, fields in response[1]
+            _extract_raw(message_id, fields)
+            for message_id, fields in response[1]
+            if message_id is not None
         ]
         return next_cursor, entries
 
 
-def _extract_raw(message_id: Any, fields: dict[Any, Any]) -> RawDeliveredEvent:
-    """Extract ``(message_id, raw envelope bytes)`` without decoding; None if field is absent."""
+def _extract_raw(message_id: Any, fields: dict[Any, Any] | None) -> RawDeliveredEvent:
+    """Extract ``(message_id, raw envelope bytes)`` without decoding; None raw if absent/trimmed."""
     message = message_id.decode() if isinstance(message_id, bytes) else str(message_id)
+    if fields is None:  # trimmed entry with a recoverable id (nil fields): decode-fail -> ACK away
+        return message, None
     raw = fields.get(_FIELD) or fields.get(_FIELD.encode())
     if raw is None:
         return message, None

@@ -255,3 +255,25 @@ def test_h8a_b2_authoritative_topology_touches_no_broker_or_fix_surface() -> Non
     path = integration / "test_market_ipc_h8a_b2_authoritative_redis.py"
     offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H8A authoritative topology imported forbidden surface: {offending}"
+
+
+def test_h8b_b4_retention_topology_touches_no_authority_broker_or_fix_surface() -> None:
+    """H8B: the B4 retention proof wires only the transport/dedup/producer — no authority or broker.
+
+    The dedup-retention invariant + age-trim proof uses the shadow sink and the D1 producer over
+    isolated Redis; it must not reach the TickEngine/MarketContext authority, a strategy/session/
+    trading path, a Dhan broker adapter, or a FIX/WebSocket transport.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "pyotp",
+        "websockets",
+    )
+    integration = _APP_ROOT.parent / "tests" / "integration"
+    path = integration / "test_market_ipc_h8b_b4_retention_redis.py"
+    offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H8B retention topology imported forbidden surface: {offending}"

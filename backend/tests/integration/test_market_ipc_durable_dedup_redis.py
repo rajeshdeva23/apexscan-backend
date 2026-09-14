@@ -123,7 +123,11 @@ async def test_fresh_consumer_suppresses_already_applied_identity(redis: Redis) 
 
 
 async def test_dedup_key_carries_bounded_ttl(redis: Redis) -> None:
-    config = _config(dedup_ttl_seconds=3_600)
+    config = _config(
+        dedup_ttl_seconds=3_600,
+        max_redelivery_horizon_seconds=1_800,
+        retention_safety_margin_seconds=900,
+    )
     identity = ProducerEventIdentity(_PRODUCER, 1, 1)
     await DurableDeduplicator(redis, config).record(identity)
 
