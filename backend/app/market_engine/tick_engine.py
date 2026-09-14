@@ -290,11 +290,27 @@ class TickEngine:
         (tick, quote, candles, session statistics, historical) is preserved unchanged;
         only ``previous_close`` is set. No candle aggregation or statistics resolution
         runs — a reference is not a trade.
+
+        A reference whose ``previous_close`` already equals the instrument's current value
+        is a DUPLICATE: it mints no version, publishes no event, and mutates no state — the
+        reference-path analogue of the Tick/Quote value-equality gate (:mod:`validation`).
+        A reference carries no ``event_timestamp``, so it can have no STALE watermark gate;
+        a genuine cross-session reference (a different close, and a different producer
+        sequence) always differs in value and still applies. This closes B2's apply→mark
+        crash-redelivery window for the previously-ungated reference: an identical reference
+        re-delivered before its durable dedup mark commits now causes no second mutation
+        (ADR-025 authoritative-sink contract; the "reference gate").
         """
         if not self._registry.is_known(event.instrument):
             logger.debug("rejected MarketReference for unknown %s", event.instrument.symbol)
             return ProcessResult(outcome=ValidationOutcome.INVALID, context=None)
         state = self._registry.ensure(event.instrument)
+        if state.context is not None and state.context.previous_close == event.previous_close:
+            logger.debug(
+                "duplicate MarketReference for %s: previous_close unchanged",
+                event.instrument.symbol,
+            )
+            return ProcessResult(outcome=ValidationOutcome.DUPLICATE, context=None)
         sequence = self._sequence.next_value()
         now = self._clock.now()
         session = (
