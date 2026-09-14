@@ -110,6 +110,16 @@ def test_h8c_t05_reset_when_group_absent_under_live_producer() -> None:
     assert result.ready_for_authority is False
 
 
+def test_h8c_t05_reset_when_stream_never_written_but_group_present() -> None:
+    # FLUSHALL then ensure_group recreates a fresh stream+group: the group EXISTS but the stream was
+    # never written (last-generated-id == 0-0). Isolates the stream-level reset signal from the
+    # group-absent fallback — even a caught-up consumer must fail closed.
+    metadata = _meta(last_generated_id="0-0", group_exists=True, last_seq=None, length=0)
+    result = reconcile(_producer(), _CAUGHT_UP, metadata)
+    assert result.state is LossDetectionState.REDIS_STREAM_RESET
+    assert result.ready_for_authority is False
+
+
 # T06 rewind — group delivered beyond the stream's last id
 def test_h8c_t06_rewind_when_group_ahead_of_stream() -> None:
     result = reconcile(

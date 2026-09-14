@@ -147,6 +147,23 @@ async def test_h8c_t05_redis_reset_detected(redis: Redis) -> None:
     assert result.ready_for_authority is False
 
 
+async def test_h8c_t05_reset_detected_after_flushall_and_regroup(redis: Redis) -> None:
+    # FLUSHALL then ensure_group recreates a fresh stream+group (last-generated-id 0-0) while the
+    # producer L1 still says it published — exercises the stream-level reset signal with the group
+    # PRESENT (not the group-absent fallback), even for a caught-up consumer.
+    config = _config()
+    stream = RedisMarketEventStream(redis=redis, config=config)
+    await stream.ensure_group()
+    await _publish(stream, start=1, count=10)
+    await redis.flushall()
+    await stream.ensure_group()  # fresh, empty stream + group
+
+    detector = RedisLossDetector(redis, config)
+    result = await detector.evaluate(_producer(last_published=10), ConsumerProgressEvidence(1, 10))
+    assert result.state is LossDetectionState.REDIS_STREAM_RESET
+    assert result.ready_for_authority is False
+
+
 # =========================================================================== #
 # T06: stream rewind — the group is durably ahead of the stream's last id
 # =========================================================================== #

@@ -36,8 +36,8 @@ point-in-time evidence snapshots and classifies transport continuity. It persist
   ingestion host, not Redis, so this evidence survives a Redis reset.
 - **Redis (bounded, native).** `XINFO STREAM` (length, `last-generated-id`), `XINFO GROUPS`
   (`last-delivered-id`, `pending`), and one `XREVRANGE COUNT 1` decoded to the last entry's canonical
-  identity. O(1) — no unbounded stream scan. (`entries-added` is used opportunistically where
-  present; it is a Redis ≥ 7.0 field, so correctness rests only on 6.2-available fields.)
+  identity. O(1) — no unbounded stream scan. Uses only Redis 6.2-available fields; the richer
+  `entries-added`/`entries-read`/`lag` (Redis ≥ 7.0) are **not** read.
 - **Consumer.** the last canonical identity the backend durably applied.
 
 **Classification** (`LossDetectionState`): `HEALTHY`, `CONSUMER_LAGGING`, `PENDING_RECOVERY`,
@@ -94,5 +94,12 @@ authority unavailable.
 - **AOF tail-loss of *un-consumed* events** is caught only via the producer↔stream last-entry
   reconciliation (published position vs. last stream identity); it depends on the producer L1 record
   being available to the detector.
-- Redis ≥ 7.0 `entries-added`/`entries-read`/`lag` would add redundancy; the detector does not
-  require them.
+- **`REDIS_STATE_REWIND`** specifically flags the group's delivered position sorting past the
+  stream's last id. A *consistent* older-snapshot restore (stream **and** group roll back together,
+  so group ≤ stream) is instead caught by the tail-loss branch (`PUBLISHED_EVENT_UNACCOUNTED_FOR`) —
+  either way `ready_for_authority` is False; only the label differs.
+- **Non-suffix loss** (an arbitrary middle entry deleted while newer entries and `last-generated-id`
+  survive) is outside the threat model (tail-loss / `FLUSHALL` / snapshot-restore are all
+  contiguous-suffix or total) and is consistent with the no-sequence-arithmetic rule; it is not
+  detected.
+- Redis ≥ 7.0 `entries-added`/`entries-read`/`lag` are not read; they would add redundancy only.

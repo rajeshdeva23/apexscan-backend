@@ -96,7 +96,12 @@ keeps IPC authority unavailable.
 
 - **Producer-evidence conveyance** to the backend (via the frozen `md:health` snapshot) is an
   activation concern wired at H9, not H8C; the detector takes the producer snapshot as input here.
-- **Redis version:** `entries-added`/`entries-read`/`lag` (Redis ≥ 7.0) would add redundancy; the
-  6.2 test runtime lacks them, so correctness rests on `last-generated-id` / `last-delivered-id`.
+- **Redis version:** `entries-added`/`entries-read`/`lag` (Redis ≥ 7.0) are not read; the 6.2 test
+  runtime lacks them, so correctness rests on `last-generated-id` / `last-delivered-id`.
+- **Rewind label vs. tail-loss:** `REDIS_STATE_REWIND` fires when the group is ahead of the stream; a
+  *consistent* older-snapshot restore (stream + group roll back together) is caught by the tail-loss
+  branch instead. Both are non-ready — only the label differs.
+- **Non-suffix loss** (an arbitrary middle entry deleted while newer entries survive) is outside the
+  threat model and is not detected — consistent with the no-sequence-arithmetic rule.
 - ADR-029 is **Proposed** — governance acceptance is a precondition for authoritative activation
   (H8D readiness review / H9). `LIVE_DHAN_TIMESTAMP_PARITY = NOT_PROVEN` (FIX-2A untouched).

@@ -58,7 +58,7 @@ class LossDetectionState(StrEnum):
     RETENTION_EXPECTED = "retention_expected"  # applied, then legitimately aged out (H8B)
     PRODUCER_PUBLICATION_FAILED = "producer_publication_failed"  # L1 broke — not a Redis loss
     REDIS_STREAM_RESET = "redis_stream_reset"  # stream/group reinitialised under a live producer
-    REDIS_STATE_REWIND = "redis_state_rewind"  # Redis moved backward vs durable consumer progress
+    REDIS_STATE_REWIND = "redis_state_rewind"  # group delivered past the stream's last id
     PUBLISHED_EVENT_UNACCOUNTED_FOR = (
         "published_event_unaccounted_for"  # tail-loss of confirmed pubs
     )
