@@ -184,3 +184,25 @@ def test_h5_offline_topology_touches_no_authority_broker_or_fix_surface() -> Non
     path = _APP_ROOT.parent / "tests" / "integration" / "test_market_ipc_h5_offline_e2e_redis.py"
     offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H5 offline topology imported forbidden surface: {offending}"
+
+
+def test_h6_backend_restart_topology_touches_no_authority_broker_or_fix_surface() -> None:
+    """H6 (T25-T29): the backend-restart topology imports no authority, broker, or FIX surface.
+
+    Proves the continuously-alive ingestion + restarted-consumer proof wires only the ingestion
+    producer composition and the shadow consumer/comparator — never the TickEngine/MarketContext
+    authority, a strategy/session/trading path, a Dhan broker adapter, or a FIX/WebSocket transport.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "pyotp",
+        "websockets",
+    )
+    integration = _APP_ROOT.parent / "tests" / "integration"
+    path = integration / "test_market_ipc_h6_backend_restart_redis.py"
+    offending = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H6 backend-restart topology imported forbidden surface: {offending}"
