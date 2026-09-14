@@ -27,30 +27,47 @@ apply E → record dedup(E) → ACK lost / E still in stream
 the horizon was unbounded in time. Audit confirmed count-based `MAXLEN ~` trimming in both the
 transport `XADD` and the D1 atomic Lua — no time bound anywhere.
 
-## Chosen model (ADR-028)
+## Chosen model (ADR-028): a consumer-side horizon, not a producer trim
 
-A **time** invariant made sound by a **time-based trim**:
+The redelivery horizon is enforced **at the consumer**, because any producer-side trim is
+publish-triggered and stops exactly when the market is quiet — the low-rate condition B4 exists for.
 
-- `max_redelivery_horizon_seconds` (new) — the maximum time an event may remain redeliverable.
-- The D1 producer age-trims the stream every publish with an **exact** `XTRIM ... MINID
-  (server_now − horizon)` (server clock via `redis.call('TIME')`), so no entry survives past the
-  horizon. `MAXLEN ~` stays as an independent memory cap.
-- Invariant (fail-closed at config construction):
-  `dedup_ttl_seconds >= max_redelivery_horizon_seconds + retention_safety_margin_seconds`.
+- `max_redelivery_horizon_seconds` (new) — the maximum time an event may be *applied* after it was
+  produced.
+- **Consumer age gate:** on every consumed entry (new *and* reclaimed) the consumer computes
+  `age = now − produced_at` and, if it exceeds the horizon, terminally ACKs it as `BEYOND_HORIZON`
+  **without applying it**. So an aged-out pending entry — reclaimed after a quiet weekend, its dedup
+  key possibly expired — is *lost* (safe), never double-applied. This is publish-independent: it
+  holds with `MAXLEN`-only trimming and zero publishes.
+- **Invariant (fail-closed):** `dedup_ttl_seconds >= max_redelivery_horizon_seconds +
+  retention_safety_margin_seconds`, checked at config construction **and** at
+  `MarketEventConsumer.start()` (so a `model_copy` that bypasses model validation still cannot start
+  an unsafe consumer). Guarantees every reclaim *within* the horizon still finds its dedup key.
+
+Within the horizon → the dedup key exists → C1 suppresses a genuine redelivery. Beyond the horizon →
+the consumer refuses to apply → no expired-key double-apply. `MAXLEN ~` stays only as a memory cap.
+
+### Why not a producer time-trim (the rejected first cut)
+
+The first H8B attempt trimmed the stream on publish (`XTRIM MINID`). The adversarial review refuted
+it: with no publishes (quiet market) nothing trims, so an aged entry stays live past `dedup_ttl` and
+a later reclaim double-applies — inverting the failure mode from safe-loss to unsafe-double-apply,
+reachable with shipped defaults (12h horizon < a weekend). Correctness must not depend on publish
+activity, so the bound moved to the consumer.
 
 ### Why MAXLEN cannot substitute for time
 
 `MAXLEN` bounds a **count**; the horizon is a **time**. Their ratio is the event rate, which varies
 (low-volume sessions, market closure, weekends). Correctness cannot depend on rate (§11), so the
-bound must be a time — hence exact `MINID` trimming, not count trimming.
+bound is a time enforced at the consumer, independent of the count-based memory cap.
 
 ## PEL / XAUTOCLAIM interaction
 
-A pending entry whose stream record has been trimmed is a tombstone. Redis ≥ 7.0 auto-drops it from
-the PEL (nil-field entry in a deleted list); Redis 6.2 (the test runtime) yields `(None, None)` and
-leaves a dangling PEL entry. The transport reclaim path now **skips id-less tombstones and treats
-nil-field entries as decode-failures** (terminal-ACK where an id exists), so a trimmed pending entry
-never crashes the reclaim loop and is never re-applied (verified over real Redis). A
+A pending entry whose stream record has been trimmed (by `MAXLEN`) is a tombstone. Redis ≥ 7.0
+auto-drops it from the PEL (nil-field entry in a deleted list); Redis 6.2 (the test runtime) yields
+`(None, None)` and leaves a dangling PEL entry. The transport reclaim path **skips id-less tombstones
+and treats nil-field entries as decode-failures** (terminal-ACK where an id exists), so a trimmed
+pending entry never crashes the reclaim loop and is never re-applied (verified over real Redis). A
 trimmed-before-applied event is *lost* (availability, sized by the horizon), never double-applied.
 
 ## Weekend / holiday behaviour
@@ -69,10 +86,11 @@ Redis client).
 
 ## H8A interaction
 
-`B2_STATUS = RESOLVED` (ADR-025/H8A) is preserved: H8B touches only `config.py` (invariant) and
-`atomic.py` (age-trim) plus the transport reclaim fix — it does not alter the TickEngine reference
-gate, the dedup key formula, epoch-awareness, or the C1 apply→mark→ACK order. Same-sequence /
-new-epoch identities remain distinct (verified).
+`B2_STATUS = RESOLVED` (ADR-025/H8A) is preserved: H8B touches only `config.py` (invariant),
+`consumer.py` (the `BEYOND_HORIZON` age gate + fail-closed start check), and `transport.py` (the
+tombstone-robust reclaim) — it does not alter the TickEngine reference gate, the dedup key formula,
+epoch-awareness, or the C1 apply→mark→ACK order. Same-sequence / new-epoch identities remain
+distinct (verified).
 
 ## Storage growth
 
@@ -85,9 +103,11 @@ Neither bound depends on event rate for correctness; rate informs only operation
 - `tests/unit/test_market_ipc_retention_invariant.py` — the fail-closed invariant: defaults safe,
   unsafe TTL rejected, boundary (equal safe / one below rejected), weekend-length horizon needs a
   long TTL, zero/negative/excessive values rejected, actionable error message.
-- `tests/integration/test_market_ipc_h8b_b4_retention_redis.py` (real `redislite`): the producer
-  age-trims the stream to the horizon (old entries evicted, first entry gone); the dedup key TTL
-  exceeds the horizon; a trimmed pending entry is neither re-applied nor crashes the loop;
+- `tests/integration/test_market_ipc_h8b_b4_retention_redis.py` (real `redislite`): a pending entry
+  reclaimed **after** the horizon with an expired dedup key is dropped, not re-applied (the HIGH-1
+  quiet-market scenario, mutation-verified); a reclaim **within** the horizon is suppressed by the
+  dedup key; the consumer fails closed at start on a `model_copy`'d unsafe config; a trimmed pending
+  entry is neither re-applied nor crashes the loop; the dedup key TTL exceeds the horizon;
   same-seq/new-epoch stay distinct; dedup survives a fresh Redis client.
 - `tests/architecture/test_market_ipc_import_boundary.py` — H8B tests touch no
   Dhan/strategy/sector/authority surface.
