@@ -1,0 +1,250 @@
+# FIX-2A — Dhan live-timestamp diagnostic evidence (RC3 gate)
+
+**Status:** DRAFT — **Sep-15 post-market live evidence reviewed** (read-only production forensics on
+`65.2.105.7`). No production change. No FIX applied. `LIVE_FUTURE_TIMESTAMP_REJECTION = YES`,
+`RAW_LTT_SEMANTICS_PROVEN = NO`, `RC3_CONFIRMED = INCONCLUSIVE`, `READY_FOR_FIX2_IMPLEMENTATION = NO`,
+`FIX2A_FOLLOWUP_DIAGNOSTIC_REQUIRED = YES`. See **Sep-15 post-market live evidence** below (the §11
+raw-LTT decisive test remains unrunnable because the raw integer is not retained).
+
+**Purpose:** confirm or reject the suspected Dhan Last-Traded-Time (LTT) timezone-interpretation
+defect using existing FIX-1 production diagnostics during a live NSE session. This phase does **not**
+implement FIX-2.
+
+## Execution context (why live evidence is not yet captured)
+
+- **Date of this analysis:** Sunday **2026-09-13** (~17:57 IST). NSE cash market **closed**; the next
+  regular session is **Tue 2026-09-15, 09:15 IST** — ~2 days ahead. Per §1, closed-market evidence
+  alone must not confirm RC3.
+- **Production inspection unavailable from this environment:** a read-only SSH probe to the authorized
+  host `65.2.105.7` returned `Permission denied (publickey)` — no key is provisioned here. Host-key
+  verification was **not** weakened (that boundary is respected). Consequently the §6 baseline, §7
+  diagnostic-availability, §13 server-clock check, and §8–§10 live snapshots **could not be
+  collected**. They must be gathered during the Sep 15 window from an environment with provisioned
+  read-only access.
+- **Baseline (recorded, NOT re-verified this phase):** production `main` SHA
+  `a6b8c68ddd87e5d2a00c19485a2bf116285641fe`; image digest
+  `sha256:42e99cc5bd943a826569f38ca57546cf236d968b9381484301133a8eba4a4378` (from prior records — not
+  re-read live). Safety posture (strategies/session-authority/trading OFF; provider ON; RC 17; IPC
+  OFF) is the *expected* state but was **NOT verified** this phase → `PRODUCTION_BASELINE = UNVERIFIED`
+  (not a mismatch; simply not readable). The Sep 15 window must verify it first (§6).
+
+## Read-only code trace (repository, `main` a6b8c68)
+
+Decode → canonical event → validation:
+
+| Step | Location | Behaviour |
+|------|----------|-----------|
+| LTT field | `adapters/dhan/live.py:41-42` (`_QUOTE_PAYLOAD`/`_FULL_PAYLOAD` `struct` fmt) | `last_trade_time` is a signed **int32** in the binary payload. |
+| epoch → datetime | `adapters/dhan/live.py:551-554` `_epoch_timestamp(value)` | `return datetime.fromtimestamp(value, tz=UTC)` — interprets the LTT integer as a **POSIX epoch** and yields a UTC-displayed **aware** datetime. |
+| event stamp | `live.py:358,408,432,440,448` | `event_timestamp = _epoch_timestamp(last_trade_time)` for tick/quote/depth. |
+| future-time reject | `market_engine/validation.py:23,70` | `_MAX_FUTURE_SKEW = timedelta(minutes=1)`; `if event.event_timestamp > now + max_future_skew: return INVALID`. |
+| diagnostic | `market_engine/tick_diagnostics.py:96` (compute site; 33/51/120 = docstring/field/snapshot) | `_last_rejected_delta_seconds = (event_timestamp - now).total_seconds()` at the reject decision — the FIX-1 metric. |
+
+So a live tick whose `event_timestamp` is materially in the future (relative to the injected UTC
+`now`) is rejected `INVALID`, and the recorded delta is `event_timestamp - now`. The future-reject
+guard itself is correct (it must keep rejecting genuinely-future events — FIX-2B test T5); any defect
+is in the LTT **interpretation**, not the validator.
+
+## Dhan LTT timestamp semantics (§16 / §18)
+
+`DHAN_LTT_TIME_SEMANTICS = UNKNOWN (official) — official docs state EPOCH, timezone NOT stated.`
+
+- **VERIFIED_OFFICIAL** (dhanhq.co/docs/v2/live-market-feed, accessed 2026-09-13): LTT is an int32
+  field labelled "EPOCH"; timezone is **not stated**.
+- **VERIFIED_SDK** (DhanHQ-py `convert_to_date_time`, `src/dhanhq/dhanhq.py`): `IST =
+  timezone(timedelta(hours=5,minutes=30)); dt = datetime.fromtimestamp(epoch, IST)`.
+
+### Load-bearing subtlety (why the naive +5:30 hypothesis is NOT yet proven)
+
+`datetime.fromtimestamp(x, tz)` treats `x` as an **absolute POSIX instant** (seconds since the UTC
+epoch); the `tz` argument changes only the **display**, not the instant. Therefore the SDK's
+`fromtimestamp(value, IST)` and ApexScan's `fromtimestamp(value, UTC)` compute the **same absolute
+instant** from the same integer — `fromtimestamp(v, UTC) == fromtimestamp(v, IST)` as aware
+datetimes. Two consequences:
+
+1. The **UTC-vs-IST choice in the consumer does not, by itself, create a +5:30 instant error.** A
+   +5:30 future shift can only arise if the raw LTT integer is *not* a true POSIX epoch (i.e. it is an
+   IST wall-clock value stuffed into an epoch field, ≈ `true_utc_epoch + 19800`).
+2. If the raw value were IST-naive (+19800), the SDK's `fromtimestamp(value, IST)` absolute instant
+   would *also* be +19800 off — so the SDK's design (`fromtimestamp(epoch, IST)`) actually implies
+   Dhan sends a **true POSIX epoch** displayed in IST, under which **ApexScan's `fromtimestamp(value,
+   UTC)` is already the correct instant** and there would be no +5:30 error.
+
+**This means the original "LTT interpreted as UTC instead of IST → +5:30 future" hypothesis is in
+tension with the reference-SDK semantics.** It is not disproven — the FIX-1 production delta is real
+observed data — but it cannot be confirmed from code/docs alone, and a naive `timestamp -= 5:30`
+would be wrong if Dhan in fact sends a true epoch. (Caveat: the SDK evidence is from the REST/
+historical `convert_to_date_time` utility; the SDK's *marketfeed* LTT path was not separately
+confirmed and may differ — another reason to trace the raw value live.)
+
+**In-repo historical sibling.** A second identical helper `_epoch_timestamp` lives at
+`adapters/dhan/normalizer.py:449-450` (`datetime.fromtimestamp(_integral_number(value), tz=UTC)`),
+used at `normalizer.py:221` for **historical candle** start timestamps. The SDK's
+`convert_to_date_time` is itself the REST/historical utility, so the VERIFIED_SDK evidence most
+directly validates *this* historical path and only indirectly the live marketfeed path. FIX-2 must
+therefore decide **consciously** whether the REST/historical epoch shares the live LTT
+interpretation: the two helpers may need to diverge (live localizes an IST-naive value) or stay
+identical (both true epochs). Test T13 ("historical/non-live paths unaffected") is the guard, and it
+is uncheckable without naming this sibling.
+
+### The decisive live test (§14)
+
+Capture, for a **known** live trade during the Sep 15 session, the **raw LTT integer** and compute
+`fromtimestamp(raw, UTC)`; compare to the true UTC instant of that trade. **Use a liquid,
+actively-trading instrument** whose LTT is within seconds of now — an illiquid instrument's
+legitimately-lagged last trade could blur delta≈0 against delta≈19800; where possible compare
+against the exchange-published trade time rather than mere receive time:
+
+- If `fromtimestamp(raw, UTC) ≈ true instant` (delta ≈ 0) → Dhan sends a **true POSIX epoch**;
+  ApexScan is correct; the +delta in FIX-1 has another cause (§12) → **RC3 likely NO**.
+- If `fromtimestamp(raw, UTC) ≈ true instant + 19800` → Dhan sends an **IST-naive epoch**; the fix is
+  to interpret the decoded value as **IST wall-clock and localize** (not a blind subtraction) →
+  **RC3 = YES** (Hypothesis B, §16).
+
+## Alternative causes to rule out before confirming (§12)
+
+Host/container clock wrong (§13 — unverified, production inaccessible); stale previous-session LTT —
+but a *stale* prior-session LTT lies in the **past** (→ **negative** delta), so staleness alone
+cannot explain a **positive** future delta; the prior FIX-1 record (positive delta, +≈15310 s, not
+re-verified this phase) therefore argues *toward* a forward shift or a slow host clock and *against*
+pure staleness, which only sharpens the need for live current-session data; ms-vs-s unit error;
+decoder byte-offset / wrong field read as LTT; framing regression (framing fix `2deddf1` is in
+`main`; confirm no framing errors in the live snapshots — do not modify framing); session-calendar
+error.
+
+## Suspected root-cause candidate (§15 — NO CHANGE MADE)
+
+- `FILE` = `backend/app/adapters/dhan/live.py`
+- `SYMBOL` = `_epoch_timestamp` (line 551), feeding `event_timestamp` in `_decode_quote_packet` /
+  `_decode_full_packet`.
+- `CURRENT_BEHAVIOR` = treats the LTT int32 as a POSIX epoch → `datetime.fromtimestamp(value, UTC)`.
+- `EXPECTED_BEHAVIOR` = interpret LTT per Dhan's **actual** semantics as confirmed by the live
+  raw-value trace: if IST-naive, localize the value as IST wall-clock then convert to UTC (proper
+  tz handling, **never** a hardcoded `-5:30`, §17); if a true epoch, leave as-is and investigate the
+  other §12 causes. **Confidence: LOW-to-MEDIUM** — candidate localized, hypothesis not confirmed.
+
+## Sep 15 live-window collection plan (what to gather)
+
+Verify market open + real ticks flowing + current-session data (§2). Take snapshots A/B/C without
+restarting anything, recording per §9: `timestamp_ist, production_sha, ticks_received, ticks_accepted,
+total_rejected, rejected_invalid, other_reasons, clock_delta_seconds (min/max/typical),
+provider_connected, reconnect_count`, plus (where safely observable) the **raw LTT integer**, the
+decoded event datetime, and the receive datetime for ≥1 representative instrument. Also do the §13
+host/container clock sanity read. Then apply the §10 confirmation criteria and the decisive live test
+above.
+
+## Sep-15 post-market live evidence (production `65.2.105.7`, read-only)
+
+Collected **2026-09-15 ~12:13–12:40 UTC (~17:43–18:10 IST)**, NSE session closed, via read-only SSH
+to the authorized host only (`apexscan` alias → `65.2.105.7`; the forbidden `52.66.165.228` was never
+contacted). No mutation, restart, deploy, token, Dhan WS, or DB/Redis write.
+
+**Baseline (re-verified live).** `build_sha = a6b8c68…641fe` (matches `main`); image digest
+`sha256:42e99cc5…a4378` (matches expected); container `apexscan-backend` up since 2026-09-11
+11:39:45Z, **restarts=0** (ran continuously through today's session); `/health` live, `/health/ready`
+ready with `database/redis/provider = healthy`. Postgres 17 + Redis 7 healthy. Env flags:
+`MARKET_PROVIDER_ENABLED=true`; no `STRATEGIES_ENABLED` / trading / authority / `IPC_*` set (all
+default OFF); `references_received=0` ⇒ quote-mode / full-feed OFF. `PRODUCTION_BASELINE = VERIFIED`,
+no mismatch.
+
+**Server clock (rules out §14-A).** `timedatectl`: `Etc/UTC`, `System clock synchronized: yes`, NTP
+active; host time matched an independent clock at observation. The host/container clock is **correct**
+— the +delta is not a slow clock.
+
+**Genuine Sep-15 live session (established).** Dhan `POST /v2/marketfeed/ohlc → 200` at 03:50:48Z
+(09:20 IST, just after open); WebSocket feed active all session; near-close low-liquidity staleness
+produced **8 bounded reconnects between 09:47–09:57Z (15:17–15:27 IST)** — the adapter watchdog resets
+on **decoded** events (`adapter.py:554`), so these are normal boundary lulls, **not** a symptom of the
+timestamp defect. `0` ERROR/CRITICAL today.
+
+**FIX-1 diagnostics (`/api/v1/diagnostics/sector-shadow`, cumulative since 2026-09-11):**
+
+| metric | value |
+|---|---|
+| `ticks_received` | 4,910,810 |
+| `ticks_accepted` | 30,258 (**last accept 2026-09-11T15:59:10Z — none since; 0 today**) |
+| `ticks_rejected_total` | 4,880,552 |
+| `rejected_by_reason.invalid` | 4,814,579 (dominant) |
+| `rejected_by_reason.duplicate` / `.stale` | 65,973 / **0** |
+| `last_rejected_reason` | `invalid` |
+| `last_rejected_event_timestamp` (decoded) | 2026-09-15T15:59:33Z |
+| `last_rejection_observed_at` (now) | 2026-09-15T10:30:26Z (16:00 IST, **today**) |
+| **`last_rejected_event_clock_delta_seconds`** | **+19,746.65** (≈ +5h29m ≈ +19,800 − ~53 s trade→observe lag) |
+| `framing_failures` | **0** (framing fix `2deddf1` present in `a6b8c68`) |
+| decode failures | 521 / 4.91M (0.011 %, length-50 normalization) |
+
+**Interpretation.** The decoded `last_rejected_event_timestamp` (15:59:33 "UTC") is ~+5:30 ahead of a
+**correct** NTP `now` (10:30:26Z). Under a true-POSIX reading that instant is 21:29 IST (no trading);
+under an **IST-naive** reading the trade is 15:59 IST (plausible near-close) — the wall-clock digits
+equal the IST trade time, the classic IST-naive-epoch signature. The bug's impact is **downstream and
+silent**: every live tick is future-rejected at `validation.py`, so `ticks_accepted` stayed frozen at
+its Sep-11 value all session, the sector-shadow runtime evaluates on stale Sep-11 snapshots, yet
+`/health` still reports `provider: healthy`.
+
+**Raw-LTT decisive test (§10/§11) — UNRUNNABLE.** `_epoch_timestamp` (`live.py:551`) consumes the raw
+int32 inline (`datetime.fromtimestamp(value, UTC)`) and **no code logs the raw value**; the retained
+logs (Sep-11→now, within the 50 MB json-file window) contain **no** raw LTT and **no** per-event
+rejection lines. Per §19 the raw integer must **not** be reverse-engineered from the decoded value and
+called independent evidence. Only **one** decoded delta sample (the frozen post-close `last_rejected`)
+is available — the §12 requirement of ≥3 samples across ≥2 instruments is **unmet**, and post-close
+polling cannot produce new samples.
+
+**Alternative-cause matrix (§14).**
+
+| # | cause | verdict | basis |
+|---|---|---|---|
+| A | host/container clock wrong | **RULED_OUT** | NTP-synced UTC, verified |
+| B | stale previous-session LTT | **RULED_OUT** (for the +delta) | staleness ⇒ past ⇒ negative; observed is +future |
+| C | ms-vs-s | **RULED_OUT** | would give ~10⁹ s delta, not ~+19,800 |
+| D | wrong decoder field | **UNLIKELY** | consistent +5:30 across 4.81M, not garbage |
+| E | wrong byte offset | **UNLIKELY** | same; decode success 4.91M/4.91M |
+| F | framing regression | **RULED_OUT** | `2deddf1` in `a6b8c68`; `framing_failures=0` |
+| G | wrong event field as LTT | **UNLIKELY** | consistent signature |
+| H | session/calendar classification | **RULED_OUT** | does not shift per-event `event_timestamp−now` |
+| I | raw Dhan LTT non-standard (IST-naive) | **POSSIBLE — LEADING** | fits +19,800−lag; plausible IST trade time; SDK displays IST; **not proven without raw integer** |
+| J | diagnostic clock-domain mismatch | **UNLIKELY** | `now` is correct UTC; implausible-vs-plausible trade-time argues the displacement is real |
+
+**Follow-up diagnostic spec (§20 — SPEC ONLY, do NOT implement this phase).** Add bounded, sampled,
+**redacted** capture at the decode site (`live.py`, where `_epoch_timestamp` is called) recording
+`raw_ltt` (int), `decoded_event_timestamp`, `receive_timestamp`/`now`, `security_id`, event `kind`,
+and computed `delta_seconds`. Bound sampling (e.g. first N per session + ≤1 per instrument per M
+seconds, hard per-session cap) to avoid log flooding; gate behind a default-OFF config flag enabled
+only for the diagnostic session; cover ≥2 liquid instruments across open/mid/close. This yields the
+§11/§12 raw evidence to convert INCONCLUSIVE → YES/NO next session. No secrets.
+
+## Decision
+
+- `LIVE_FUTURE_TIMESTAMP_REJECTION = YES` — Sep-15 live session confirmed; genuine live ticks
+  future-rejected `invalid` (4.81M cumulative, 0 accepted today), stable **+19,746 s ≈ +5:30** delta
+  against a verified-correct clock; framing/clock/ms/staleness ruled out.
+- `RAW_LTT_SEMANTICS_PROVEN = NO` — the raw LTT integer is not retained (never logged); only one
+  decoded delta sample exists; §12 multi-sample raw evidence is unavailable and §19 forbids
+  reverse-derivation.
+- `RC3_CONFIRMED = INCONCLUSIVE` — evidence strongly favours Hypothesis B (IST-naive raw LTT) and
+  eliminates the other §14 causes, but the decisive raw-value test (§11) cannot be run on retained
+  data. Per §22, +19,800 alone does not force YES.
+- `READY_FOR_FIX2_IMPLEMENTATION = NO`; `FIX2A_FOLLOWUP_DIAGNOSTIC_REQUIRED = YES`.
+- Root-cause candidate (unchanged file/symbol; confidence raised LOW-MEDIUM → **MEDIUM-HIGH**):
+  `live.py:551 _epoch_timestamp` = `datetime.fromtimestamp(value, UTC)`; evidence-supported expected
+  behaviour = localise an IST-naive value as IST then convert to UTC (**never** a hardcoded `-5:30`),
+  pending raw-value confirmation and a conscious live-vs-historical (`normalizer.py:449`) decision.
+- Do **not** implement FIX-2. Do **not** hardcode a `-5:30` offset. Next action =
+  `MINIMAL_NEXT_LIVE_EVIDENCE_PLAN` (deploy the §20 diagnostic, collect raw LTT next session).
+
+## Decoupling consistency note (§23, do not act here)
+
+A future FIX-2 must be applied at the canonical event-construction boundary so the **same** timestamp
+semantics hold for both the legacy backend live path and the future `market-ingestion` canonical
+path — avoid two timestamp semantics. Note two `_epoch_timestamp` helpers already exist in-repo
+(`live.py:551` live LTT, `normalizer.py:449` historical candles); FIX-2 must decide per-path whether
+they converge, not blindly edit one. The decoupling/holiday branch is **not** modified by this
+phase.
+
+## Provisional FIX-2B test matrix (only if RC3 later confirms — §22)
+
+T1 documented Dhan LTT converts correctly · T2 canonical timestamp tz-aware · T3 live-equivalent
+event no longer +5:30 future · T4 valid current event accepted · **T5 genuinely-future event still
+rejected** · T6 stale behaviour unchanged · T7 IST-midnight boundary · T8 UTC-midnight does not
+mis-set trading date · T9 09:15 open · T10 close/session boundaries · T11 stacked-frame parsing
+unaffected · T12 RequestCode-17 quote decode unaffected · T13 historical/non-live paths unaffected ·
+T14 weekend/holiday classification unaffected.
