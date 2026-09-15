@@ -157,6 +157,23 @@ async def test_h9a_t15_diagnostics_bounded(redis: Redis) -> None:
 
 
 # =========================================================================== #
+# T15b: a corrupt/tampered owner record fails closed (validate/snapshot never raise)
+# =========================================================================== #
+@pytest.mark.parametrize("corrupt", [b"not-json{", b"[]", b'{"owner_role": "backend"}'])
+async def test_h9a_t15b_corrupt_record_fails_closed(redis: Redis, corrupt: bytes) -> None:
+    coord = _coordinator(redis)
+    lease = await coord.acquire(OwnerRole.BACKEND, "backend-1")
+    assert lease is not None
+    await redis.set(coord._config.owner_key, corrupt)  # tamper: unparseable / wrong-shape record
+
+    # A record that cannot be decoded into an owner grants nobody ownership, and never raises.
+    assert await coord.validate(lease) is False
+    snap = await coord.snapshot()
+    assert snap.has_owner is False
+    assert snap.redis_error_total >= 1  # the failed decode is counted, not swallowed silently
+
+
+# =========================================================================== #
 # I01: backend vs ingestion race — exactly one winner
 # =========================================================================== #
 async def test_h9a_i01_backend_vs_ingestion_race_single_winner(redis: Redis) -> None:

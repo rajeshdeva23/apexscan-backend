@@ -42,9 +42,11 @@ cycles: generations are strictly increasing, contiguous under a live Redis, neve
 ## Redis failure behaviour
 
 Acquire/renew/validate against an unavailable Redis all fail closed (no ownership granted); a
-snapshot read fails closed to "no owner". A `Redis reset` (fence + key gone) is detected by B11/H8C
-and, because the record is absent, a stale holder still fails `validate` — so a reset can never
-resurrect stale ownership. (ADR-030 fencing-durability note.)
+snapshot read fails closed to "no owner". A **corrupt/undecodable owner record** is treated exactly
+like an unreadable one — `validate`/`snapshot` return "no owner" (never raise, never grant), and the
+failed decode is counted in `redis_error_total`. A `Redis reset` (fence + key gone) is detected by
+B11/H8C and, because the record is absent, a stale holder still fails `validate` — so a reset can
+never resurrect stale ownership. (ADR-030 fencing-durability note.)
 
 ## Ownership precedes the provider
 
@@ -83,7 +85,8 @@ secrets are not moved (backend keeps `dhan.env` through cutover+rollback; H10 re
   bounds, import purity.
 - `tests/integration/test_market_ingestion_ownership_redis.py` (real `redislite`) — acquire/conflict/
   same-role-race, renew/release/validate + stale rejection, TTL expiry + higher-fence re-acquire,
-  fail-closed on Redis unavailable, bounded diagnostics, 1,000-race contention (never two owners),
+  fail-closed on Redis unavailable, fail-closed on a corrupt/undecodable record, bounded
+  diagnostics, 1,000-race contention (never two owners),
   1,000-generation fencing monotonicity, offline cutover + rollback rehearsals
   (`MAX_CONCURRENT_PROVIDER_OWNERS == 1`), and safe cutover-halt on contention.
 - `tests/architecture/test_market_ipc_import_boundary.py` — ownership imports no
@@ -91,7 +94,11 @@ secrets are not moved (backend keeps `dhan.env` through cutover+rollback; H10 re
 
 ## Residual gates before H9B
 
-Production deployment of the interlock in both services; the governed cutover/rollback runbook
-(`H9B-single-owner-cutover-runbook.md`, DRAFT — not authorized for execution); the Dhan token plan;
-Redis durability policy pinned (B11 op-side); FIX-2 for live correctness; ADR-028/029 acceptance for
-IPC authority. `READY_FOR_H9B` stays gated on these.
+Real provider binding — the module enforces the lease contract but does not itself bind a Dhan
+provider; `acquire → validate → connect` and `lose-lease → stop` are only rehearsed with fakes here,
+so H9B must wire and prove them against the real provider lifecycle. A unique per-incarnation
+`instance_id` (e.g. `uuid4`, not a fixed container name) must be enforced at composition so a
+fence-reset cannot collide with a reused id. Production deployment of the interlock in both services;
+the governed cutover/rollback runbook (`H9B-single-owner-cutover-runbook.md`, DRAFT — not authorized
+for execution); the Dhan token plan; Redis durability policy pinned (B11 op-side); FIX-2 for live
+correctness; ADR-028/029 acceptance for IPC authority. `READY_FOR_H9B` stays gated on these.

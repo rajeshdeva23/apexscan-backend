@@ -234,7 +234,7 @@ class RedisOwnershipCoordinator:
 
     async def validate(self, lease: OwnershipLease) -> bool:
         """Whether this exact lease is still the current owner; fails closed on a Redis error."""
-        record = await self._read(fail_closed=True)
+        record = await self._read()
         if record is None:
             return False
         return (
@@ -249,7 +249,7 @@ class RedisOwnershipCoordinator:
 
     async def snapshot(self) -> OwnershipSnapshot:
         """Bounded ownership diagnostics; the current-owner read fails closed to 'no owner'."""
-        record = await self._read(fail_closed=True)
+        record = await self._read()
         return OwnershipSnapshot(
             has_owner=record is not None,
             owner_role=record.owner_role if record else None,
@@ -264,20 +264,23 @@ class RedisOwnershipCoordinator:
             redis_error_total=self._redis_error,
         )
 
-    async def _read(self, *, fail_closed: bool) -> OwnershipRecord | None:
+    async def _read(self) -> OwnershipRecord | None:
+        """Read the current owner; fail closed to ``None`` on any Redis *or* record-decode error.
+
+        A corrupt/tampered record is treated exactly like an unreadable one — it can never be
+        decoded into a valid owner, so it grants no permission to own and is counted as an error.
+        """
         try:
             raw = await self._redis.get(self._config.owner_key)
-        except RedisError:
-            self._redis_error += 1
-            if fail_closed:
+            if raw is None:
                 return None
-            raise
-        if raw is None:
+            data = json.loads(raw)
+            return OwnershipRecord(
+                owner_role=str(data["owner_role"]),
+                instance_id=str(data["instance_id"]),
+                fencing_generation=int(data["fencing_generation"]),
+                acquired_at_ms=int(data["acquired_at_ms"]),
+            )
+        except (RedisError, ValueError, KeyError, TypeError):
+            self._redis_error += 1
             return None
-        data = json.loads(raw)
-        return OwnershipRecord(
-            owner_role=str(data["owner_role"]),
-            instance_id=str(data["instance_id"]),
-            fencing_generation=int(data["fencing_generation"]),
-            acquired_at_ms=int(data["acquired_at_ms"]),
-        )
