@@ -302,3 +302,25 @@ def test_h8c_b11_loss_detection_touches_no_authority_broker_or_fix_surface() -> 
         {m for path in (module, test) for m in _modules(path) for f in forbidden if _matches(m, f)}
     )
     assert offending == [], f"H8C loss-detection imported forbidden surface: {offending}"
+
+
+def test_h9a_ownership_interlock_touches_no_authority_broker_or_api() -> None:
+    """H9A: the single-owner interlock is a broker-neutral Redis lease — no authority/broker/API.
+
+    The ownership coordinator gates *permission* to establish the provider session; it must not
+    import the TickEngine/MarketContext authority, a strategy/session path, a Dhan broker adapter or
+    auth, or an API route — so it stays a pure cross-process safety primitive (ADR-030).
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "app.api",
+        "pyotp",
+        "websockets",
+    )
+    module = _APP_ROOT / "market_ingestion" / "ownership.py"
+    offending = sorted({m for m in _modules(module) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"H9A ownership imported forbidden surface: {offending}"

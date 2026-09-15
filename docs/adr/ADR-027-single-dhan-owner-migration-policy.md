@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed (DESIGN / ROADMAP AMENDMENT — no implementation, no activation, no real Dhan) |
+| **Status** | Accepted (2026-09-15; the open single-owner interlock decision below is ratified as **Option I2** via ADR-030 — no production activation, no real Dhan) |
 | **Date** | 2026-09-13 |
 | **Deciders** | Platform / Market-Ingestion Decoupling Architecture |
 | **Amends** | ADR-025 (rollout/migration sequence), ADR-026 (§B6 live-shadow sub-decision & recommended subphases) |
@@ -100,7 +100,12 @@ H10 = remove backend Dhan ownership/secrets (B10 completion)
 Labels may be refined by later phases, but **no risk gate may be silently collapsed**. `H8A/B/C`
 (B2/B4/B11) and a proven single-owner interlock are **mandatory before IPC authority** (H9C).
 
-## Single-owner interlock — ARCHITECTURE_DECISION_REQUIRED (open)
+## Single-owner interlock — RATIFIED as Option I2 (ADR-030)
+
+> **Update (2026-09-15, H9A):** the open decision below is **resolved** — **Option I2 (Redis
+> ownership lease + fencing token)** is adopted and specified in **ADR-030**, implemented offline in
+> H9A. The original open-decision text is retained below for the record.
+
 
 The existing controls are **insufficient** to *hard-guarantee* cross-process XOR:
 
