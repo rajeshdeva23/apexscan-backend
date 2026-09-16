@@ -169,6 +169,14 @@ class MarketIngestionService:
             self._status = ServiceStatus.DISABLED
             logger.info("market-ingestion service disabled; inert (no Dhan/IPC/Redis activity)")
             return
+        if self._status is not ServiceStatus.NOT_STARTED:
+            # Idempotent boot (matches boundary.start()/publisher.start()): a repeated or
+            # concurrent start() must never spawn a second provider connect / supervisor loop.
+            # The guard and the STARTING transition below run with no intervening await, so a
+            # concurrent second start() sees STARTING and returns instead of racing a second
+            # incarnation into existence.
+            logger.info("market-ingestion start() ignored; service already %s", self._status.value)
+            return
         self._require_composition()
         self._status = ServiceStatus.STARTING
         try:
