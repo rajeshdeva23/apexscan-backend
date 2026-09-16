@@ -44,6 +44,7 @@ from app.market_ipc.envelope import (
     decode_envelope,
 )
 from app.market_ipc.events import EventKind, IpcPayload, decode_payload
+from app.market_ipc.loss_detection import ConsumerProgressEvidence
 from app.market_ipc.transport import _CURSOR_START, MarketEventStream, RawDeliveredEvent
 
 # The consumer's current trading-date authority (in production: MarketSessionClassifier); the
@@ -164,6 +165,8 @@ class ConsumerDiagnostics(BaseModel):
     pending_reclaim_failures: int
     pending_reclaimed_applied: int
     pending_reclaimed_duplicates: int
+    last_applied_epoch: int | None
+    last_applied_sequence: int | None
     last_received_at: datetime | None
     last_applied_at: datetime | None
     last_ack_at: datetime | None
@@ -198,6 +201,8 @@ class MarketEventConsumer:
         self._dedup = deduplicator
         self._counters = _ConsumerCounters()
         self._running = False
+        self._last_applied_epoch: int | None = None
+        self._last_applied_sequence: int | None = None
         self._last_received_at: datetime | None = None
         self._last_applied_at: datetime | None = None
         self._last_ack_at: datetime | None = None
@@ -403,7 +408,32 @@ class MarketEventConsumer:
             return self._record_dedup_failure()
         self._counters.applied += 1
         self._last_applied_at = self._now()
+        self._advance_last_applied(identity)
         return await self._finalize(message_id, MessageOutcome.APPLIED)
+
+    def _advance_last_applied(self, identity: ProducerEventIdentity) -> None:
+        """Track the highest durably-applied ``(epoch, sequence)`` (B11 consumer progress; H9B).
+
+        Monotonic within a lineage: a newer epoch replaces the position; a higher sequence in the
+        current epoch advances it; a reclaimed/out-of-order older entry never rewinds it. Called
+        only after the durable dedup mark commits, so it reflects successfully applied progress —
+        never a merely-read event (preserves the H8A apply→mark boundary).
+        """
+        epoch, sequence = identity.producer_epoch, identity.producer_sequence
+        if self._last_applied_epoch is None or epoch > self._last_applied_epoch:
+            self._last_applied_epoch = epoch
+            self._last_applied_sequence = sequence
+        elif epoch == self._last_applied_epoch and (
+            self._last_applied_sequence is None or sequence > self._last_applied_sequence
+        ):
+            self._last_applied_sequence = sequence
+
+    def consumer_progress(self) -> ConsumerProgressEvidence:
+        """The last canonical identity this consumer durably applied (B11 evidence input)."""
+        return ConsumerProgressEvidence(
+            last_applied_epoch=self._last_applied_epoch,
+            last_applied_sequence=self._last_applied_sequence,
+        )
 
     def _record_dedup_failure(self) -> MessageOutcome:
         """Count a durable-dedup store failure and fail closed (entry left pending)."""
@@ -466,6 +496,8 @@ class MarketEventConsumer:
             pending_reclaim_failures=counters.reclaim_failures,
             pending_reclaimed_applied=counters.reclaimed_applied,
             pending_reclaimed_duplicates=counters.reclaimed_duplicates,
+            last_applied_epoch=self._last_applied_epoch,
+            last_applied_sequence=self._last_applied_sequence,
             last_received_at=self._last_received_at,
             last_applied_at=self._last_applied_at,
             last_ack_at=self._last_ack_at,

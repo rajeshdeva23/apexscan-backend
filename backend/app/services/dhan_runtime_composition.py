@@ -16,6 +16,8 @@ cleanup. It starts no live stream and owns no long-running task — that is RUN-
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -49,6 +51,11 @@ from app.market_engine.historical.service import HistoricalWarmupService
 from app.market_engine.sequence import SequenceGenerator
 from app.market_engine.session import MarketSessionClassifier, SessionSchedule
 from app.market_engine.tick_diagnostics import TickEngineDiagnostics
+from app.market_ingestion.ownership import OwnerRole
+from app.market_ingestion.ownership_runtime import (
+    ProviderOwnershipGuard,
+    build_provider_ownership_guard,
+)
 from app.market_intelligence.sector import MembershipResolver, load_sector_membership_dataset
 from app.schemas.market_data import (
     FeedContinuityEvent,
@@ -183,16 +190,25 @@ class RuntimeComposition:
 
     runtime: LiveMarketRuntime
     provider_coordinator: ProviderCoordinator | None
+    ownership_guard: ProviderOwnershipGuard | None = None
 
     async def start(self) -> None:
         """Start the runtime (subscribe the manager) after the core is fully composed."""
         await self.runtime.start()
 
     async def shutdown(self) -> None:
-        """Shut down the runtime, then the provider lifecycle (idempotent, no leak)."""
+        """Shut down the runtime, provider, then release the ownership lease (idempotent, no leak).
+
+        Ordering (ADR-030 §9): the fenced lease is released only AFTER the provider is disconnected,
+        so ownership is never yielded while a Dhan connection is still live. ``release`` refuses to
+        touch a lease already lost, so a fail-closed-on-loss shutdown never deletes a newer owner's
+        fencing state.
+        """
         await self.runtime.shutdown()
         if self.provider_coordinator is not None:
             await self.provider_coordinator.shutdown()
+        if self.ownership_guard is not None:
+            await self.ownership_guard.release()
 
 
 def _canonical_cash_equity_universe(live: DhanCashEquityLiveUniverse) -> tuple[Instrument, ...]:
@@ -357,6 +373,25 @@ async def _safe_shutdown(coordinator: ProviderCoordinator) -> None:
         logger.exception("provider cleanup failed while unwinding runtime composition")
 
 
+async def _acquire_backend_ownership(guard: ProviderOwnershipGuard | None) -> None:
+    """Acquire + validate the fenced BACKEND lease and start renewal, BEFORE the token mint (H9B).
+
+    ADR-030 §6/§10: a conflict (the ingestion owner holds the lease) raises
+    :class:`OwnershipAcquisitionError` here, so the caller never reaches ``coordinator.start`` — the
+    token mint. A no-op when ownership is not wired (default/offline).
+    """
+    if guard is None:
+        return
+    await guard.acquire_or_fail()
+    guard.start_renewal()
+
+
+async def _release_backend_ownership(guard: ProviderOwnershipGuard | None) -> None:
+    """Release/close the fenced lease during fail-closed unwinding; no-op when unwired/unowned."""
+    if guard is not None:
+        await guard.release()
+
+
 def _live_session_classifier(
     *, settings: Settings, dataset: TradingCalendarDataset
 ) -> MarketSessionClassifier:
@@ -449,6 +484,7 @@ async def compose_market_runtime(
     catalog: StrategyCatalog | None = None,
     clock: Clock | None = None,
     sequence: SequenceGenerator | None = None,
+    ownership: ProviderOwnershipGuard | None = None,
 ) -> RuntimeComposition:
     """Compose the live-market runtime, resolving the universe only when provider-enabled.
 
@@ -480,6 +516,10 @@ async def compose_market_runtime(
             fails closed (``UnknownEnabledStrategyError``, provider coordinator cleaned up).
         clock: Injected clock; production uses the system clock.
         sequence: Injected sequence generator.
+        ownership: The fenced provider-ownership guard (ADR-030 H9B). Injected by tests; otherwise
+            built from settings when ``market_ownership_enabled`` (else ``None`` — unchanged legacy
+            behaviour). When present, the BACKEND lease is acquired and validated BEFORE the token
+            mint, and released on shutdown; the two market paths compete for one authority domain.
 
     Raises:
         UniverseResolutionError: If the enabled universe is empty or has duplicates.
@@ -511,8 +551,14 @@ async def compose_market_runtime(
             live_continuity_sink=sink,
             live_session_predicate=session_gate,
         )
+    guard = (
+        ownership
+        if ownership is not None
+        else build_provider_ownership_guard(settings, OwnerRole.BACKEND)
+    )
     coordinator = ProviderCoordinator(cast("BrokerAdapter", provider))
     try:
+        await _acquire_backend_ownership(guard)  # fenced lease BEFORE the token mint (ADR-030 §6)
         await coordinator.start(settings.provider_lifecycle_timeout_seconds)
         await provider.load_instruments()
         universe = _canonical_cash_equity_universe(provider.load_nse_cash_equity_live_universe())
@@ -520,6 +566,7 @@ async def compose_market_runtime(
         entries = (catalog or production_catalog()).resolve(settings.strategies_enabled_list)
     except BaseException:
         await _safe_shutdown(coordinator)
+        await _release_backend_ownership(guard)  # release/close if acquired; no-op otherwise
         raise
     requirements_factory = _dhan_requirements_factory(
         provider=provider, settings=settings, dataset=dataset, clock=clock
@@ -569,7 +616,9 @@ async def compose_market_runtime(
             return state is MarketState.LIVE_SESSION
 
         session_gate.bind(_in_live_session)
-    return RuntimeComposition(runtime=runtime, provider_coordinator=coordinator)
+    return RuntimeComposition(
+        runtime=runtime, provider_coordinator=coordinator, ownership_guard=guard
+    )
 
 
 class LiveMarketRuntimeDependency:
@@ -603,6 +652,7 @@ class LiveMarketRuntimeDependency:
         self._clock = clock or SystemClock()
         self._sequence = sequence
         self._composition: RuntimeComposition | None = None
+        self._ownership_watch: asyncio.Task[None] | None = None
 
     async def start(self, timeout_seconds: float) -> None:
         """Compose and start the runtime, idempotently.
@@ -627,6 +677,24 @@ class LiveMarketRuntimeDependency:
             await composition.shutdown()
             raise
         self._composition = composition
+        if composition.ownership_guard is not None:
+            self._ownership_watch = asyncio.create_task(self._watch_ownership_loss())
+
+    async def _watch_ownership_loss(self) -> None:
+        """Fail closed if the fenced BACKEND lease is lost while running (ADR-030 §8/§21).
+
+        A stale backend owner must not keep the Dhan connection: on loss, shut the composition down
+        (which disconnects the provider). Uses ``composition.shutdown`` directly — not
+        ``self.shutdown`` — so this task never cancels itself.
+        """
+        composition = self._composition
+        if composition is None or composition.ownership_guard is None:
+            return
+        await composition.ownership_guard.wait_lost()
+        self._composition = None
+        self._ownership_watch = None
+        logger.warning("backend provider ownership lost; shutting down the live-market runtime")
+        await composition.shutdown()
 
     async def verify_health(self) -> ProviderHealth:
         """Report HEALTHY only when the provider is healthy and ingestion is alive."""
@@ -651,6 +719,12 @@ class LiveMarketRuntimeDependency:
 
     async def shutdown(self) -> None:
         """Shut the runtime down (ingestion → manager → provider); safe if never started."""
+        watch = self._ownership_watch
+        self._ownership_watch = None
+        if watch is not None and not watch.done():
+            watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch
         composition = self._composition
         self._composition = None
         if composition is not None:

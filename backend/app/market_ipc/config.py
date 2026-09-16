@@ -23,6 +23,13 @@ class MarketIpcConfig(BaseModel):
     consumer_name: str = Field(default="backend-0", min_length=1, max_length=128)
     reference_key_prefix: str = Field(default="md:reference", min_length=1, max_length=128)
     health_key: str = Field(default="md:health", min_length=1, max_length=128)
+    # md:health conveyance (H9B). ``health_ttl_seconds`` bounds how long an unrefreshed snapshot
+    # survives in Redis; ``health_stale_seconds`` is the reader's fail-closed freshness deadline —
+    # a snapshot older than this yields no producer evidence (B11 fails closed). Keep the TTL >=
+    # the staleness deadline so a still-fresh snapshot is never evicted before it is considered
+    # stale. Off with everything else until composed.
+    health_ttl_seconds: int = Field(default=30, ge=1, le=3_600)
+    health_stale_seconds: float = Field(default=15.0, gt=0, le=3_600)
     maxlen: int = Field(default=100_000, ge=1_000, le=10_000_000)
     read_count: int = Field(default=100, ge=1, le=10_000)
     block_ms: int = Field(default=5_000, ge=0, le=60_000)
@@ -61,6 +68,18 @@ class MarketIpcConfig(BaseModel):
     def _dedup_outlives_redelivery_horizon(self) -> Self:
         """Fail closed at construction unless the B4 retention invariant holds (ADR-028)."""
         validate_retention_invariant(self)
+        return self
+
+    @model_validator(mode="after")
+    def _health_ttl_outlives_staleness(self) -> Self:
+        """Require the md:health TTL to be >= the reader's staleness deadline (H9B)."""
+        if self.health_ttl_seconds < self.health_stale_seconds:
+            raise ValueError(
+                "health_ttl_seconds "
+                f"({self.health_ttl_seconds}) must be >= health_stale_seconds "
+                f"({self.health_stale_seconds}) so a still-fresh md:health snapshot is not evicted "
+                "before the reader would consider it stale."
+            )
         return self
 
 

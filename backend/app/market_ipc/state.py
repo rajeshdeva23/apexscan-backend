@@ -123,11 +123,19 @@ class InMemoryCompactedReferenceStore:
 
 
 class IngestionHealthState(BaseModel):
-    """Broker-neutral ingestion health snapshot published to ``md:health`` (future).
+    """Broker-neutral ingestion health snapshot published to ``md:health``.
 
     Independent signals (DESIGN-REVIEW-2 §20): the API being up never implies market-data
     health. ``market_data_age_seconds`` is the freshness signal; ``universe_sync`` reports
     producer/consumer universe-version agreement.
+
+    This is the SINGLE health truth conveyed producer→backend (H9B). It also carries the three
+    producer L1 publication-continuity facts the consume-side loss detector (B11, ADR-025) needs —
+    ``last_published_sequence``, ``terminal_publication_break``, ``publication_outcome_uncertain`` —
+    so the backend reconciles a downstream absence against the producer's confirmed position without
+    a second, competing continuity record. They mirror
+    :meth:`ProducerPublicationEvidence.from_continuity` exactly, and
+    :meth:`ProducerPublicationEvidence.from_ingestion_health` reads them back.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, str_strip_whitespace=True)
@@ -140,6 +148,12 @@ class IngestionHealthState(BaseModel):
     universe_sync: ProviderStatus = ProviderStatus.UNKNOWN
     market_data_age_seconds: float | None = Field(default=None, ge=0)
     last_event_at: datetime | None = None
+    # B11 producer L1 evidence (ADR-025): the confirmed (D1-acked) published position and the
+    # terminal-break / uncertain-outcome distinctions, so a missing downstream event is attributed
+    # to the producer rather than to a Redis loss.
+    last_published_sequence: int | None = Field(default=None, ge=0)
+    terminal_publication_break: bool = False
+    publication_outcome_uncertain: bool = False
 
     _validate_updated_at = field_validator("updated_at")(_require_aware)
 

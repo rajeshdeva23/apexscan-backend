@@ -111,23 +111,27 @@ def test_reference_recovery_is_not_constructed_by_composition() -> None:
     assert constructors == {}, f"reference recovery constructed in composition: {constructors}"
 
 
-def test_consumer_runtime_is_not_wired_into_startup() -> None:
-    """H4A is offline: no production module (outside market_ipc) builds or composes the runtime.
+def test_consumer_runtime_is_composed_only_at_the_sanctioned_backend_seam() -> None:
+    """H9B §17: the consumer runtime is wired into the backend root through ONE sanctioned seam.
 
-    The shadow consumer runtime must be reachable only through explicit test/offline composition,
-    so merging H4A activates no backend consumer and cannot begin the (forbidden) Redis -> backend
-    -> TickEngine cutover.
+    Since H9B the backend root composes the runtime over a shared aware-UTC clock, but it stays
+    NON-AUTHORITATIVE and inert under the default LEGACY_ONLY flag shape (no Redis client, no poll
+    task) — it never begins the (still-forbidden, H9C-governed) Redis -> backend -> TickEngine
+    cutover. This guardrail confirms the composition seam ``compose_consumer_runtime`` is reachable
+    only from ``services/backend_consumer_runtime.py``; no other production module builds the
+    runtime directly, so the wiring cannot sprawl or be quietly activated elsewhere.
     """
     seams = ("MarketEventConsumerRuntime(", "compose_consumer_runtime(")
+    allowed = {_APP_ROOT / "services" / "backend_consumer_runtime.py"}
     wired: dict[str, list[str]] = {}
     for path in sorted(_APP_ROOT.rglob("*.py")):
-        if path.is_relative_to(_APP_ROOT / "market_ipc"):
+        if path.is_relative_to(_APP_ROOT / "market_ipc") or path in allowed:
             continue
         text = path.read_text(encoding="utf-8")
         hits = [name for name in seams if name in text]
         if hits:
             wired[str(path)] = hits
-    assert wired == {}, f"consumer runtime wired into composition: {wired}"
+    assert wired == {}, f"consumer runtime composed outside the sanctioned backend seam: {wired}"
 
 
 def test_consumer_runtime_imports_no_producer_or_provider_surface() -> None:

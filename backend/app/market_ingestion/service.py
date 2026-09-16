@@ -33,6 +33,10 @@ from app.market_ingestion.mode import (
     derive_market_path_mode,
     validate_phase_h_flags,
 )
+from app.market_ingestion.ownership_runtime import (
+    OwnershipAcquisitionError,
+    ProviderOwnershipGuard,
+)
 from app.market_ingestion.sink import EventSink, ProviderOnlyEventSink
 from app.market_ingestion.supervisor import ProviderSupervisor
 from app.schemas.market_data import SubscriptionRequest
@@ -95,6 +99,7 @@ class MarketIngestionService:
         provider: BrokerAdapter | None = None,
         subscription_request: SubscriptionRequest | None = None,
         publication: PublicationStack | None = None,
+        ownership: ProviderOwnershipGuard | None = None,
         provider_lifecycle_timeout_seconds: float = 30.0,
         supervisor_max_reconnects: int | None = None,
         supervisor_sleep: Callable[[float], Awaitable[None]] | None = None,
@@ -107,6 +112,7 @@ class MarketIngestionService:
         self._provider = provider
         self._request = subscription_request
         self._publication = publication
+        self._ownership = ownership
         self._timeout = provider_lifecycle_timeout_seconds
         self._max_reconnects = supervisor_max_reconnects
         self._supervisor_sleep = supervisor_sleep
@@ -180,6 +186,7 @@ class MarketIngestionService:
         self._require_composition()
         self._status = ServiceStatus.STARTING
         try:
+            await self._acquire_ownership()  # fenced lease BEFORE any token mint / provider connect
             if self.publisher_mode:
                 await self._start_publication()  # M1 epoch → L1 incarnation → observer
             await self._start_provider()  # connect + health, then the stream supervisor
@@ -188,6 +195,21 @@ class MarketIngestionService:
             await self._cleanup_after_failed_start()
             self._status = ServiceStatus.FAILED
             raise
+
+    async def _acquire_ownership(self) -> None:
+        """Acquire + validate the fenced provider-ownership lease, then start renewal (H9B).
+
+        The hard ordering invariant (ADR-030 §6): a valid lease is held BEFORE the provider connect
+        / token mint. A loss detected while running trips the terminal event, so the terminal
+        watcher fails closed. A no-op when ownership is not wired (default/offline).
+        """
+        if self._ownership is None:
+            return
+        self._ownership.set_on_ownership_lost(self._terminal.set)
+        await self._ownership.acquire_or_fail()  # raises OwnershipAcquisitionError → fail closed
+        self._ownership.start_renewal()
+        if not self.publisher_mode:  # publisher mode starts the watcher in _start_publication
+            self._watch_task = asyncio.create_task(self._watch_terminal())
 
     def _require_composition(self) -> None:
         """Fail fast if the enabled service lacks its required injected composition."""
@@ -219,6 +241,12 @@ class MarketIngestionService:
 
     async def _start_provider(self) -> None:
         """Connect + health-check the provider, then start the ordered stream supervisor."""
+        if self._ownership is not None and not await self._ownership.validate():
+            # Belt-and-braces (ADR-030 §7): ownership was lost between acquire and connect. Never
+            # mint a token / open the provider without a currently-valid lease.
+            raise OwnershipAcquisitionError(
+                "provider-ownership lease was lost before the provider connect (fail closed)"
+            )
         self._coordinator = ProviderCoordinator(self._provider)
         await self._coordinator.start(self._timeout)
         self._provider_connected = True
@@ -237,6 +265,7 @@ class MarketIngestionService:
             max_reconnects=self._max_reconnects,
             on_disconnect=on_disconnect,
             on_reconnect=on_reconnect,
+            reconnect_guard=self._ownership.validate if self._ownership is not None else None,
         )
         self._supervisor_task = asyncio.create_task(self._supervisor.run())
         self._supervisor_task.add_done_callback(self._on_supervisor_done)
@@ -279,6 +308,7 @@ class MarketIngestionService:
         if self._coordinator is not None:
             with contextlib.suppress(Exception):
                 await self._coordinator.shutdown()
+        await self._release_ownership()  # no-op if the lease was already lost (never re-release)
 
     async def _cleanup_after_failed_start(self) -> None:
         """Unwind anything started during a failed start (reverse order; no leaked task/conn)."""
@@ -289,6 +319,7 @@ class MarketIngestionService:
         if self._coordinator is not None:
             with contextlib.suppress(Exception):
                 await self._coordinator.shutdown()
+        await self._release_ownership()  # release a lease acquired before the start failed
         if self.publisher_mode and self._publication is not None:
             with contextlib.suppress(Exception):
                 await self._publication.boundary.stop()
@@ -304,6 +335,7 @@ class MarketIngestionService:
         if self._coordinator is not None:  # disconnect provider
             with contextlib.suppress(Exception):
                 await self._coordinator.shutdown()
+        await self._release_ownership()  # clean stop: release the lease AFTER the provider is down
         if self.publisher_mode and self._publication is not None:  # M2 bounded drain → L1 final
             result = await self._publication.boundary.stop()
             self._publication.continuity.drain_completed(result)
@@ -313,6 +345,18 @@ class MarketIngestionService:
         self._observer_task = self._watch_task = None
         self._provider_connected = False
         self._status = ServiceStatus.STOPPED
+
+    async def _release_ownership(self) -> None:
+        """Release the fenced lease iff this incarnation still cleanly owns it (idempotent).
+
+        ``release`` cancels the renewal loop and, per ADR-030 §8, refuses to release a lease that
+        was already lost — so a fail-closed-on-loss never deletes a newer owner's fencing state. A
+        no-op when ownership is not wired.
+        """
+        if self._ownership is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._ownership.release()
 
     async def _close_publication(self) -> None:
         """Close the stack-owned Redis client exactly once, after M2 has drained (idempotent).
