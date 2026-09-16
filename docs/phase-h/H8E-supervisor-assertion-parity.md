@@ -44,7 +44,7 @@ provider stream loops), plus a second observer/watch task. Reproduced tests-firs
 **Fix (smallest owning-layer correction):** a guard at the top of `start()` —
 `if self._status is not ServiceStatus.NOT_STARTED: return` — placed so the guard and the `STARTING`
 transition run with no intervening `await`, making it safe against both repeated **and** concurrent
-starts. Matches the sibling idempotent-`start()` pattern. Diff = **+12/-0 in one file**
+starts. Matches the sibling idempotent-`start()` pattern. Diff = **+8/-0 in one file**
 (`app/market_ingestion/service.py`). Mutation-verified: disabling the guard fails both `test_h8e_c_*`.
 
 ## Test evidence
@@ -74,7 +74,9 @@ provider; real decoupled composition):
 ## Determinism
 No test gates correctness on a real sleep: supervisor backoff uses an injected recording sleeper
 (`asyncio.sleep(0)`); event/reconnect waits are condition-gated polls with a large iteration cap used
-only as deadlock protection; parity is asserted via `compare()`.
+only as deadlock protection; parity is asserted via `compare()`. (The L1 observer's ~5 ms background
+tick and the 1 ms poll cadence are present but non-gating — no assertion depends on elapsed
+wall-time; consumer `block_ms=0` so reads never block.)
 
 ## Regression
 - H8E targeted: 5 passed.
