@@ -209,6 +209,11 @@ class MarketEventConsumer:
         self._last_error_at: datetime | None = None
         self._last_event_age_ms: float | None = None
 
+    @property
+    def sink(self) -> ShadowMarketEventSink:
+        """The destination events are applied to (so a runtime can seed it before the poll loop)."""
+        return self._sink
+
     async def start(self) -> None:
         """Ensure the Redis consumer group (and stream) exists; idempotent. Fail closed on B4.
 

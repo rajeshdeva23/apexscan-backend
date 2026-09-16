@@ -21,6 +21,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
@@ -43,8 +44,13 @@ from app.schemas.market_data import SubscriptionRequest
 
 if TYPE_CHECKING:
     from app.market_ingestion.publication import PublicationStack
+    from app.market_ipc.health import IngestionHealthPublisher
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class ServiceStatus(StrEnum):
@@ -100,11 +106,13 @@ class MarketIngestionService:
         subscription_request: SubscriptionRequest | None = None,
         publication: PublicationStack | None = None,
         ownership: ProviderOwnershipGuard | None = None,
+        health_publisher: IngestionHealthPublisher | None = None,
         provider_lifecycle_timeout_seconds: float = 30.0,
         supervisor_max_reconnects: int | None = None,
         supervisor_sleep: Callable[[float], Awaitable[None]] | None = None,
         observer_interval_seconds: float = 0.5,
         observer_sleep: Callable[[float], Awaitable[None]] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         """Validate flags and store injected composition; construct no live dependency (no I/O)."""
         validate_phase_h_flags(flags)
@@ -113,6 +121,9 @@ class MarketIngestionService:
         self._request = subscription_request
         self._publication = publication
         self._ownership = ownership
+        self._health_publisher = health_publisher
+        self._now = now or _utc_now
+        self._health_publish_failed = False
         self._timeout = provider_lifecycle_timeout_seconds
         self._max_reconnects = supervisor_max_reconnects
         self._supervisor_sleep = supervisor_sleep
@@ -278,17 +289,48 @@ class MarketIngestionService:
             self._terminal.set()
 
     async def _run_observer(self) -> None:
-        """Bounded L1 observer: feed M2 diagnostics into continuity; trip terminal on a break."""
+        """Bounded L1 observer: feed M2 diagnostics into continuity; trip terminal on a break.
+
+        Each tick also refreshes ``md:health`` from the just-observed continuity snapshot (H9C-P1),
+        so a healthy-but-idle feed keeps ``updated_at`` fresh (the tick is time-driven, not event-
+        driven) and a terminal break is conveyed before the observer returns.
+        """
         from app.market_ipc.continuity import ContinuityState  # lazy: keep import pure
 
         stack = self._publication
         assert stack is not None
         while True:
             stack.continuity.observe_boundary(stack.boundary.diagnostics())
+            await self._publish_health()
             if stack.continuity.state is ContinuityState.BROKEN:
                 self._terminal.set()
                 return
             await self._observer_sleep(self._observer_interval)
+
+    async def _publish_health(self) -> None:
+        """Project the L1 continuity snapshot into ``md:health`` (publisher mode; fail-closed).
+
+        A failed write is logged once per failure streak and never trips terminal — health-
+        observability loss must not be read as healthy (the reader fails closed on absence/stale)
+        nor cause a crash/restart storm. A no-op before the producer incarnation started, when not
+        in publisher mode, or when no health publisher is composed.
+        """
+        if self._health_publisher is None or not self.publisher_mode or self._publication is None:
+            return
+        from app.market_ipc.health import ingestion_health_from_continuity  # lazy: keep import pure
+
+        snapshot = self._publication.continuity.snapshot()
+        if snapshot.producer_id is None or snapshot.producer_epoch is None:
+            return  # no incarnation identity yet; nothing authoritative to publish
+        state = ingestion_health_from_continuity(snapshot, updated_at=self._now())
+        committed = await self._health_publisher.publish(state)
+        if not committed and not self._health_publish_failed:
+            self._health_publish_failed = True
+            logger.warning(
+                "md:health write failed; backend reader will fail closed until it recovers"
+            )
+        elif committed:
+            self._health_publish_failed = False
 
     async def _watch_terminal(self) -> None:
         """Await a terminal break signal, then fail closed (single owner of the disconnect)."""
@@ -336,13 +378,15 @@ class MarketIngestionService:
             with contextlib.suppress(Exception):
                 await self._coordinator.shutdown()
         await self._release_ownership()  # clean stop: release the lease AFTER the provider is down
+        await self._cancel_task(self._observer_task)  # stop observer BEFORE the final health write
+        self._observer_task = None
         if self.publisher_mode and self._publication is not None:  # M2 bounded drain → L1 final
             result = await self._publication.boundary.stop()
             self._publication.continuity.drain_completed(result)
+            await self._publish_health()  # final non-healthy snapshot; observer no longer racing it
         await self._close_publication()  # close the owned Redis client (after drain + L1 finalize)
-        await self._cancel_task(self._observer_task)
         await self._cancel_task(self._watch_task)
-        self._observer_task = self._watch_task = None
+        self._watch_task = None
         self._provider_connected = False
         self._status = ServiceStatus.STOPPED
 

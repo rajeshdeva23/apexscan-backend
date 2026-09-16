@@ -93,22 +93,51 @@ def test_shadow_consumer_is_not_constructed_by_composition() -> None:
     assert constructors == [], f"shadow consumer constructed in composition: {constructors}"
 
 
-def test_reference_recovery_is_not_constructed_by_composition() -> None:
-    """Phase D is inert: no production module builds the reference writer/loader/store.
+def test_reference_recovery_is_constructed_only_at_the_sanctioned_bootstrap_seam() -> None:
+    """H9C-P1 Gate D: reference recovery is built ONLY at the consumer-runtime bootstrap seam.
 
-    Compacted reference recovery must be reachable only through explicit test/offline
-    composition, so merging Phase D activates no Redis writes or loads.
+    The consumer runtime now rehydrates durable reference state at ``start()`` (loader + store), so
+    the loader/store are constructed — but ONLY inside ``compose_consumer_runtime``
+    (``market_ipc/consumer_runtime.py``), which is itself reachable only from the sanctioned backend
+    seam. Every other production module must still build no reference recovery, so the wiring cannot
+    sprawl or be quietly activated elsewhere. ``ReferenceStateWriter`` (the producer-side writer) is
+    not part of Gate D and must remain unconstructed anywhere.
     """
     inert = ("ReferenceStateWriter(", "ReferenceStateLoader(", "RedisCompactedReferenceStore(")
+    allowed = {_APP_ROOT / "market_ipc" / "consumer_runtime.py"}
     constructors: dict[str, list[str]] = {}
     for path in sorted(_APP_ROOT.rglob("*.py")):
-        if path.is_relative_to(_APP_ROOT / "market_ipc"):
+        if path in allowed:
             continue
         text = path.read_text(encoding="utf-8")
-        hits = [name for name in inert if name in text]
+        # A class definition is not a construction; only ``Name(`` call sites count.
+        hits = [name for name in inert if name in text and f"class {name[:-1]}:" not in text]
         if hits:
             constructors[str(path)] = hits
-    assert constructors == {}, f"reference recovery constructed in composition: {constructors}"
+    assert constructors == {}, (
+        f"reference recovery constructed outside the sanctioned seam: {constructors}"
+    )
+
+
+def test_health_publisher_is_constructed_only_at_the_ingestion_composition_seam() -> None:
+    """H9C-P1 Gate J: the ``md:health`` producer writer is built ONLY at the ingestion seam.
+
+    The runtime health writer is composed only in ``market_ingestion/composition.py`` (it reuses the
+    publication stack's Redis client). No other production module may construct
+    ``IngestionHealthPublisher``, so the producer-health conveyance cannot sprawl. The backend-side
+    ``IngestionHealthReader`` is a separate class and is unaffected by this rule.
+    """
+    allowed = {_APP_ROOT / "market_ingestion" / "composition.py"}
+    constructors: list[str] = []
+    for path in sorted(_APP_ROOT.rglob("*.py")):
+        if path in allowed:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "IngestionHealthPublisher(" in text and "class IngestionHealthPublisher:" not in text:
+            constructors.append(str(path))
+    assert constructors == [], (
+        f"health publisher constructed outside the ingestion seam: {constructors}"
+    )
 
 
 def test_consumer_runtime_is_composed_only_at_the_sanctioned_backend_seam() -> None:

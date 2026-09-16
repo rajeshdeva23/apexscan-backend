@@ -28,10 +28,15 @@ from app.market_ingestion.service import MarketIngestionService
 if TYPE_CHECKING:
     from app.core.config import Settings
     from app.market_ingestion.publication import PublicationStack
+    from app.market_ipc.health import IngestionHealthPublisher
     from app.schemas.market_data import Instrument
 
 # Stable producer identity for the decoupled ingestion service (M1 producer_id).
 _PRODUCER_ID = "market-ingestion"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class UniverseResolutionError(RuntimeError):
@@ -65,6 +70,7 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
         raise
     request = SubscriptionRequest(instruments=universe, data_types=frozenset({MarketDataKind.TICK}))
     publication = _build_publication(settings) if flags.ipc_publisher_enabled else None
+    health_publisher = _build_health_publisher(settings, publication)
     ownership = build_provider_ownership_guard(settings, OwnerRole.INGESTION)
     return MarketIngestionService(
         flags=flags,
@@ -72,8 +78,26 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
         subscription_request=request,
         publication=publication,
         ownership=ownership,
+        health_publisher=health_publisher,
         provider_lifecycle_timeout_seconds=settings.provider_lifecycle_timeout_seconds,
+        now=_utc_now,
     )
+
+
+def _build_health_publisher(
+    settings: Settings, publication: PublicationStack | None
+) -> IngestionHealthPublisher | None:
+    """Build the ``md:health`` producer writer over the publication stack's Redis (H9C-P1).
+
+    Only publisher mode conveys L1 continuity to the backend, so the writer is composed only when a
+    publication stack exists; it reuses the stack's Redis client (closed by the service on
+    shutdown), keeping one client per incarnation. Returns ``None`` in provider-only mode.
+    """
+    if publication is None:
+        return None
+    from app.market_ipc.health import IngestionHealthPublisher
+
+    return IngestionHealthPublisher(publication.redis, settings.market_ipc_config())
 
 
 def _build_publication(settings: Settings) -> PublicationStack:
@@ -88,9 +112,6 @@ def _build_publication(settings: Settings) -> PublicationStack:
 
     from app.market_engine.session import MarketSessionClassifier
     from app.market_ingestion.publication import SessionTradingDate, build_publication_stack
-
-    def _utc_now() -> datetime:
-        return datetime.now(UTC)
 
     redis: Redis = Redis.from_url(settings.redis_url)
     classifier = MarketSessionClassifier.from_settings(settings)
