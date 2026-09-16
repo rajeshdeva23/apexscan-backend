@@ -2,20 +2,28 @@
 
 > # ⚠️ DRAFT — NOT AUTHORIZED FOR EXECUTION
 >
-> This is a **conceptual** runbook produced by H9A. **No step here has been executed.** H9B is a
+> This is a **conceptual** runbook. **No step here has been executed.** The live cutover is a
 > separate, explicit, live-production authorization. Executing any step requires: acceptance of this
 > runbook, deployment of the ADR-030 interlock in both services, resolution of the live gates below,
 > and explicit human approval. **Do not run any command from this document.** It contains no secrets
 > and no literal commands by design.
+>
+> **Implementation status (H9B offline):** the ADR-030 interlock is now **wired offline** into both
+> the decoupled ingestion service and the legacy backend path, and the peak==1 invariant is proven
+> offline across startup/restart/cutover/rollback/crash/lease-loss — see
+> [H9B-single-owner-authority-wiring.md](H9B-single-owner-authority-wiring.md). The wiring is inert
+> by default (`market_ownership_enabled=false`); **no live cutover, deploy, or authority switch has
+> occurred.** Deployment to both services and every step below remain LIVE-gated.
 
 ## Preconditions (all must hold before H9B is authorized)
 
 - Offline H9A PASS: cross-process interlock (ADR-030 I2) proven; cutover/rollback rehearsed;
   `MAX_CONCURRENT_PROVIDER_OWNERS == 1`.
 - ADR-027 **Accepted**; ADR-030 **Accepted**; ADR-028 & ADR-029 **Accepted** (authority path).
-- Interlock **deployed** in both `apexscan-market-ingestion` and `apexscan-backend`.
+- Interlock **deployed** in both `apexscan-market-ingestion` and `apexscan-backend` (wired offline in
+  H9B; deployment to both services is still required and LIVE-gated) and `market_ownership_enabled=true`.
 - Redis durability policy pinned (`appendfsync`/RDB in a `redis.conf`; B11 op-side); B11 consume-side
-  loss detector wired (`md:health` producer-evidence conveyance).
+  loss detector wired (`md:health` producer-evidence conveyance) — **composed offline in H9B**.
 - Reference bootstrap proven (D1 loader on cutover).
 - FIX-2 live-correctness gate resolved (RC3 confirmed / FIX-2 as needed) — no live timestamp/parity
   claim while RC3 is INCONCLUSIVE.

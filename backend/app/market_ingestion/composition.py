@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.market_ingestion.ownership import OwnerRole
+from app.market_ingestion.ownership_runtime import build_provider_ownership_guard
 from app.market_ingestion.service import MarketIngestionService
 
 if TYPE_CHECKING:
@@ -63,11 +65,13 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
         raise
     request = SubscriptionRequest(instruments=universe, data_types=frozenset({MarketDataKind.TICK}))
     publication = _build_publication(settings) if flags.ipc_publisher_enabled else None
+    ownership = build_provider_ownership_guard(settings, OwnerRole.INGESTION)
     return MarketIngestionService(
         flags=flags,
         provider=provider,
         subscription_request=request,
         publication=publication,
+        ownership=ownership,
         provider_lifecycle_timeout_seconds=settings.provider_lifecycle_timeout_seconds,
     )
 

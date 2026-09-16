@@ -31,7 +31,11 @@ def _settings(*, ingestion: bool) -> SimpleNamespace:
         ipc_authoritative_enabled=False,
         legacy_market_path_enabled=True,
     )
-    return SimpleNamespace(phase_h_flags=lambda: flags, provider_lifecycle_timeout_seconds=30.0)
+    return SimpleNamespace(
+        phase_h_flags=lambda: flags,
+        provider_lifecycle_timeout_seconds=30.0,
+        market_ownership_enabled=False,
+    )
 
 
 class _FakeUniverseProvider:

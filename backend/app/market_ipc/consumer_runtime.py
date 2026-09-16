@@ -35,10 +35,17 @@ from app.market_ipc.consumer import (
 )
 from app.market_ipc.dedup import BoundedDeduplicator
 from app.market_ipc.durable_dedup import CompositeDeduplicator, DurableDeduplicator
+from app.market_ipc.health import IngestionHealthReader
+from app.market_ipc.loss_detection import (
+    LossDetectionResult,
+    LossDetectionState,
+    RedisLossDetector,
+)
 from app.market_ipc.transport import RedisMarketEventStream
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     from app.core.config import Settings
     from app.market_ingestion.mode import MarketPathMode, PhaseHFlags
@@ -49,6 +56,8 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_ORIGIN_ID = "0-0"  # a stream id that has never had an entry generated (B11 fail-closed default)
 
 
 class RuntimeState(StrEnum):
@@ -78,12 +87,18 @@ class MarketEventConsumerRuntime:
         consumer: MarketEventConsumer | None = None,
         redis: Redis | None = None,
         poll_idle_seconds: float = 0.0,
+        loss_detector: RedisLossDetector | None = None,
+        health_reader: IngestionHealthReader | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._mode = mode
         self._flags = flags
         self._consumer = consumer
         self._redis = redis
         self._poll_idle_seconds = poll_idle_seconds
+        self._loss_detector = loss_detector
+        self._health_reader = health_reader
+        self._now = now or _utc_now
         self._state = RuntimeState.DISABLED if consumer is None else RuntimeState.NOT_STARTED
         self._task: asyncio.Task[None] | None = None
         self._redis_closed = False
@@ -186,6 +201,41 @@ class MarketEventConsumerRuntime:
         """Bounded consumer counters, or ``None`` for the inert/disabled runtime."""
         return self._consumer.diagnostics() if self._consumer is not None else None
 
+    async def evaluate_authority_readiness(self) -> LossDetectionResult:
+        """Reconcile transport continuity now (B11 composed) as an authority-readiness INPUT.
+
+        Feeds the loss detector three evidence sources: the producer L1 position from ``md:health``
+        (staleness-gated), the consumer's durably-applied ``(epoch, sequence)``, and bounded Redis
+        metadata. Fails closed to ``INSUFFICIENT_EVIDENCE`` (``ready_for_authority=False``) when the
+        runtime is inert or the producer health snapshot is missing/stale — a missing producer
+        position is never read as healthy. This activates NOTHING (H9B); Phase H9C owns authority.
+        """
+        if self._consumer is None or self._loss_detector is None or self._health_reader is None:
+            return self._unavailable("consumer runtime is not composed for loss detection")
+        producer = await self._health_reader.read_evidence(self._now())
+        if producer is None:
+            return self._unavailable("producer md:health snapshot is missing or stale")
+        return await self._loss_detector.evaluate(producer, self._consumer.consumer_progress())
+
+    def _unavailable(self, reason: str) -> LossDetectionResult:
+        """Build a fail-closed INSUFFICIENT_EVIDENCE result when producer evidence is missing."""
+        consumer = self._consumer.consumer_progress() if self._consumer is not None else None
+        return LossDetectionResult(
+            state=LossDetectionState.INSUFFICIENT_EVIDENCE,
+            reason=reason,
+            ready_for_authority=False,
+            producer_id="unknown",
+            producer_epoch=0,
+            producer_last_published_sequence=None,
+            consumer_last_applied_sequence=(
+                consumer.last_applied_sequence if consumer is not None else None
+            ),
+            stream_length=0,
+            stream_last_generated_id=_ORIGIN_ID,
+            group_last_delivered_id=_ORIGIN_ID,
+            pending=0,
+        )
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -240,4 +290,7 @@ async def compose_consumer_runtime(
         consumer=consumer,
         redis=redis,
         poll_idle_seconds=0.0 if config.block_ms > 0 else 0.05,
+        loss_detector=RedisLossDetector(redis, config),
+        health_reader=IngestionHealthReader(redis, config),
+        now=clock,
     )

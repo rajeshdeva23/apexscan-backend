@@ -47,11 +47,15 @@ class ProviderSupervisor:
         max_reconnects: int | None = None,
         on_disconnect: Callable[[], None] | None = None,
         on_reconnect: Callable[[], None] | None = None,
+        reconnect_guard: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         """Wire the supervisor; ``max_reconnects=None`` self-heals indefinitely (production).
 
         ``on_disconnect``/``on_reconnect`` are optional L1 hooks called on a *recoverable* transport
         drop and on the following reconnect attempt (never on a terminal publication break).
+        ``reconnect_guard`` (H9B) is checked before every reconnect: if it returns ``False`` the
+        stream is NOT restarted — a stale owner that lost the fenced lease must never reconnect —
+        and the loop ends terminally (fail-closed) instead of self-healing.
         """
         self._provider = provider
         self._request = request
@@ -60,6 +64,7 @@ class ProviderSupervisor:
         self._max_reconnects = max_reconnects
         self._on_disconnect = on_disconnect
         self._on_reconnect = on_reconnect
+        self._reconnect_guard = reconnect_guard
         self._status = SupervisorStatus.IDLE
         self._reconnects = 0
         self._consecutive_failures = 0
@@ -86,6 +91,11 @@ class ProviderSupervisor:
             await self._consume_once()  # returns only on a recoverable end (terminal propagates)
             if self._on_disconnect is not None:
                 self._on_disconnect()  # L1: provider transport dropped (recoverable)
+            if self._reconnect_guard is not None and not await self._reconnect_guard():
+                # H9B: ownership lost — a stale owner must not reconnect. Terminal, not self-healed.
+                raise PublicationTerminalError(
+                    "provider ownership lease lost; refusing to reconnect the stream"
+                )
             if self._max_reconnects is not None and self._reconnects >= self._max_reconnects:
                 self._status = SupervisorStatus.FAILED
                 return

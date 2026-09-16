@@ -29,6 +29,7 @@ from app.core.lifecycle import (
 from app.core.logging import configure_logging
 from app.database import database_lifecycle
 from app.middleware.request_logging import RequestLoggingMiddleware
+from app.services.backend_consumer_runtime import compose_backend_consumer_runtime
 from app.services.dhan_runtime_composition import LiveMarketRuntimeDependency
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.error("Application startup blocked by a mandatory dependency")
         raise
 
+    # Decoupled IPC consumer runtime (H9B §17): composed over one shared aware-UTC clock and
+    # inert under the default LEGACY_ONLY flag shape (no Redis client, no poll task). It activates
+    # only when the shadow/authority flags are explicitly enabled in a later governed phase.
+    consumer_runtime = await compose_backend_consumer_runtime(settings)
+    await consumer_runtime.start()
+
     try:
         yield
     finally:
         logger.info("Shutting down %s", settings.app_name)
+        await consumer_runtime.stop()  # stop the poll loop before Redis is released below
         try:
             await lifecycle.shutdown()
         except ApplicationShutdownError:

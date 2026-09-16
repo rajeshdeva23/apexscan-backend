@@ -26,6 +26,7 @@ from app.market_ingestion.mode import (
     derive_market_path_mode,
     validate_phase_h_flags,
 )
+from app.market_ingestion.ownership import OwnershipLeaseConfig
 from app.market_ipc.config import MarketIpcConfig
 
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "staging", "production"})
@@ -159,6 +160,16 @@ class Settings(BaseSettings):
     live_h3_publish_approved: bool = Field(default=False)
     # Durable directory for the M1 producer-epoch file (ingestion service's own volume).
     market_ingestion_state_dir: str = Field(default="artifacts/market_ingestion", min_length=1)
+
+    # --- Cross-process single-Dhan-owner interlock (ADR-030; DECOUPLING H9B) -----------
+    # The Redis lease + fencing gate (H9A primitive) that makes the legacy backend path and the
+    # decoupled ingestion service compete for ONE provider-ownership authority: a process must hold
+    # a valid fenced lease before any Dhan token mint / provider connect. Default OFF so production
+    # behaviour is unchanged (H9B is offline-only; a governed cutover flips this later). The lease
+    # timing feeds OwnershipLeaseConfig, which fails closed unless 0 < renewal < ttl.
+    market_ownership_enabled: bool = Field(default=False)
+    market_ownership_lease_ttl_seconds: int = Field(default=30, ge=1, le=3_600)
+    market_ownership_renewal_interval_seconds: int = Field(default=10, ge=1, le=3_600)
 
     # --- Market session (NSE cash-equity; ADR-004) -------------------------
     # Exchange timezone for interpreting canonical UTC timestamps into the
@@ -393,6 +404,13 @@ class Settings(BaseSettings):
         """Build the bounded market-IPC transport config (defaults in H1; inert until composed)."""
         return MarketIpcConfig()
 
+    def market_ownership_config(self) -> OwnershipLeaseConfig:
+        """Build the fenced-lease timing/key contract (ADR-030); fails closed on bad timing."""
+        return OwnershipLeaseConfig(
+            lease_ttl_seconds=self.market_ownership_lease_ttl_seconds,
+            renewal_interval_seconds=self.market_ownership_renewal_interval_seconds,
+        )
+
     @model_validator(mode="after")
     def validate_phase_h_flag_matrix(self) -> Self:
         """Reject illegal Phase-H flag combinations fail-fast (ADR-025 flag matrix)."""
@@ -434,6 +452,24 @@ class Settings(BaseSettings):
                 "IPC_PUBLISHER_ENABLED=true requires LIVE_H3_PUBLISH_APPROVED=true "
                 "(live shadow publish is deferred by the B6 NO_LIVE_H3_YET decision, ADR-026)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_ownership_lease_timing(self) -> Self:
+        """Fail fast when ownership is enabled with an invalid lease timing (renewal must beat TTL).
+
+        Only enforced when ``market_ownership_enabled`` so a default deployment (ownership off) is
+        never blocked by lease timing it does not use. ``OwnershipLeaseConfig`` raises unless
+        ``0 < renewal_interval_seconds < lease_ttl_seconds``.
+        """
+        if self.market_ownership_enabled:
+            try:
+                self.market_ownership_config()
+            except ValidationError as error:
+                raise ValueError(
+                    "MARKET_OWNERSHIP_RENEWAL_INTERVAL_SECONDS must be > 0 and < "
+                    "MARKET_OWNERSHIP_LEASE_TTL_SECONDS so a live owner renews before expiry"
+                ) from error
         return self
 
     @model_validator(mode="after")

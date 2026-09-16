@@ -45,6 +45,7 @@ from app.market_ipc.transport import _FIELD
 
 if TYPE_CHECKING:
     from app.market_ipc.continuity import FeedContinuitySnapshot
+    from app.market_ipc.state import IngestionHealthState
 
 _ORIGIN_ID = "0-0"  # a stream that has never had an entry generated
 
@@ -105,6 +106,22 @@ class ProducerPublicationEvidence:
             publication_outcome_uncertain=(
                 snapshot.reason is ContinuityReason.PUBLICATION_OUTCOME_UNCERTAIN
             ),
+        )
+
+    @classmethod
+    def from_ingestion_health(cls, state: IngestionHealthState) -> ProducerPublicationEvidence:
+        """Project a decoded ``md:health`` snapshot into producer evidence (H9B conveyance).
+
+        The md:health L1 fields were written by the producer directly from the same
+        :class:`FeedContinuitySnapshot` that :meth:`from_continuity` reads, so this reconstitutes
+        identical evidence across the process boundary — one health truth, no re-derivation.
+        """
+        return cls(
+            producer_id=state.producer_id,
+            producer_epoch=state.producer_epoch,
+            last_published_sequence=state.last_published_sequence,
+            terminal_publication_break=state.terminal_publication_break,
+            publication_outcome_uncertain=state.publication_outcome_uncertain,
         )
 
 
