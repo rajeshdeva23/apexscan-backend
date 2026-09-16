@@ -41,6 +41,7 @@ from app.market_ipc.loss_detection import (
     LossDetectionState,
     RedisLossDetector,
 )
+from app.market_ipc.reference import RedisCompactedReferenceStore, ReferenceStateLoader
 from app.market_ipc.transport import RedisMarketEventStream
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
         TradingDateAuthority,
         UniverseVersionAuthority,
     )
+    from app.market_ipc.reference import ReferenceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,9 @@ class MarketEventConsumerRuntime:
         poll_idle_seconds: float = 0.0,
         loss_detector: RedisLossDetector | None = None,
         health_reader: IngestionHealthReader | None = None,
+        reference_loader: ReferenceStateLoader | None = None,
+        trading_date_source: TradingDateAuthority | None = None,
+        universe_version_source: UniverseVersionAuthority | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._mode = mode
@@ -98,6 +103,10 @@ class MarketEventConsumerRuntime:
         self._poll_idle_seconds = poll_idle_seconds
         self._loss_detector = loss_detector
         self._health_reader = health_reader
+        self._reference_loader = reference_loader
+        self._trading_date_source = trading_date_source
+        self._universe_version_source = universe_version_source
+        self._reference_snapshot: ReferenceSnapshot | None = None
         self._now = now or _utc_now
         self._state = RuntimeState.DISABLED if consumer is None else RuntimeState.NOT_STARTED
         self._task: asyncio.Task[None] | None = None
@@ -137,6 +146,7 @@ class MarketEventConsumerRuntime:
             return  # already starting/running: never double-launch the poll task
         self._state = RuntimeState.STARTING
         try:
+            await self._bootstrap_reference()  # seed durable reference BEFORE any event applies
             # Idempotent XGROUP CREATE (mkstream); raises if Redis is unreachable.
             await self._consumer.start()
         except BaseException:
@@ -146,6 +156,30 @@ class MarketEventConsumerRuntime:
         self._task = asyncio.create_task(self._run())
         self._task.add_done_callback(self._on_task_done)
         self._state = RuntimeState.RUNNING
+
+    async def _bootstrap_reference(self) -> None:
+        """Recover durable session reference from Redis and seed the sink, before events apply.
+
+        The whole point (Gate D) is to rehydrate ``previous_close`` / session OHLC from the
+        compacted ``md:reference:<date>`` hash WITHOUT re-authenticating to Dhan. It reads only that
+        hash — a key wholly separate from the stream, group, and PEL — so it never ACKs an entry,
+        discards a pending entry, resets the group, or rewinds durable consumer progress. A missing
+        trading-date authority yields no bootstrap (warming up); a Redis outage propagates so the
+        start fails closed rather than mistaking an outage for an empty session.
+        """
+        if self._reference_loader is None or self._trading_date_source is None:
+            return
+        trading_date = self._trading_date_source()
+        if trading_date is None:
+            return  # no authoritative date yet: warming up, seed nothing
+        expected_version = (
+            self._universe_version_source() if self._universe_version_source is not None else None
+        )
+        snapshot = await self._reference_loader.load(trading_date, expected_version)
+        self._reference_snapshot = snapshot
+        seed = getattr(self._consumer.sink, "seed_reference", None) if self._consumer else None
+        if seed is not None:
+            await seed(snapshot)
 
     async def _run(self) -> None:
         """Drive bounded poll cycles until stopped; ``poll_once`` never raises (faults counted).
@@ -200,6 +234,11 @@ class MarketEventConsumerRuntime:
     def diagnostics(self) -> ConsumerDiagnostics | None:
         """Bounded consumer counters, or ``None`` for the inert/disabled runtime."""
         return self._consumer.diagnostics() if self._consumer is not None else None
+
+    @property
+    def reference_snapshot(self) -> ReferenceSnapshot | None:
+        """The reference state recovered at bootstrap, or ``None`` if none was loaded (Gate D)."""
+        return self._reference_snapshot
 
     async def evaluate_authority_readiness(self) -> LossDetectionResult:
         """Reconcile transport continuity now (B11 composed) as an authority-readiness INPUT.
@@ -284,6 +323,7 @@ async def compose_consumer_runtime(
         now=clock,
         deduplicator=deduplicator,
     )
+    reference_store = RedisCompactedReferenceStore(redis, config)
     return MarketEventConsumerRuntime(
         mode=mode,
         flags=flags,
@@ -292,5 +332,8 @@ async def compose_consumer_runtime(
         poll_idle_seconds=0.0 if config.block_ms > 0 else 0.05,
         loss_detector=RedisLossDetector(redis, config),
         health_reader=IngestionHealthReader(redis, config),
+        reference_loader=ReferenceStateLoader(source=reference_store, now=clock),
+        trading_date_source=trading_date_source,
+        universe_version_source=universe_version_source,
         now=clock,
     )
