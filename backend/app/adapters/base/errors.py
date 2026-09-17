@@ -36,6 +36,18 @@ class ProviderAuthenticationError(ProviderBoundaryError):
         super().__init__("Provider authentication failed")
 
 
+class ProviderNotAuthorizedError(ProviderBoundaryError):
+    """Raised when a live provider connection is refused by an injected ownership authorization.
+
+    Distinct from :class:`ProviderAuthenticationError` (a credential failure): the credentials are
+    fine, but this process is not currently authorized to hold the live provider session (e.g. it
+    lost the ownership lease). Terminal — a reconnect must NOT retry it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Provider live connection not authorized")
+
+
 class ProviderNetworkError(ProviderBoundaryError):
     """Raised when a provider request cannot reach its remote service."""
 

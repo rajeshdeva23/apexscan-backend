@@ -810,7 +810,13 @@ async def test_combined_health_reference_consumer_and_b11_sufficient(
     try:
         await _drive_events(composed.service, len(events))
         await _wait_health(redis, config)  # producer md:health present (Gate J)
-        assert await redis.exists(reference_key(config.reference_key_prefix, _TD)) == 1
+        # The reference is written by the async M2→D1 worker, which may lag the submit count; poll.
+        ref_key = reference_key(config.reference_key_prefix, _TD)
+        for _ in range(500):
+            if await redis.exists(ref_key) == 1:
+                break
+            await asyncio.sleep(0.005)
+        assert await redis.exists(ref_key) == 1
 
         # Backend consumer starts from NO local state: bootstraps reference, then consumes.
         sink = _SeedingSink()

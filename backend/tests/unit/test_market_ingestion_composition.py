@@ -70,7 +70,12 @@ class _FakeUniverseProvider:
 def _patch_provider(monkeypatch: pytest.MonkeyPatch, provider: _FakeUniverseProvider) -> None:
     from app.adapters.dhan.adapter import DhanRestAdapter
 
-    monkeypatch.setattr(DhanRestAdapter, "from_settings", classmethod(lambda cls, s: provider))
+    # from_settings gained live_connect_authorization (H9C-P3); accept and ignore it here.
+    monkeypatch.setattr(
+        DhanRestAdapter,
+        "from_settings",
+        classmethod(lambda cls, s, **_kwargs: provider),
+    )
 
 
 async def test_disabled_composition_returns_inert_service() -> None:

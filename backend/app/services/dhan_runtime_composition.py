@@ -384,6 +384,7 @@ async def _acquire_backend_ownership(guard: ProviderOwnershipGuard | None) -> No
         return
     await guard.acquire_or_fail()
     guard.start_renewal()
+    await guard.reserve_token_mint()  # Gate H: fail closed within the cross-process mint cooldown
 
 
 async def _release_backend_ownership(guard: ProviderOwnershipGuard | None) -> None:
@@ -538,6 +539,13 @@ async def compose_market_runtime(
         )
         return RuntimeComposition(runtime=runtime, provider_coordinator=None)
 
+    # Build ownership first so a from-settings adapter can be bound to its live-connect
+    # authorization (Gate G): the adapter asks guard.validate before every live-socket open.
+    guard = (
+        ownership
+        if ownership is not None
+        else build_provider_ownership_guard(settings, OwnerRole.BACKEND)
+    )
     sink: _DeferredContinuitySink | None = None
     session_gate: _DeferredLiveSessionGate | None = None
     if adapter is not None:
@@ -550,12 +558,8 @@ async def compose_market_runtime(
             transport=transport,
             live_continuity_sink=sink,
             live_session_predicate=session_gate,
+            live_connect_authorization=guard.validate if guard is not None else None,
         )
-    guard = (
-        ownership
-        if ownership is not None
-        else build_provider_ownership_guard(settings, OwnerRole.BACKEND)
-    )
     coordinator = ProviderCoordinator(cast("BrokerAdapter", provider))
     try:
         await _acquire_backend_ownership(guard)  # fenced lease BEFORE the token mint (ADR-030 §6)

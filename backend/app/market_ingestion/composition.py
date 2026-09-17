@@ -53,7 +53,12 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
     from app.adapters.dhan.adapter import DhanRestAdapter
     from app.schemas.market_data import MarketDataKind, SubscriptionRequest
 
-    provider = DhanRestAdapter.from_settings(settings)
+    # Build ownership first so the adapter can be bound to its live-connect authorization (Gate G):
+    # the adapter asks guard.validate before every live-socket open/reconnect. None when ownership
+    # is disabled (default) → the adapter is unguarded exactly as before, and the service is inert.
+    ownership = build_provider_ownership_guard(settings, OwnerRole.INGESTION)
+    live_authz = ownership.validate if ownership is not None else None
+    provider = DhanRestAdapter.from_settings(settings, live_connect_authorization=live_authz)
     try:
         await provider.connect()  # idempotent; creates HTTP clients, no token/WS yet
         await provider.load_instruments()
@@ -71,7 +76,6 @@ async def compose_market_ingestion_service(settings: Settings) -> MarketIngestio
     request = SubscriptionRequest(instruments=universe, data_types=frozenset({MarketDataKind.TICK}))
     publication = _build_publication(settings) if flags.ipc_publisher_enabled else None
     health_publisher = _build_health_publisher(settings, publication)
-    ownership = build_provider_ownership_guard(settings, OwnerRole.INGESTION)
     return MarketIngestionService(
         flags=flags,
         provider=provider,
