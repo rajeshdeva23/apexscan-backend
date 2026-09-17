@@ -1,11 +1,13 @@
 """Entrypoint for the market-ingestion service: ``python -m app.market_ingestion`` (H1/H2/H3C).
 
-Disabled (the default) → composes an inert service, logs its status, exits cleanly (code 0) with
-NO Dhan/IPC/Redis activity. Enabled → composes the provider-owning service, starts it, and serves
-until the supervisor ends or an operator termination signal (SIGTERM/SIGINT) arrives, then shuts
-down deterministically (stop intake → drain M2 → finalize L1 → close the owned Redis client). A
-terminal publication break fails closed with a non-zero exit. Importing this module has no side
-effects; work happens only under ``if __name__ == "__main__"``.
+Disabled → composes an inert service with NO Dhan/IPC/Redis activity. As a container entrypoint
+(``main`` → ``serve_when_idle=True``, H9C-P2) it then IDLES until an operator termination signal so
+a deployed-but-inert service stays a healthy long-running container under ``unless-stopped`` (a
+clean immediate exit would restart-loop). A direct ``_run()`` call (tests/one-shot) returns 0 now.
+Enabled → composes the provider-owning service, starts it, and serves until the supervisor
+ends or SIGTERM/SIGINT, then shuts down deterministically (stop intake → drain M2 → finalize L1 →
+close the owned Redis client). A terminal publication break fails closed with a non-zero exit.
+Importing this module has no side effects; work happens only under ``if __name__ == "__main__"``.
 """
 
 from __future__ import annotations
@@ -26,8 +28,14 @@ logger = logging.getLogger(__name__)
 _SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
-async def _run() -> int:
-    """Compose, start, and (when enabled) serve the ingestion service; return an exit code."""
+async def _run(*, serve_when_idle: bool = False) -> int:
+    """Compose, start, and (when enabled) serve the ingestion service; return an exit code.
+
+    ``serve_when_idle`` (set by the container entrypoint) makes a DISABLED/inert service idle until
+    a termination signal instead of exiting immediately, so it stays a healthy long-running
+    container under ``restart: unless-stopped`` rather than restart-looping a clean exit. Left False
+    for direct/one-shot calls (tests), which return 0 at once.
+    """
     settings = get_settings()
     service = None
     try:
@@ -47,7 +55,29 @@ async def _run() -> int:
         if service.terminal_failure:  # a terminal publication break fails closed at exit too
             logger.error("market-ingestion ended on a terminal publication break")
             return 1
+    elif service.status is ServiceStatus.DISABLED and serve_when_idle:
+        await _idle_until_signal()  # deployed-but-inert: stay up until docker stop (no crash-loop)
     return 0 if service.status in (ServiceStatus.DISABLED, ServiceStatus.STOPPED) else 1
+
+
+async def _idle_until_signal() -> None:
+    """Block until SIGTERM/SIGINT for a deployed-but-inert container (no work, no exit-loop).
+
+    Waits ONLY on a termination signal (there is no supervisor to end an inert service). Where
+    asyncio signal handling is unavailable, no handlers install and this returns immediately — the
+    caller then exits cleanly, matching the pre-H9C-P2 behaviour on those platforms.
+    """
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    installed = _install_signal_handlers(loop, shutdown.set)
+    if not installed:
+        return  # no signal support here; do not block forever
+    try:
+        await shutdown.wait()
+    finally:
+        for sig in installed:
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
 
 
 async def _wait_for_shutdown(service: MarketIngestionService) -> None:
@@ -91,9 +121,9 @@ def _install_signal_handlers(
 
 
 def main() -> int:
-    """Configure logging and run the entrypoint."""
+    """Configure logging and run the entrypoint (idles when deployed-but-inert)."""
     logging.basicConfig(level=logging.INFO)
-    return asyncio.run(_run())
+    return asyncio.run(_run(serve_when_idle=True))
 
 
 if __name__ == "__main__":

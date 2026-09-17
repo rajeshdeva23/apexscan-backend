@@ -53,6 +53,14 @@ def build_provider_ownership_guard(
     Both the legacy backend path and the decoupled ingestion service call this so they compete for
     the SAME authority domain: one Redis (``settings.redis_url``) and one ``OwnershipLeaseConfig``
     (identical owner/fence keys). The guard owns and closes the dedicated Redis client it creates.
+
+    The client is bounded by a transport-level ``socket_timeout`` equal to the renewal interval
+    (H9C-P2, Gate I): redis-py otherwise blocks indefinitely, so a hung renew/validate under a
+    network partition could leave a stale owner connected past the lease TTL. A bounded socket
+    surfaces as a ``TimeoutError`` (a ``RedisError`` subclass), which ``renew``/``validate`` already
+    treat as a failure → the guard enters the lost path and fails closed — well within the
+    ``ttl - renewal`` margin before any successor could acquire. This is a transport timeout, not
+    asyncio cancellation, so no in-flight coroutine is cancelled mid-call.
     """
     if not settings.market_ownership_enabled:
         return None
@@ -60,12 +68,15 @@ def build_provider_ownership_guard(
 
     from app.market_ingestion.ownership import RedisOwnershipCoordinator
 
-    redis: Redis = Redis.from_url(settings.redis_url)
+    renewal = settings.market_ownership_renewal_interval_seconds
+    redis: Redis = Redis.from_url(
+        settings.redis_url, socket_timeout=renewal, socket_connect_timeout=renewal
+    )
     coordinator = RedisOwnershipCoordinator(redis, settings.market_ownership_config())
     return ProviderOwnershipGuard(
         coordinator=coordinator,
         role=role,
-        renewal_interval_seconds=settings.market_ownership_renewal_interval_seconds,
+        renewal_interval_seconds=renewal,
         instance_id=instance_id,
         redis_to_close=redis,
     )

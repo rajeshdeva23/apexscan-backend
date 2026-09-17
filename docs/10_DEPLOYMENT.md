@@ -1228,4 +1228,83 @@ non-negotiable rules in §17. The one consciously accepted Phase 1 limitation is
 
 ---
 
+## 20. Two-Service Decoupled Release & Ownership Activation (H9C-P2)
+
+The decoupled market path runs **two application processes from the same immutable image**:
+`apexscan-backend` (`OwnerRole.BACKEND`) and `apexscan-market-ingestion` (`OwnerRole.INGESTION`),
+competing for one fenced Redis ownership lease (ADR-030). This section covers **deployment
+readiness only**. Enabling ownership / IPC authority (the live cutover) is a separate governed H9C
+operation and is **out of scope here**.
+
+### 20.1 Binding invariant — deployment ≠ activation
+
+A normal deployment moves image revisions and nothing else. It **must** leave:
+
+```
+MARKET_OWNERSHIP_ENABLED = false
+IPC_AUTHORITATIVE_ENABLED = false
+```
+
+No deployment step (compose, `remote_update.sh`, the transport pipeline) sets these flags. The
+market-ingestion service is `restart: unless-stopped` (a legitimate long-running service) **and**
+stays profile-gated (`profiles: ["market-ingestion"]`), so the default `up` / the pipeline's
+`up backend` never start it; even when started with the flags off it composes an inert service and
+idles — no Dhan auth, no WebSocket, no ownership acquisition, no IPC authority.
+
+### 20.2 Pre-activation release order
+
+```
+build one immutable image (digest-pinned ${APEXSCAN_IMAGE})
+        ↓
+deploy the SAME image to backend + market-ingestion   (remote_update.sh both)
+        ↓
+authority remains OFF (flags unchanged)
+        ↓
+verify both services run the identical revision/digest
+        ↓
+verify both services are healthy and inert
+        ↓
+verify Redis + ownership config parity (deploy/two_service_preflight.py)
+        ↓
+STOP  ── anything beyond this is H9C activation, not a deployment
+```
+
+Deploy targets: `scripts/deploy/remote_update.sh [backend|market-ingestion|both]` (default
+`backend`). Use `both` for a decoupling-compatible release so the two services never drift onto
+different revisions.
+
+### 20.3 Pre-activation preflight
+
+Before any governed activation, prove — offline, from `docker compose config` / `ps` output — that
+the two services are cutover-safe using `deploy/two_service_preflight.py`:
+
+* **same revision** — backend image digest == ingestion image digest;
+* **ownership config parity** — `REDIS_URL`, `MARKET_OWNERSHIP_ENABLED`, lease TTL, and renewal
+  interval identical on both (put them in the **shared** `apexscan-infra.env` so both read one
+  domain — a one-sided config lets the disabled side open Dhan unfenced);
+* **authority off** — no activation flag is ON.
+
+The preflight is secret-free (it reports key names, never values) and performs no Docker/Redis/AWS
+I/O.
+
+### 20.4 Ownership timing (Gate I)
+
+Explicit production values live in `.env.example` (and the shared `apexscan-infra.env` in
+production): `MARKET_OWNERSHIP_LEASE_TTL_SECONDS=30`, `MARKET_OWNERSHIP_RENEWAL_INTERVAL_SECONDS=10`.
+The invariant `0 < renewal < ttl` is enforced fail-fast at startup when ownership is enabled. The
+ownership Redis client is bounded by a transport-level `socket_timeout` equal to the renewal
+interval, so a hung renew fails closed well within the `ttl − renewal` margin.
+
+### 20.5 Token-hazard boundary (Gate G/H — NOT solved here)
+
+⚠️ A **backend recreate** re-runs application startup, which authenticates Dhan **when
+`market_provider_enabled=true`**; a rapid redeploy/recreate can hit Dhan's ~2-minute
+token-generation cooldown and crash-loop. Activating the ingestion provider mints its own token.
+**These activation/recreation-ordering hazards are governed by Gate G/H and are deliberately NOT
+addressed in H9C-P2.** An ordinary authority-**OFF** deployment does not authenticate Dhan (the
+provider flags are off); if a future change makes an authority-OFF deploy authenticate Dhan, that is
+a safety defect to report, not to work around here.
+
+---
+
 *End of `10_DEPLOYMENT.md` — Official Deployment & Operations Architecture Specification.*
