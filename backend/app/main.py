@@ -77,11 +77,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # only when the shadow/authority flags are explicitly enabled in a later governed phase.
     consumer_runtime = await compose_backend_consumer_runtime(settings)
     await consumer_runtime.start()
+    # Exposed read-only to the market-authority diagnostics endpoint (H9C-P4 Gate K); never mutated
+    # by it. Inert under default flags (no consumer), so diagnostics report fail-closed unknowns.
+    app.state.market_consumer_runtime = consumer_runtime
 
     try:
         yield
     finally:
         logger.info("Shutting down %s", settings.app_name)
+        app.state.market_consumer_runtime = None
         await consumer_runtime.stop()  # stop the poll loop before Redis is released below
         try:
             await lifecycle.shutdown()
