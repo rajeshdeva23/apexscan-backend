@@ -92,24 +92,34 @@ services:
       - apexscan-net
 
   # -------------------------------------------------------------------------
-  # Market ingestion — future decoupled Dhan→IPC producer (DECOUPLING H1).
+  # Market ingestion — decoupled Dhan→IPC producer (DECOUPLING H1 … H9C-P2).
   #
-  # INERT by design: gated behind the "market-ingestion" Compose profile, so the
-  # default `docker compose up` (and the deploy pipeline's `up backend`) NEVER
-  # start it. It shares the backend image but runs the dedicated entrypoint,
-  # which with MARKET_INGESTION_SERVICE_ENABLED unset/false performs no Dhan
-  # auth, WebSocket, epoch allocation, Redis, or IPC activity and exits cleanly.
-  # No public port (§14). Owns dhan.env (secret-ownership seam); the backend
-  # keeps its own Dhan access until H9/H10. Live boot is H2.
+  # DEPLOYABLE but INERT by default. It is a legitimate long-running service now
+  # (H9C-P2, Gate F: it must be able to run persistently as a single-owner Dhan
+  # producer once activated), so it uses the same `unless-stopped` policy as the
+  # backend. Deployment is NOT activation: it stays gated behind the
+  # "market-ingestion" Compose profile, so the default `docker compose up` and the
+  # deploy pipeline's `up backend` NEVER start it — an operator must explicitly opt
+  # in (`--profile market-ingestion`). Even when started, with
+  # MARKET_INGESTION_SERVICE_ENABLED and MARKET_OWNERSHIP_ENABLED unset/false it
+  # performs no Dhan auth, WebSocket, epoch allocation, ownership acquisition, or
+  # IPC authority — it composes an inert service and idles. It shares the backend
+  # image (SAME digest) and runs the dedicated entrypoint. No public port. Reads
+  # the SHARED apexscan-infra.env (Redis + ownership config parity with the
+  # backend) plus dhan.env; the backend keeps its own Dhan access until H9/H10.
+  # Live ownership/authority activation is a separate governed H9C operation.
   # -------------------------------------------------------------------------
   market-ingestion:
     profiles: ["market-ingestion"]
     image: ${APEXSCAN_IMAGE:?APEXSCAN_IMAGE must be a digest-pinned registry reference}
     container_name: apexscan-market-ingestion
     command: ["python", "-m", "app.market_ingestion"]
-    # Runs once and exits cleanly while inert; "no" avoids restart-looping a clean
-    # exit. H2 revisits this to unless-stopped when the service performs live work.
-    restart: "no"
+    # Long-running single-owner producer once activated; matches the backend policy.
+    # Inert-by-default (flags off): the entrypoint IDLES until `docker stop` instead
+    # of exiting, so `unless-stopped` keeps a healthy deployed-but-inert container
+    # without restart-looping a clean exit — and it never implies Dhan/authority
+    # activation (that is a separate governed H9C step).
+    restart: unless-stopped
     env_file:
       - /etc/apexscan/apexscan-infra.env
       - /etc/apexscan/dhan.env
