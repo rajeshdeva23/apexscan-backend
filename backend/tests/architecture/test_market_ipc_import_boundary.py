@@ -357,3 +357,46 @@ def test_h9a_ownership_interlock_touches_no_authority_broker_or_api() -> None:
     module = _APP_ROOT / "market_ingestion" / "ownership.py"
     offending = sorted({m for m in _modules(module) for f in forbidden if _matches(m, f)})
     assert offending == [], f"H9A ownership imported forbidden surface: {offending}"
+
+
+def test_h9c_p3_dhan_adapter_has_no_ownership_or_redis_dependency() -> None:
+    """H9C-P3 (Gate G/T): the Dhan adapter stays ownership- and Redis-unaware.
+
+    The adapter learns "may I connect?" only through an injected authorization callback — it must
+    never import Redis or the ownership/token primitives, so the low-level broker adapter has no
+    dependency on how the fenced lease or the mint throttle work.
+    """
+    forbidden = (
+        "redis",
+        "app.market_ingestion.ownership",
+        "app.market_ingestion.ownership_runtime",
+        "app.market_ingestion.token_mint_guard",
+    )
+    offenders: dict[str, list[str]] = {}
+    for path in sorted((_APP_ROOT / "adapters" / "dhan").glob("*.py")):
+        hits = sorted({m for m in _modules(path) for f in forbidden if _matches(m, f)})
+        if hits:
+            offenders[str(path)] = hits
+    assert offenders == {}, f"Dhan adapter took an ownership/Redis dependency: {offenders}"
+
+
+def test_h9c_p3_token_mint_guard_is_infrastructure_neutral() -> None:
+    """H9C-P3 (Gate H/T): the token-mint throttle is a pure Redis/runtime primitive.
+
+    Like the ownership lease it must not reach the TickEngine/MarketContext authority, a strategy/
+    session path, a Dhan broker adapter, or an API route — only Redis + the ownership types.
+    """
+    forbidden = (
+        "app.adapters.dhan",
+        "app.market_engine",
+        "app.market_intelligence",
+        "app.strategies",
+        "app.strategy_manager",
+        "app.api",
+        "app.services",
+        "pyotp",
+        "websockets",
+    )
+    module = _APP_ROOT / "market_ingestion" / "token_mint_guard.py"
+    offending = sorted({m for m in _modules(module) for f in forbidden if _matches(m, f)})
+    assert offending == [], f"token-mint guard imported forbidden surface: {offending}"

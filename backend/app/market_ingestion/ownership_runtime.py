@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from app.market_ingestion.ownership import OwnershipState
+from app.market_ingestion.token_mint_guard import RedisTokenMintGuard, TokenMintThrottledError
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -73,12 +74,15 @@ def build_provider_ownership_guard(
         settings.redis_url, socket_timeout=renewal, socket_connect_timeout=renewal
     )
     coordinator = RedisOwnershipCoordinator(redis, settings.market_ownership_config())
+    # The token-mint throttle shares the guard's Redis client but is a SEPARATE authority (own key).
+    token_mint_guard = RedisTokenMintGuard(redis, settings.token_mint_config())
     return ProviderOwnershipGuard(
         coordinator=coordinator,
         role=role,
         renewal_interval_seconds=renewal,
         instance_id=instance_id,
         redis_to_close=redis,
+        token_mint_guard=token_mint_guard,
     )
 
 
@@ -103,12 +107,17 @@ class ProviderOwnershipGuard:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         on_ownership_lost: Callable[[], None] | None = None,
         redis_to_close: Redis | None = None,
+        token_mint_guard: RedisTokenMintGuard | None = None,
     ) -> None:
         """Wire the guard for one incarnation; generate a fresh ``instance_id`` unless supplied.
 
         ``redis_to_close`` is a Redis client the guard OWNS and closes once on teardown (the
         from-settings composition creates a dedicated client for the coordinator); leave it ``None``
         when the coordinator's client is owned elsewhere (tests share one client).
+
+        ``token_mint_guard`` is the SEPARATE cross-process mint throttle (Gate H): the guard exposes
+        :meth:`reserve_token_mint` so a caller reserves a mint (after ownership) before the provider
+        connects, but it never replaces the ownership lease (who-may-use vs when-may-mint).
         """
         self._coordinator = coordinator
         self._role = role
@@ -117,6 +126,7 @@ class ProviderOwnershipGuard:
         self._sleep = sleep or asyncio.sleep
         self._on_ownership_lost = on_ownership_lost
         self._redis_to_close = redis_to_close
+        self._token_mint_guard = token_mint_guard
         self._redis_closed = False
         self._state = OwnershipState.NOT_OWNER
         self._lease: OwnershipLease | None = None
@@ -170,6 +180,28 @@ class ProviderOwnershipGuard:
                 "(fenced out by a newer owner — fail closed)"
             )
         return lease
+
+    async def reserve_token_mint(self) -> None:
+        """Reserve a cross-process token mint (after ownership); fail closed within the cooldown.
+
+        The second half of the ordering invariant: a caller awaits this AFTER ``acquire_or_fail``
+        and only then permits a token mint / provider connect. A no-op when no throttle is composed.
+        A cooldown denial (a predecessor minted too recently) or an indeterminate durable state
+        raises :class:`TokenMintThrottledError`, so the successor never mints inside the window. Do
+        not bypass the cooldown; an operator may retry after the reported remaining seconds.
+        """
+        if self._token_mint_guard is None:
+            return
+        if self._lease is None or self._state is not OwnershipState.OWNER:
+            raise TokenMintThrottledError(
+                f"cannot reserve a {self._role.value} token mint before acquiring ownership"
+            )
+        decision = await self._token_mint_guard.reserve_mint(self._lease)
+        if not decision.allowed:
+            raise TokenMintThrottledError(
+                f"{self._role.value} token mint refused: the cross-process cooldown has "
+                f"{decision.remaining_seconds:.0f}s remaining (fail closed; do not bypass)"
+            )
 
     async def validate(self) -> bool:
         """Whether this incarnation still owns the lease; on a miss, enter the lost path.

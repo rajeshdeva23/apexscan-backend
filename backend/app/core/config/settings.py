@@ -27,6 +27,7 @@ from app.market_ingestion.mode import (
     validate_phase_h_flags,
 )
 from app.market_ingestion.ownership import OwnershipLeaseConfig
+from app.market_ingestion.token_mint_guard import TokenMintConfig
 from app.market_ipc.config import MarketIpcConfig
 
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "staging", "production"})
@@ -170,6 +171,10 @@ class Settings(BaseSettings):
     market_ownership_enabled: bool = Field(default=False)
     market_ownership_lease_ttl_seconds: int = Field(default=30, ge=1, le=3_600)
     market_ownership_renewal_interval_seconds: int = Field(default=10, ge=1, le=3_600)
+    # Cross-process Dhan token-mint cooldown (H9C-P3, Gate H). Mirrors Dhan's ~2-minute
+    # generation limit so a handoff/redeploy does not re-mint too soon and crash-loop the
+    # provider. A throttle only (metadata, never the token); separate from the ownership lease.
+    market_token_mint_cooldown_seconds: int = Field(default=120, ge=1, le=3_600)
 
     # --- Market session (NSE cash-equity; ADR-004) -------------------------
     # Exchange timezone for interpreting canonical UTC timestamps into the
@@ -410,6 +415,10 @@ class Settings(BaseSettings):
             lease_ttl_seconds=self.market_ownership_lease_ttl_seconds,
             renewal_interval_seconds=self.market_ownership_renewal_interval_seconds,
         )
+
+    def token_mint_config(self) -> TokenMintConfig:
+        """Build the cross-process token-mint throttle contract (H9C-P3, Gate H)."""
+        return TokenMintConfig(cooldown_seconds=self.market_token_mint_cooldown_seconds)
 
     @model_validator(mode="after")
     def validate_phase_h_flag_matrix(self) -> Self:

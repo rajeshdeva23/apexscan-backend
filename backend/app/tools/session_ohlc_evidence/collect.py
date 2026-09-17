@@ -17,7 +17,7 @@ them unobserved, so the record evaluates INCONCLUSIVE — the correct honest out
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import cast
@@ -25,6 +25,13 @@ from typing import cast
 from app.adapters.dhan.adapter import DhanRestAdapter
 from app.adapters.dhan.models import DhanCashEquityLiveUniverse, DhanInstrumentReference
 from app.core.config import Settings
+from app.market_ingestion.ownership import OwnerRole
+from app.market_ingestion.ownership_runtime import (
+    OwnershipAcquisitionError,
+    ProviderOwnershipGuard,
+    build_provider_ownership_guard,
+)
+from app.market_ingestion.token_mint_guard import TokenMintThrottledError
 from app.schemas.market_data import (
     Instrument,
     MarketData,
@@ -263,6 +270,53 @@ def build_instrument_evidence(
     )
 
 
+class DiagnosticOwnershipConflictError(RuntimeError):
+    """A governed Dhan owner holds the lease, so this diagnostic must not open a second session."""
+
+
+async def _acquire_diagnostic_ownership(settings: Settings) -> ProviderOwnershipGuard | None:
+    """Acquire the shared Dhan lease as ``DIAGNOSTIC`` (H9C-P3, Gate G/Part E); fail closed if held.
+
+    Returns ``None`` when ownership is disabled (default) — the tool then runs unguarded as before
+    (no interlock anywhere). When ownership is enabled it competes on the SAME lease key, so a
+    live backend/ingestion owner makes ``acquire`` fail and this refuses rather than open a
+    second concurrent Dhan session. Renewal keeps the lease across a multi-window run.
+    """
+    guard = build_provider_ownership_guard(settings, OwnerRole.DIAGNOSTIC)
+    if guard is None:
+        return None
+    try:
+        await guard.acquire_or_fail()
+    except OwnershipAcquisitionError as error:
+        await guard.release()  # close the guard's Redis client; never held a lease to delete
+        raise DiagnosticOwnershipConflictError(
+            "a governed Dhan owner holds the provider-ownership lease; refusing the diagnostic"
+        ) from error
+    guard.start_renewal()
+    # The diagnostic mints a real token, so it participates in the SAME cross-process cooldown
+    # (Gate H): it RECORDS its mint (so a later governed owner is not tricked into a double-mint)
+    # and refuses if a recent mint is still inside the window. Release the lease before propagating.
+    try:
+        await guard.reserve_token_mint()
+    except TokenMintThrottledError:
+        await guard.release()
+        raise
+    return guard
+
+
+async def _release_diagnostic_ownership(guard: ProviderOwnershipGuard | None) -> None:
+    """Release the diagnostic lease + close its client; a no-op when unguarded (ownership off)."""
+    if guard is not None:
+        await guard.release()
+
+
+def _live_authz(
+    guard: ProviderOwnershipGuard | None,
+) -> Callable[[], Awaitable[bool]] | None:
+    """The adapter's live-connect authorization: the guard's validate, or None when unguarded."""
+    return guard.validate if guard is not None else None
+
+
 async def run_collect(
     settings: Settings,
     *,
@@ -274,7 +328,8 @@ async def run_collect(
     per_window_seconds: float = 30.0,
 ) -> EvidenceRecord:
     """Run a straight-through read-only collection over the given windows (R4B use only)."""
-    adapter = DhanRestAdapter.from_settings(settings)
+    guard = await _acquire_diagnostic_ownership(settings)  # refuse if a governed owner is live
+    adapter = DhanRestAdapter.from_settings(settings, live_connect_authorization=_live_authz(guard))
     await adapter.connect()
     ws_acc: dict[str, dict[str, OhlcObservation]] = {}
     rest_acc: dict[str, dict[str, OhlcObservation]] = {}
@@ -307,6 +362,7 @@ async def run_collect(
                 rest_acc.setdefault(key, {})[window] = obs
     finally:
         await adapter.disconnect()
+        await _release_diagnostic_ownership(guard)
     return _assemble(
         universe,
         ws_acc,
@@ -371,7 +427,8 @@ async def run_capture_late_start(
     deadline_seconds: float = 60.0,
 ) -> EvidenceRecord:
     """Run a read-only diagnostic late-start capture for one instrument (R4D use only)."""
-    adapter = DhanRestAdapter.from_settings(settings)
+    guard = await _acquire_diagnostic_ownership(settings)  # refuse if a governed owner is live
+    adapter = DhanRestAdapter.from_settings(settings, live_connect_authorization=_live_authz(guard))
     await adapter.connect()
     start = datetime.now(UTC)
     try:
@@ -386,6 +443,7 @@ async def run_capture_late_start(
         )
     finally:
         await adapter.disconnect()
+        await _release_diagnostic_ownership(guard)
     return _partial_record(
         universe,
         trading_date=trading_date,
@@ -407,7 +465,8 @@ async def run_capture_reconnect(
     deadline_seconds: float = 60.0,
 ) -> EvidenceRecord:
     """Run a read-only diagnostic reconnect capture for one instrument (R4D use only)."""
-    adapter = DhanRestAdapter.from_settings(settings)
+    guard = await _acquire_diagnostic_ownership(settings)  # refuse if a governed owner is live
+    adapter = DhanRestAdapter.from_settings(settings, live_connect_authorization=_live_authz(guard))
     await adapter.connect()
     start = datetime.now(UTC)
     try:
@@ -418,6 +477,7 @@ async def run_capture_reconnect(
         )
     finally:
         await adapter.disconnect()
+        await _release_diagnostic_ownership(guard)
     return _partial_record(
         universe,
         trading_date=trading_date,

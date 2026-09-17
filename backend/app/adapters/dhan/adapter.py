@@ -29,6 +29,7 @@ from app.adapters.base.errors import (
     ProviderBoundaryError,
     ProviderContractViolationError,
     ProviderNetworkError,
+    ProviderNotAuthorizedError,
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -207,6 +208,7 @@ class DhanRestAdapter(
         live_hard_stale_timeout_seconds: float | None = None,
         live_session_predicate: Callable[[], bool] | None = None,
         live_clock: Callable[[], float] = monotonic,
+        live_connect_authorization: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         if (access_token is None) == (token_provider is None):
             raise ProviderAuthenticationError()
@@ -248,6 +250,10 @@ class DhanRestAdapter(
         self._live_hard_stale_timeout_seconds = live_hard_stale_timeout_seconds
         self._live_session_predicate = live_session_predicate
         self._live_clock = live_clock
+        # Injected ownership authorization (H9C-P3, Gate G): asked before EVERY live-socket open
+        # (initial connect and every internal reconnect). The adapter knows only "may I connect?",
+        # never how Redis fencing works. ``None`` (default/tests) = unguarded prior behaviour.
+        self._live_connect_authorization = live_connect_authorization
         self._last_valid_event_at: float | None = None
         self._suspect_stale_logged = False
 
@@ -274,11 +280,14 @@ class DhanRestAdapter(
         transport: httpx.AsyncBaseTransport | None = None,
         live_continuity_sink: Callable[[FeedContinuityEvent], None] | None = None,
         live_session_predicate: Callable[[], bool] | None = None,
+        live_connect_authorization: Callable[[], Awaitable[bool]] | None = None,
     ) -> DhanRestAdapter:
         """Create the concrete adapter from centralized, redacted application settings.
 
         ``live_continuity_sink`` receives broker-neutral feed-continuity facts (ADR-006)
         from the live stream; the composition layer binds it to the Market Engine.
+        ``live_connect_authorization`` (H9C-P3) is the injected ownership check the adapter asks
+        before every live-socket open/reconnect; the composition binds it to the ownership guard.
         """
         if settings.dhan_auth_mode == "totp":
             return cls(
@@ -292,6 +301,7 @@ class DhanRestAdapter(
                 live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
                 live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
                 live_session_predicate=live_session_predicate,
+                live_connect_authorization=live_connect_authorization,
             )
         if settings.dhan_access_token is None:
             raise ProviderAuthenticationError()
@@ -306,6 +316,7 @@ class DhanRestAdapter(
             live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
             live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
             live_session_predicate=live_session_predicate,
+            live_connect_authorization=live_connect_authorization,
         )
 
     async def connect(self) -> None:
@@ -643,6 +654,14 @@ class DhanRestAdapter(
     async def _connect_live_socket(self) -> None:
         if self._live_socket is not None:
             return
+        # Gate G: every live-socket open (initial connect AND every internal reconnect) must be
+        # authorized by the injected ownership check before a token is read or a WS is opened. A
+        # process that has lost ownership must never reopen its Dhan socket.
+        if (
+            self._live_connect_authorization is not None
+            and not await self._live_connect_authorization()
+        ):
+            raise ProviderNotAuthorizedError()
         client_id = self._live_client_id
         if client_id is None or not client_id.get_secret_value().strip():
             raise ProviderAuthenticationError()
@@ -697,6 +716,10 @@ class DhanRestAdapter(
                     logger.info("Dhan live feed reconnect succeeded on attempt %d", attempt)
                     return
                 except asyncio.CancelledError:
+                    raise
+                except ProviderNotAuthorizedError:
+                    # Ownership lost → not authorized to reconnect: terminal, never retry.
+                    await self._mark_live_connection_lost()
                     raise
                 except Exception:
                     await self._mark_live_connection_lost()

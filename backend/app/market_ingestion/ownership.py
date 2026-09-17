@@ -34,10 +34,16 @@ if TYPE_CHECKING:
 
 
 class OwnerRole(StrEnum):
-    """The two logical Dhan-owner roles (never both live at once)."""
+    """The logical Dhan-owner roles (never more than one live at once).
+
+    ``DIAGNOSTIC`` (H9C-P3) lets a sanctioned evidence/CLI tool that opens a real Dhan session
+    compete for the SAME lease, so it is mutually exclusive with the live backend/ingestion owners —
+    it never opens a second concurrent Dhan session behind their backs.
+    """
 
     BACKEND = "backend"
     INGESTION = "ingestion"
+    DIAGNOSTIC = "diagnostic"
 
 
 class OwnershipState(StrEnum):

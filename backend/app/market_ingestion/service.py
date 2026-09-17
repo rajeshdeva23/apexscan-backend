@@ -258,6 +258,10 @@ class MarketIngestionService:
             raise OwnershipAcquisitionError(
                 "provider-ownership lease was lost before the provider connect (fail closed)"
             )
+        if self._ownership is not None:
+            # Gate H: reserve a cross-process token mint (fail closed within the cooldown) AFTER
+            # ownership is validated and BEFORE the provider connects (its first get_health mints).
+            await self._ownership.reserve_token_mint()
         self._coordinator = ProviderCoordinator(self._provider)
         await self._coordinator.start(self._timeout)
         self._provider_connected = True
@@ -345,12 +349,33 @@ class MarketIngestionService:
         self._provider_connected = False
         await self._cancel_task(self._supervisor_task)
         self._supervisor_task = None
-        await self._cancel_task(self._observer_task)
+        await self._cancel_task(self._observer_task)  # stop the HEALTHY heartbeat first
         self._observer_task = None
+        await self._publish_health_final_down()  # P1 LOW-1: stop advertising a fresh HEALTHY state
         if self._coordinator is not None:
             with contextlib.suppress(Exception):
                 await self._coordinator.shutdown()
         await self._release_ownership()  # no-op if the lease was already lost (never re-release)
+
+    async def _publish_health_final_down(self) -> None:
+        """Fenced final non-healthy md:health on fail-close so a dead incarnation stops advertising.
+
+        The observer is already cancelled (no HEALTHY heartbeat races this). It writes ingestion and
+        transport DOWN (NOT a terminal publication break, unless continuity actually says so) and
+        only if md:health still belongs to this incarnation (``publish_if_current``), so it never
+        wipes a successor's fresher record. A no-op outside publisher mode / before an
+        incarnation started; a write failure is swallowed (teardown never raises).
+        """
+        if self._health_publisher is None or not self.publisher_mode or self._publication is None:
+            return
+        from app.market_ipc.health import ingestion_health_from_continuity  # lazy: keep import pure
+
+        snapshot = self._publication.continuity.snapshot()
+        if snapshot.producer_id is None or snapshot.producer_epoch is None:
+            return
+        state = ingestion_health_from_continuity(snapshot, updated_at=self._now(), active=False)
+        with contextlib.suppress(Exception):
+            await self._health_publisher.publish_if_current(state)
 
     async def _cleanup_after_failed_start(self) -> None:
         """Unwind anything started during a failed start (reverse order; no leaked task/conn)."""
