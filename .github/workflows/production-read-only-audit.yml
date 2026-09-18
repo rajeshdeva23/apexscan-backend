@@ -1,0 +1,93 @@
+name: Production Read-Only Audit
+
+# STRICTLY READ-ONLY. Manual (workflow_dispatch) only — never push/pull_request/
+# schedule/deployment. Reports SANITIZED production state (container status,
+# image/revision, allow-listed authority flags as ON/OFF/MISSING/UNKNOWN) over the
+# SAME hardened SSH transport and read-only /version probe the deploy pipeline uses.
+# It deploys NOTHING, mutates NOTHING (no pull/up/down/restart/stop/rm/exec, no git,
+# no systemctl, no Redis/DB/Dhan I/O), and never prints a secret value. The host
+# commands live in deploy.read_only_audit as a fixed, inspection-only allow-list.
+#
+# Like the deploy workflow, when no production transport is provisioned this fails
+# closed with PRODUCTION_TRANSPORT_NOT_CONFIGURED. Host/user/key are referenced by
+# secret name only and never fabricated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Short reason for this read-only audit (audit trail).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Read-only; still single-flight so two audits never interleave, and never cancel
+# an in-flight production deploy's group.
+concurrency:
+  group: apexscan-production-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Read-only production audit
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+      SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+      SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+      PUBLIC_BASE_URL: ${{ secrets.PRODUCTION_BASE_URL }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install audit dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "."
+
+      - name: Transport preflight (fail closed if unprovisioned)
+        run: |
+          missing=()
+          [ -n "$SSH_HOST" ] || missing+=("PRODUCTION_SSH_HOST")
+          [ -n "$SSH_USER" ] || missing+=("PRODUCTION_SSH_USER")
+          [ -n "$SSH_KEY" ] || missing+=("PRODUCTION_SSH_KEY")
+          [ -n "$SSH_KNOWN_HOSTS" ] || missing+=("PRODUCTION_SSH_KNOWN_HOSTS")
+          [ -n "$PUBLIC_BASE_URL" ] || missing+=("PRODUCTION_BASE_URL")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "PRODUCTION_TRANSPORT_NOT_CONFIGURED: missing ${missing[*]}." >&2
+            echo "The read-only audit uses the same SSH transport as the deploy" >&2
+            echo "pipeline; supply these production secrets before running it." >&2
+            exit 1
+          fi
+
+      - name: Set up pinned SSH material (never echoed)
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/prod_key
+          chmod 600 ~/.ssh/prod_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/prod_known_hosts
+          chmod 600 ~/.ssh/prod_known_hosts
+
+      - name: Run read-only audit
+        working-directory: backend
+        run: |
+          python -m deploy.read_only_audit \
+            --host "$SSH_HOST" --user "$SSH_USER" \
+            --key-file "$HOME/.ssh/prod_key" \
+            --known-hosts "$HOME/.ssh/prod_known_hosts" \
+            --base-url "$PUBLIC_BASE_URL" \
+            --docker-privilege sudo_non_interactive
+
+      - name: Remove SSH material
+        if: always()
+        run: rm -f ~/.ssh/prod_key ~/.ssh/prod_known_hosts
