@@ -101,6 +101,7 @@ def test_no_workflow_enables_ipc() -> None:
         "deploy-production.yml",
         "ci.yml",
         "publish-legacy-rollback.yml",
+        "production-read-only-audit.yml",
     ):
         lowered = _text(name).lower()
         for token in forbidden:
@@ -115,6 +116,7 @@ def test_no_workflow_echoes_secrets() -> None:
         "deploy-production.yml",
         "ci.yml",
         "publish-legacy-rollback.yml",
+        "production-read-only-audit.yml",
     ):
         for line in _text(name).splitlines():
             stripped = line.strip()
@@ -166,6 +168,43 @@ def test_publish_legacy_workflow_is_scoped_and_manual() -> None:
     assert "StrictHostKeyChecking=yes" in text and "StrictHostKeyChecking=no" not in text
     assert "sha256sum -c" in text  # archive integrity verified
     assert "docker build" not in text and "up -d" not in text  # never builds or deploys
+
+
+def test_audit_workflow_is_manual_only_read_only_and_fails_closed() -> None:
+    name = "production-read-only-audit.yml"
+    on = _on(_load(name))
+    assert set(on) == {"workflow_dispatch"}
+    assert "push" not in on and "pull_request" not in on and "schedule" not in on
+    doc = _load(name)
+    assert doc["permissions"] == {"contents": "read"}  # read-only, no packages:write
+    assert doc["jobs"]["audit"]["environment"] == "production"
+    assert doc["concurrency"]["cancel-in-progress"] is False
+    text = _text(name)
+    assert "PRODUCTION_TRANSPORT_NOT_CONFIGURED" in text  # fails closed unprovisioned
+    assert "python -m deploy.read_only_audit" in text
+    assert "StrictHostKeyChecking=no" not in text  # host authenticity never disabled
+    assert "rm -f ~/.ssh/prod_key" in text  # SSH material cleaned up
+
+
+def test_audit_workflow_never_mutates() -> None:
+    # Inspect only executable lines (drop the "# ..." documentation that names the
+    # very verbs this workflow forbids, to avoid a false positive on prose).
+    code = "\n".join(
+        line
+        for line in _text("production-read-only-audit.yml").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for verb in (
+        "docker pull",
+        "docker build",
+        "up -d",
+        "remote_update.sh",
+        "deploy.transport",
+        "compose up",
+        "restart",
+        "git pull",
+    ):
+        assert verb not in code, f"audit workflow references mutating op {verb!r}"
 
 
 def test_env_secrets_are_gitignored() -> None:
