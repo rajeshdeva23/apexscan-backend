@@ -1,0 +1,157 @@
+name: Stage production release
+
+# STAGE B-pre (DEPLOY-3C): install the SHA-bound deployment bundle's Compose authority
+# into the versioned release directory <DEPLOY_ROOT>/<sha>/ that deploy-production.yml's
+# transport preflight requires. It stages ONLY docker-compose.production.yml, atomically
+# and idempotently, over the SAME hardened SSH the deploy pipeline uses. It NEVER pulls an
+# image, runs `docker compose up`, restarts/recreates a container, changes env/secrets,
+# contacts Dhan, or prunes/modifies a sibling release. Manual + human-approved only.
+#
+# The bundle is the exact artifact build-image.yml published (deployment-bundle-<sha>); it
+# is re-verified (deploy.bundle.verify_bundle) before any host mutation. When no production
+# transport is provisioned this fails closed with PRODUCTION_TRANSPORT_NOT_CONFIGURED.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full 40-char commit SHA to stage (must be on main, CI green, bundle built).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Single-flight staging; never cancels an in-flight staging and never shares the deploy group.
+concurrency:
+  group: apexscan-production-staging
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Verify staging eligibility
+    runs-on: ubuntu-latest
+    outputs:
+      build_run_id: ${{ steps.bundle.outputs.build_run_id }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch main for ancestry check
+        run: git fetch --no-tags origin main
+
+      - name: Verify SHA eligibility (reachable from main + CI green)
+        working-directory: backend
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          REPO: ${{ github.repository }}
+        run: python -m deploy.eligibility --sha "$TARGET_SHA" --repo "$REPO"
+
+      - name: Confirm deployment bundle exists
+        id: bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$TARGET_SHA" in
+            *[!0-9a-f]* | "") echo "TARGET_SHA_INVALID: not 40-char hex." >&2; exit 1 ;;
+          esac
+          [ "${#TARGET_SHA}" -eq 40 ] || { echo "TARGET_SHA_INVALID: length." >&2; exit 1; }
+          run_id="$(gh run list -R "$REPO" --workflow=build-image.yml \
+            --json databaseId,headSha,conclusion \
+            -q "[.[] | select(.headSha==\"$TARGET_SHA\" and .conclusion==\"success\")][0].databaseId")"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "DEPLOYMENT_BUNDLE_NOT_FOUND: no successful build-image run for $TARGET_SHA." >&2
+            exit 1
+          fi
+          echo "build_run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+  stage:
+    name: Stage release to production host
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+      SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+      SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+      DEPLOY_ROOT: ${{ secrets.PRODUCTION_DEPLOY_ROOT }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deploy dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "."
+
+      - name: Transport preflight (fail closed if unprovisioned)
+        run: |
+          missing=()
+          [ -n "$SSH_HOST" ] || missing+=("PRODUCTION_SSH_HOST")
+          [ -n "$SSH_USER" ] || missing+=("PRODUCTION_SSH_USER")
+          [ -n "$SSH_KEY" ] || missing+=("PRODUCTION_SSH_KEY")
+          [ -n "$SSH_KNOWN_HOSTS" ] || missing+=("PRODUCTION_SSH_KNOWN_HOSTS")
+          [ -n "$DEPLOY_ROOT" ] || missing+=("PRODUCTION_DEPLOY_ROOT")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "PRODUCTION_TRANSPORT_NOT_CONFIGURED: missing ${missing[*]}." >&2
+            echo "Staging uses the same SSH transport as the deploy pipeline;" >&2
+            echo "supply these production secrets before running it." >&2
+            exit 1
+          fi
+
+      - name: Download SHA-bound deployment bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          REPO: ${{ github.repository }}
+          BUILD_RUN_ID: ${{ needs.authorize.outputs.build_run_id }}
+        run: |
+          gh run download -R "$REPO" "$BUILD_RUN_ID" \
+            -n "deployment-bundle-$TARGET_SHA" --dir _bundle
+          test -f _bundle/bundle.tar.gz
+
+      - name: Set up pinned SSH material (never echoed)
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/prod_key
+          chmod 600 ~/.ssh/prod_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/prod_known_hosts
+          chmod 600 ~/.ssh/prod_known_hosts
+
+      # Verifies the bundle (deploy.bundle.verify_bundle) BEFORE any host command, then
+      # places ONLY docker-compose.production.yml at <DEPLOY_ROOT>/<sha>/ atomically. No
+      # pull, no `up`, no restart — staging only. Idempotent; fails closed on conflict.
+      - name: Stage release directory
+        working-directory: backend
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          python -m deploy.stage \
+            --host "$SSH_HOST" --user "$SSH_USER" \
+            --key-file "$HOME/.ssh/prod_key" \
+            --known-hosts "$HOME/.ssh/prod_known_hosts" \
+            --deploy-root "$DEPLOY_ROOT" --target-sha "$TARGET_SHA" \
+            --bundle "$GITHUB_WORKSPACE/_bundle/bundle.tar.gz" \
+            --docker-privilege sudo_non_interactive
+
+      - name: Remove SSH material
+        if: always()
+        run: rm -f ~/.ssh/prod_key ~/.ssh/prod_known_hosts

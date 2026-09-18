@@ -102,6 +102,7 @@ def test_no_workflow_enables_ipc() -> None:
         "ci.yml",
         "publish-legacy-rollback.yml",
         "production-read-only-audit.yml",
+        "stage-production-release.yml",
     ):
         lowered = _text(name).lower()
         for token in forbidden:
@@ -117,6 +118,7 @@ def test_no_workflow_echoes_secrets() -> None:
         "ci.yml",
         "publish-legacy-rollback.yml",
         "production-read-only-audit.yml",
+        "stage-production-release.yml",
     ):
         for line in _text(name).splitlines():
             stripped = line.strip()
@@ -132,7 +134,12 @@ def test_ci_typechecks_deploy_tooling() -> None:
 def test_no_dispatch_input_interpolated_into_run() -> None:
     # ${{ inputs.* }} / ${{ github.event.* }} must reach run: via env vars, never
     # be interpolated into the shell (script-injection guard).
-    for name in ("build-image.yml", "deploy-production.yml", "publish-legacy-rollback.yml"):
+    for name in (
+        "build-image.yml",
+        "deploy-production.yml",
+        "publish-legacy-rollback.yml",
+        "stage-production-release.yml",
+    ):
         for job in _load(name)["jobs"].values():
             for step in job.get("steps", []):
                 run = step.get("run")
@@ -205,6 +212,46 @@ def test_audit_workflow_never_mutates() -> None:
         "git pull",
     ):
         assert verb not in code, f"audit workflow references mutating op {verb!r}"
+
+
+def test_stage_workflow_is_manual_only_and_human_approved() -> None:
+    name = "stage-production-release.yml"
+    on = _on(_load(name))
+    assert set(on) == {"workflow_dispatch"}
+    assert "push" not in on and "pull_request" not in on and "schedule" not in on
+    doc = _load(name)
+    assert doc["permissions"] == {"contents": "read", "actions": "read"}
+    assert doc["jobs"]["stage"]["environment"] == "production"  # human approval gate
+    assert doc["concurrency"]["group"] == "apexscan-production-staging"
+    assert doc["concurrency"]["cancel-in-progress"] is False
+    assert on["workflow_dispatch"]["inputs"]["target_sha"]["required"] is True
+
+
+def test_stage_workflow_checks_eligibility_and_bundle_before_staging() -> None:
+    text = _text("stage-production-release.yml")
+    assert "deploy.eligibility" in text  # SHA reachable-from-main + CI-green gate
+    assert "deployment-bundle-$TARGET_SHA" in text  # exact SHA-bound artifact
+    assert "gh run download" in text  # consumes the built artifact, never regenerates
+    assert "python -m deploy.stage" in text  # the verify+stage helper (verifies first)
+
+
+def test_stage_workflow_is_fail_closed_and_hardened_and_never_deploys() -> None:
+    text = _text("stage-production-release.yml")
+    assert "PRODUCTION_TRANSPORT_NOT_CONFIGURED" in text  # fails closed unprovisioned
+    assert "StrictHostKeyChecking=no" not in text  # host authenticity never disabled
+    assert "prod_known_hosts" in text and "rm -f ~/.ssh/prod_key" in text  # pinned + cleanup
+    # Inspect only executable lines (drop the "# ..." prose naming the very ops it forbids).
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    for verb in (
+        "docker pull",
+        "compose up",
+        "up -d",
+        "docker build",
+        "remote_update.sh",
+        "deploy.transport",
+        "restart",
+    ):
+        assert verb not in code, f"staging workflow references deploy op {verb!r}"
 
 
 def test_env_secrets_are_gitignored() -> None:
