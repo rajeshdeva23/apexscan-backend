@@ -56,6 +56,10 @@ from app.adapters.dhan.live import (
     iter_standard_live_packets,
     plan_live_subscription_batches,
 )
+from app.adapters.dhan.ltt_diagnostics import (
+    RawLttDiagnosticConfig,
+    RawLttDiagnosticRecorder,
+)
 from app.adapters.dhan.models import (
     DhanCashEquityLiveUniverse,
     DhanFnoStockUniverse,
@@ -207,6 +211,8 @@ class DhanRestAdapter(
         live_hard_stale_timeout_seconds: float | None = None,
         live_session_predicate: Callable[[], bool] | None = None,
         live_clock: Callable[[], float] = monotonic,
+        ltt_diagnostic: RawLttDiagnosticRecorder | None = None,
+        live_wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if (access_token is None) == (token_provider is None):
             raise ProviderAuthenticationError()
@@ -250,6 +256,9 @@ class DhanRestAdapter(
         self._live_clock = live_clock
         self._last_valid_event_at: float | None = None
         self._suspect_stale_logged = False
+        # Gate-A raw-LTT evidence recorder (default OFF / inert). Observation-only.
+        self._ltt_diagnostic = ltt_diagnostic or RawLttDiagnosticRecorder()
+        self._live_wall_clock = live_wall_clock
 
     def _stale_watchdog_active(self) -> bool:
         """True only when a stale timeout is configured and an expected LIVE_SESSION is active."""
@@ -280,6 +289,7 @@ class DhanRestAdapter(
         ``live_continuity_sink`` receives broker-neutral feed-continuity facts (ADR-006)
         from the live stream; the composition layer binds it to the Market Engine.
         """
+        ltt_diagnostic = _ltt_diagnostic_from_settings(settings)
         if settings.dhan_auth_mode == "totp":
             return cls(
                 token_provider=DhanAuthManager.from_settings(settings, transport=transport),
@@ -292,6 +302,7 @@ class DhanRestAdapter(
                 live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
                 live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
                 live_session_predicate=live_session_predicate,
+                ltt_diagnostic=ltt_diagnostic,
             )
         if settings.dhan_access_token is None:
             raise ProviderAuthenticationError()
@@ -306,6 +317,7 @@ class DhanRestAdapter(
             live_stale_timeout_seconds=settings.dhan_live_stale_timeout_seconds,
             live_hard_stale_timeout_seconds=settings.dhan_live_hard_stale_timeout_seconds,
             live_session_predicate=live_session_predicate,
+            ltt_diagnostic=ltt_diagnostic,
         )
 
     async def connect(self) -> None:
@@ -524,6 +536,9 @@ class DhanRestAdapter(
 
     def _decode_one_packet(self, packet: bytes) -> tuple[MarketData, ...]:
         """Decode a single framed provider packet, counting its outcome by cause + response code."""
+        # Gate-A evidence: capture the raw LTT integer BEFORE conversion, independent of decode
+        # success. Inert unless explicitly enabled; never alters the packet or the decode below.
+        self._ltt_diagnostic.observe(packet, receive_utc=self._live_wall_clock())
         try:
             events = decode_standard_live_packet(packet, self._live_cash_references)
         except (
@@ -1023,6 +1038,20 @@ def _derivative_expiry_code(
 
 def _market_datetime(value: datetime) -> datetime:
     return value.astimezone(_INDIAN_MARKET_TIMEZONE)
+
+
+def _ltt_diagnostic_from_settings(settings: Settings) -> RawLttDiagnosticRecorder:
+    """Build the Gate-A raw-LTT recorder from settings (disabled and inert unless enabled)."""
+    raw_ids = settings.dhan_raw_ltt_diagnostic_security_ids
+    allowed = frozenset(int(part) for part in raw_ids.split(",") if part.strip())
+    return RawLttDiagnosticRecorder(
+        RawLttDiagnosticConfig(
+            enabled=settings.dhan_raw_ltt_diagnostic_enabled,
+            max_samples=settings.dhan_raw_ltt_diagnostic_max_samples,
+            min_interval_seconds=settings.dhan_raw_ltt_diagnostic_min_interval_seconds,
+            allowed_security_ids=allowed,
+        )
+    )
 
 
 def _error_details(response: httpx.Response) -> tuple[str | None, str | None, str]:

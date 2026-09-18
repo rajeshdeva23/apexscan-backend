@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     # the observer is not constructed, so there is zero subscription, REST, artifact, or
     # behavioral difference.
     session_ohlc_evidence_observer_enabled: bool = Field(default=False)
+    # Gate-A raw-LTT evidence diagnostic (FIX-2 / RC3). DEFAULT OFF and inert: when false the live
+    # adapter records nothing and behaves identically. Evidence-only — it captures the raw Dhan LTT
+    # integer before conversion; it NEVER converts, corrects, or applies a -5:30 offset. Bounded by
+    # the sample/interval/allow-list fields below.
+    dhan_raw_ltt_diagnostic_enabled: bool = Field(default=False)
+    dhan_raw_ltt_diagnostic_max_samples: int = Field(default=100, ge=1, le=10000)
+    dhan_raw_ltt_diagnostic_min_interval_seconds: float = Field(default=1.0, ge=0, le=3600)
+    # Comma-separated Dhan security ids to scope capture to (empty = all instruments).
+    dhan_raw_ltt_diagnostic_security_ids: str = Field(default="")
     # Passive live Sector Intelligence shadow runtime (SECTOR-VIEW-1B). Default OFF: when false
     # no observer is subscribed and no evaluator task runs — zero behavioral difference. Read-only
     # shadow; never affects the provider, engine, strategies, or trading.
