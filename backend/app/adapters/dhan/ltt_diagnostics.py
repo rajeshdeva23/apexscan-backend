@@ -37,6 +37,10 @@ _LTT_BEARING_CODES = frozenset({_QUOTE_RESPONSE_CODE, _FULL_RESPONSE_CODE})
 # here only to LABEL each sample PASS/REJECT for evidence; it never gates the real validator.
 _DEFAULT_MAX_FUTURE_SKEW_SECONDS = 60.0
 
+# Single state key used when no allow-list is configured, so empty-allow-list capture keeps the
+# legacy global counter/interval instead of allocating per-security state across all market traffic.
+_GLOBAL_KEY: int | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class RawLttSample:
@@ -54,7 +58,15 @@ class RawLttSample:
 
 @dataclass(frozen=True, slots=True)
 class RawLttDiagnosticConfig:
-    """Bounds for the Gate-A recorder. Disabled and inert by default."""
+    """Bounds for the Gate-A recorder. Disabled and inert by default.
+
+    ``max_samples`` and ``min_interval_seconds`` are applied **per security id** whenever
+    ``allowed_security_ids`` is non-empty, so each Gate-A instrument gets its own independent
+    quota and pacing (one instrument's traffic can neither consume another's slots nor its
+    interval). The total record ceiling is then ``max_samples * len(allowed_security_ids)``.
+    With an empty allow-list the recorder keeps a single global counter/interval (the legacy
+    behavior), so it never allocates unbounded per-security state across arbitrary market traffic.
+    """
 
     enabled: bool = False
     max_samples: int = 100
@@ -93,27 +105,36 @@ def _decode_for_evidence(raw_ltt: int) -> datetime | None:
 
 
 class RawLttDiagnosticRecorder:
-    """Bounded, sampled, rate-limited raw-LTT evidence recorder. Inert unless enabled."""
+    """Bounded, sampled, rate-limited raw-LTT evidence recorder. Inert unless enabled.
+
+    The sample count and rate-limit interval are tracked **per security id** when an allow-list is
+    configured, and globally when it is not (see :class:`RawLttDiagnosticConfig`). Either way the
+    state keys are bounded: an entry is created only after a packet passes the allow-list gate, so
+    the map never exceeds the configured allow-list (or one global slot when the list is empty).
+    """
 
     def __init__(self, config: RawLttDiagnosticConfig | None = None) -> None:
         self._config = config or RawLttDiagnosticConfig()
-        self._emitted = 0
-        self._last_emit_utc: datetime | None = None
+        # Keyed by security id when the allow-list is set, else by the single global sentinel key.
+        self._emitted_by_key: dict[int | None, int] = {}
+        self._last_emit_by_key: dict[int | None, datetime] = {}
 
     @property
     def emitted(self) -> int:
-        """Number of evidence records emitted so far (bounded by ``max_samples``)."""
-        return self._emitted
+        """Total evidence records emitted across all tracked keys (each ≤ ``max_samples``)."""
+        return sum(self._emitted_by_key.values())
 
     def observe(self, packet: bytes, *, receive_utc: datetime) -> RawLttSample | None:
         """Record one raw-LTT sample if enabled and within bounds; else no-op.
 
         Observation-only: it reads the raw LTT integer and computes the evidence fields, but never
-        mutates the packet, the decoded value, or any downstream decode/validation decision.
+        mutates the packet, the decoded value, or any downstream decode/validation decision. The
+        sample cap and rate window are enforced independently per security id when an allow-list is
+        configured, so one instrument can neither exhaust another's quota nor block its interval.
         Returns the emitted :class:`RawLttSample`, or ``None`` when disabled, not LTT-bearing,
-        filtered out by the instrument allow-list, over the sample cap, or inside the rate window.
+        filtered out by the instrument allow-list, over that key's sample cap, or inside its window.
         """
-        if not self._config.enabled or self._emitted >= self._config.max_samples:
+        if not self._config.enabled:
             return None
         fields = peek_ltt_fields(packet)
         if fields is None:
@@ -122,21 +143,25 @@ class RawLttDiagnosticRecorder:
         allowed = self._config.allowed_security_ids
         if allowed and security_id not in allowed:
             return None
-        if self._within_rate_window(receive_utc):
+        key = security_id if allowed else _GLOBAL_KEY
+        if self._emitted_by_key.get(key, 0) >= self._config.max_samples:
+            return None
+        if self._within_rate_window(key, receive_utc):
             return None
         sample = self._build_sample(
             response_code, exchange_segment_code, security_id, raw_ltt, receive_utc
         )
-        self._emitted += 1
-        self._last_emit_utc = receive_utc
+        self._emitted_by_key[key] = self._emitted_by_key.get(key, 0) + 1
+        self._last_emit_by_key[key] = receive_utc
         self._emit(sample)
         return sample
 
-    def _within_rate_window(self, receive_utc: datetime) -> bool:
-        """Whether ``receive_utc`` is within the minimum interval of the last emitted sample."""
-        if self._last_emit_utc is None:
+    def _within_rate_window(self, key: int | None, receive_utc: datetime) -> bool:
+        """Whether ``receive_utc`` is within the minimum interval of this key's last sample."""
+        last_emit = self._last_emit_by_key.get(key)
+        if last_emit is None:
             return False
-        elapsed = (receive_utc - self._last_emit_utc).total_seconds()
+        elapsed = (receive_utc - last_emit).total_seconds()
         return elapsed < self._config.min_interval_seconds
 
     def _build_sample(
